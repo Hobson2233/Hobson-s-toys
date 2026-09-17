@@ -1,0 +1,51 @@
+# ---- 本地私有数据：绝不能进仓库 ----
+# 真实账号密码。模板见 local_secrets.example.py
+local_secrets.py
+
+# 程序运行期数据（正常不在这里，但万一被指到当前目录）
+config.json
+accounts.json
+last-result.json
+campus-login.log
+selftest.txt
+guitest.txt
+
+# ---- 构建产物 ----
+# PyInstaller 的 workpath / distpath。体积大（build1 13M / dist1 9.4M），
+# 而且每次构建都会变 —— 提交它们等于给仓库塞垃圾。
+build*/
+dist*/
+*.spec
+icon_small/
+# 裁图标时的中间产物
+*.ico.orig
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# ---- 截图产物 ----
+# ui_shots/ 是本地看界面用的中间产物，不提交。
+#
+# ⚠️ 不要试图用「搜图片字节」来确认截图干净 —— 实测无效：
+#    截图里的文字是**光栅化像素**，不是字符串。把 PNG 的 IDAT 解压出来搜，
+#    连窗口标题「校园网自动登录」都搜不到（8/16 位编码都试过，全是 False），
+#    所以它报的「干净」是**假阴性**。2026-09-16 就因此把带真实学号的截图
+#    误判成安全 —— 那批图里明明白白显示着一个真实学号。
+#
+# 正确的做法是**从数据源头隔离**：跑 ui_shot.py 之前它会先 sandbox()，
+# 把数据目录换到 %TEMP%\campus_ui_shot 并写入假账号（2026000001 之类），
+# 这样窗口里根本没有真东西可拍。已实测：跑完真实数据目录 6 个文件 md5 全未变。
+# 要放进 README 的示意图，从 ui_shots/ 里挑出来复制到 docs/（那个目录会提交）。
+ui_shots/

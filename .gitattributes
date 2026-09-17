@@ -1,0 +1,12 @@
+# 换行符策略：仓库内统一 LF，检出到任何平台的工作区也是 LF。
+# 理由：本机 system 级 core.autocrlf=true（来自捆绑的 PortableGit 的 etc/gitconfig），
+# 检出时会把 LF 变成 CRLF；而 CRLF/LF 混用会让别人 clone 后出现「整文件全变」的假 diff。
+# 这里显式钉死为 LF，优先级高于 core.autocrlf，所以本机工作区保持 LF、
+# 和仓库内容逐字节一致（已实测：blob 与工作区同为 78634 字节）。
+# 顺带好处：不依赖某台机器上 git 的默认配置，换台电脑装的是别的 Git 也不会漂。
+* text=auto eol=lf
+
+# 二进制文件不做任何换行符转换（ico 里含 0x0D 0x0A 序列，转了就损坏）
+*.ico binary
+*.exe binary
+*.png binary
