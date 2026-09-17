@@ -244,7 +244,8 @@ def f():
 '''
     tree = ast.parse(bad)
     s = Scan("<selftest>")
-    s.visit(tree)    codes = {c for _, c, _ in s.issues}
+    s.visit(tree)
+    codes = {c for _, c, _ in s.issues}
     want = {"DUPKEY", "DUPDEF", "ISLITERAL", "MUTDEF", "EMPTYEXC", "FINRET",
             "ORCONST", "UNUSEDVAR"}
     missing = want - codes
