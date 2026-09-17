@@ -85,6 +85,7 @@ campus_login.py         主程序（单文件，无参=GUI，--auto/--logout/--p
 paths.py                统一的路径解析（不要在脚本里写死绝对路径）
 proc_tree.py            进程树管理：Job Object + 看门狗 + _MEI 残留清理
 build.py                构建入口，带四道门槛
+savepoint.py            本地存档：改代码前打快照，搞砸了能回退
 local_secrets.example.py  本地凭据模板（复制成 local_secrets.py 填真值，已被 gitignore）
 docs/                   README 用的界面截图
 ```
@@ -122,6 +123,30 @@ python secret_scan.py --staged                 # 每次提交前跑一遍
 > 要清干净得改写历史 + 强制推送，而且别人已经 clone 的副本、GitHub 的缓存
 > 都收不回来。所以要在**提交之前**拦，这就是 `secret_scan.py` 存在的理由。
 
+### 改代码之前先打个存档
+
+```bash
+python savepoint.py save "改密码框之前"        # 动手前先存一份
+python savepoint.py list                       # 看有哪些存档
+python savepoint.py restore 2026-09-17_1329    # 搞砸了就退回去
+python savepoint.py diff                       # 先看看现在跟存档差在哪
+```
+
+存档走的是**另一套引用** `refs/savepoints/*`，不是普通提交 —— 所以：
+
+- 不污染 `git log`，不动 HEAD，不改工作区（打快照对仓库是只读的）
+- **不会被 `git push --tags` 带出去**（它不是 tag），仓库要公开时这点很重要
+- 一直被引用着，所以永远不会被 gc 回收
+- 快照内容是那一刻工作区的完整状态（含未提交修改、新增、删除），但**遵守 .gitignore**
+
+`restore` 之前会**自动再存一份**，所以「回退」这个动作本身也能再回退，脚本会把
+反悔命令直接打在屏幕上。
+
+> ⚠️ 脚本里**绝不调用 `git prune` / `git gc`**。本机实测：在这个工作区里跑
+> `git prune`（任何形式，连默认两周宽限期的普通版也会）会把整个对象库清空，
+> `git status` 报 `fatal: bad object HEAD`，连初始提交都没了。
+> 清快照用 `tidy`（只删引用，不碰对象）。
+
 ### 测试与诊断脚本
 
 | 脚本 | 作用 | 能不能当门槛 |
@@ -139,6 +164,7 @@ python secret_scan.py --staged                 # 每次提交前跑一遍
 | `autostart_test.py` | 开机自启的增删改查 | 否 |
 | `ui_shot.py` / `layout_probe.py` | 截图 / 量布局（要真桌面） | 否 |
 | `png_zoom.py` | 裁切放大 PNG 局部、数字形个数（核对截图里画了什么） | 否 |
+| `savepoint.py` | 本地存档：改代码前打快照，搞砸了能整体回退 | 否（改代码前用） |
 
 跑测试要用**带 PyInstaller 的解释器**（`leak_check` / `help_check` / `portability_check` 依赖它）。
 
