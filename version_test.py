@@ -140,6 +140,31 @@ def main():
               got != sys_ver or not sys_ver, True)
 
     print()
+    print("=== 5. 文档里的版本号和 VERSION 一致 ===")
+    # README 里必须写版本号（用户一眼要看到），但那就成了「第二处硬编码」——
+    # 改 VERSION 时忘了改 README，界面显示 0.2.0、README 还写 0.1.0，没人会报错。
+    # 所以这里把它**变成被检查的副本**：对不上就让测试红。
+    # 正则要求前后都不是数字或点，免得把 IP 里的 "202.196.169" 当成版本号。
+    import re
+    pat = re.compile(r"(?<![\d.])(\d+\.\d+\.\d+)(?![\d.])")
+    # 检查器自己的对照：抓得到真版本号，又不能把 IP 当成版本号。
+    # README 里确实写着门户 IP，没有阴性对照的话，正则写宽了会把它们算进「版本号」，
+    # 于是测试永远红、或者更糟——被人当成「反正会红」而忽略。
+    check("阳性：正则抓得到 9.9.9", pat.findall("版本 9.9.9"), ["9.9.9"])
+    check("阴性：IP 不会被当成版本号",
+          pat.findall("门户 202.196.169.166 / 内网 10.0.1.10"), [])
+    for name in ("README.md",):
+        path = os.path.join(HERE, name)
+        if not os.path.isfile(path):
+            check("%s 存在" % name, path, "存在的文件")
+            continue
+        with open(path, "r", encoding="utf-8") as f:
+            found = pat.findall(f.read())
+        print("         %s 里出现的版本号: %r" % (name, found))
+        check("%s 里的版本号都等于 VERSION" % name,
+              sorted(set(found)), [C.VERSION])
+
+    print()
     if FAILS:
         print("失败 %d 项: %s" % (len(FAILS), ", ".join(FAILS)))
         return 1
