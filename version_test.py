@@ -11,7 +11,10 @@
 
 用法：
     python version_test.py                  # 只测纯函数部分（不碰 exe）
-    python version_test.py <某个.exe>        # 额外核对那个 exe 的版本资源
+    python version_test.py <某个.exe>        # 额外核对那个 exe：版本资源 + --version 弹窗
+
+第 6 节会**真的启动那个 exe**（用 proc_tree 起，跑完收掉整棵进程树），
+所以要么给 exe 路径、要么接受它被跳过。第 2 节依赖 PyInstaller。
 
 退出码 0 = 全过。
 """
@@ -163,6 +166,39 @@ def main():
         print("         %s 里出现的版本号: %r" % (name, found))
         check("%s 里的版本号都等于 VERSION" % name,
               sorted(set(found)), [C.VERSION])
+
+    print()
+    print("=== 6. 打包后 --version 真的弹出了窗口 ===")
+    # 这是唯一一条「只能在打包产物上验」的路径：源码模式 print 就行，打包后没有
+    # stdout，必须弹 messagebox。而弹窗是**模态**的，没人点它就一直停在那儿 ——
+    # 所以「10 秒后还没退出」恰恰是**成功**的标志，不是超时失败。
+    # 反过来，如果弹窗代码抛了异常，`log()` 会记下「--version 弹窗失败」然后
+    # exit_now(0)，进程**立刻消失** —— 那时 timed_out 会是 False。
+    # 两条断言合起来才能区分「在等用户点」和「已经挂了」。
+    if not exe or not os.path.isfile(exe):
+        print("  [跳过] 没给 exe 路径")
+    else:
+        import proc_tree
+        log_file = C.LOG_FILE
+        before = os.path.getsize(log_file) if os.path.isfile(log_file) else 0
+        rc, timed_out = proc_tree.run_exe(exe, ["--version"], timeout=10)
+        tail = ""
+        if os.path.isfile(log_file):
+            with open(log_file, "r", encoding="utf-8", errors="replace") as f:
+                f.seek(before)
+                tail = f.read()
+        print("         退出码=%s 10s 内未退出=%s" % (rc, timed_out))
+        check("弹窗路径没有抛异常（日志里没有「弹窗失败」）",
+              "弹窗失败" in tail, False)
+        check("进程停在模态弹窗上等用户点（10s 未退出）", timed_out, True)
+        if not timed_out:
+            print("         日志尾部: %s" % tail[-300:].replace("\n", " | "))
+        # 阴性对照：--selftest 不建窗口、干完就退。它必须**不超时** ——
+        # 否则「10s 未退出」可能只是 run_exe 的返回值永远为真，
+        # 那上面那条断言就是废话（「检查通过」≠「检查在跑」，第七条第 3 点）。
+        rc2, to2 = proc_tree.run_exe(exe, ["--selftest"], timeout=30)
+        print("         对照 --selftest: 退出码=%s 超时=%s" % (rc2, to2))
+        check("阴性对照：--selftest 自己会退出（不超时）", to2, False)
 
     print()
     if FAILS:
