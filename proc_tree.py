@@ -30,7 +30,10 @@ PyInstaller 的 onefile 打包结果运行时是两个进程：
 ## 坑 3：卡住的 GUI 脚本会把窗口留在桌面上
 
 诊断脚本是排障工具，绝不该成为新的问题来源。Tk 卡住时解释器正常收尾根本不会发生，
-所以 `atexit` / `try/finally` 都靠不住，只能靠 daemon 线程到点 `os._exit()`。
+所以 `atexit` / `try/finally` 都靠不住，只能靠 daemon 线程到点硬退。
+
+**注意「硬退」不是 `os._exit()`**：它在 Windows 上仍走 `ExitProcess`，会执行
+DLL 卸载回调，那一步本身就会慢甚至永久卡住。见下面 `hard_kill()`。
 
 ## 用法
 
@@ -393,11 +396,42 @@ def mei_usage():
 
 # ==================== 看门狗 ====================
 
+def hard_kill(code):
+    """不执行 DLL 卸载回调地把本进程干掉。
+
+    **`os._exit()` 不是「硬退」**：它在 Windows 上走 CRT `_exit` → `ExitProcess`，
+    而 ExitProcess 会依次调用所有已加载 DLL 的 `DLL_PROCESS_DETACH` ——
+    Tcl/Tk 的清理既慢（实测 11~12 秒）又可能**永远卡住**。
+
+    2026-09-17 用插桩（`exit_trace_probe.py`，程序内按阶段打点）实测：
+    日志停在「即将硬退」之后再无输出，faulthandler 的 20 秒定时器线程也被
+    ExitProcess 提前终止（dump 文件 0 字节）→ 卡点确定在 ExitProcess 的
+    C 层，而不是 Python 层。所以下面这段旧注释里「谁也救不了」的说法是**错的**：
+
+        （旧注释）「它救命的手段同样是 os._exit()；如果连 os._exit() 都卡在
+         DLL 清理里，那就没有别的办法了。」
+
+    `TerminateProcess` 不走 DLL 卸载，因此没有这个死面。这就是那条出路。
+
+    注意：campus_login.py 里有一份等价实现（`hard_kill`），**故意重复**——
+    应用本体不能依赖本模块（本模块是排障工具，不随 exe 打包）。
+    """
+    try:
+        kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+        kernel32.TerminateProcess.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+        kernel32.TerminateProcess.restype = ctypes.c_int
+        kernel32.TerminateProcess(kernel32.GetCurrentProcess(), code & 0xFFFFFFFF)
+    except Exception:
+        pass
+    # 成功的话不会走到这里。兜底：退回 os._exit（在非 Windows 上也是这条路）。
+    os._exit(code)
+
+
 def arm_watchdog(seconds, note=""):
     """到点还没解除就强制退出。返回一个「解除」函数（可重复调用）。
 
     Tk 卡住时解释器正常收尾根本不会发生，所以 atexit / try/finally 都靠不住 ——
-    只有另开一个 daemon 线程到点 os._exit() 才拦得住「窗口留在用户桌面上」。
+    只有另开一个 daemon 线程到点硬退才拦得住「窗口留在用户桌面上」。
     """
     state = {"done": False}
 
@@ -414,7 +448,7 @@ def arm_watchdog(seconds, note=""):
             sys.stderr.flush()
         except Exception:
             pass
-        os._exit(WATCHDOG_EXIT)
+        hard_kill(WATCHDOG_EXIT)
 
     threading.Thread(target=worker, name="watchdog", daemon=True).start()
 
@@ -437,11 +471,13 @@ def exit_hard(code):
     它会等所有已加载 DLL 的 `DLL_PROCESS_DETACH` 跑完 —— Tcl/Tk 的清理
     就是慢（而且不可靠）。正常收尾（C）会走更多 Tk 关闭逻辑，直接卡死。
 
-    **推论：看门狗不是绝对保证。** 它救命的手段同样是 `os._exit()`；
-    如果连 `os._exit()` 都卡在 DLL 清理里，那就没有别的办法了。
-    所以「窗口绝不会留在用户桌面上」这句话的准确版本是：
-    **正常情况下会；卡在 DLL 清理这一步时谁也救不了**。
-    实践中这已经足够 —— 11~12 秒后进程会自己走掉，用户看到的只是迟一点消失。
+    **2026-09-17 修正：上面那段的成因是对的，但推论错了。**
+    当时的推论是「看门狗不是绝对保证，卡在 DLL 清理里谁也救不了」，
+    于是继续用 `os._exit` —— 而「慢」和「卡住」本来就是同一件事（DLL 卸载），
+    两者都没有出路。真正的出路是**根本不执行 DLL 卸载**：`TerminateProcess`
+    不做这一步，所以既快（毫秒级）又不会卡。现在本函数走 `hard_kill()`。
+
+    原判断被推翻的经过（含插桩证据）见 `.workbuddy-ai/memory/2026-09-17.md`。
 
     安全前提：所有文件写入都用 `with open(...)` 即时落盘，没有待刷的缓冲。
     """
@@ -450,4 +486,4 @@ def exit_hard(code):
         sys.stderr.flush()
     except Exception:
         pass
-    os._exit(code)
+    hard_kill(code)

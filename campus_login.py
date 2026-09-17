@@ -206,6 +206,46 @@ def log(msg):
         pass
 
 
+# ============ 退出路径诊断（仅当 CAMPUS_EXIT_TRACE=1 时生效）============
+# 为什么要这个：GUI 关闭后进程不退，光从外面看只能得出「它还活着」，
+# 分不清是卡在 Tk 收尾（mainloop 没返回）还是卡在 os._exit 里头的
+# ExitProcess。这里按阶段打点，每个点单独开一次文件——进程被硬杀也不丢。
+# 默认关着，不影响正常用户；排查时设环境变量再跑。
+def exit_trace(msg):
+    if not os.environ.get("CAMPUS_EXIT_TRACE"):
+        return
+    try:
+        line = "%s.%03d  pid=%s  %s\n" % (
+            datetime.now().strftime("%H:%M:%S"),
+            datetime.now().microsecond // 1000,
+            os.getpid(), msg)
+        with open(os.path.join(data_dir(), "exit-trace.log"), "a",
+                  encoding="utf-8") as f:
+            f.write(line)
+    except Exception:
+        pass
+
+
+def arm_exit_watchdog():
+    """20 秒后如果进程还活着，把所有线程的 Python 栈 dump 出来。
+
+    这是「卡在 Python 层」和「卡在 C 层」的判别器：如果卡在 os._exit 的
+    ExitProcess 里，faulthandler 的定时器线程早就被 ExitProcess 干掉了，
+    这个文件会是空的 —— 什么都不 dump 本身就是答案。
+    """
+    if not os.environ.get("CAMPUS_EXIT_TRACE"):
+        return
+    try:
+        import faulthandler
+        f = open(os.path.join(data_dir(), "exit-stacks.log"), "a",
+                 encoding="utf-8")
+        faulthandler.enable(file=f, all_threads=True)
+        faulthandler.dump_traceback_later(20, repeat=True, file=f, exit=False)
+        exit_trace("看门狗已布防（20s 后 dump 线程栈）")
+    except Exception:
+        exit_trace("看门狗布防失败:\n%s" % traceback.format_exc())
+
+
 def write_json(path, obj):
     """一律写 UTF-8 无 BOM"""
     tmp = path + ".tmp"
@@ -1479,6 +1519,9 @@ def run_gui(smoke=False):
     import tkinter.font as tkfont
     from tkinter import messagebox
 
+    arm_exit_watchdog()
+    exit_trace("run_gui 开始（smoke=%s）" % smoke)
+
     BG = "#f0f2f5"
     CARD = "#ffffff"
     FG = "#222222"
@@ -1955,7 +1998,17 @@ def run_gui(smoke=False):
         except Exception:
             pass
         return 0
+    # 点 X 时先记一笔。行为与 Tk 默认（无 handler 时直接 destroy）完全一致，
+    # 只是为了知道「关闭请求确实到了主线程」，把卡点范围再收窄一格。
+    def _on_wm_close():
+        exit_trace("收到 WM_DELETE_WINDOW（用户点了 X）")
+        root.destroy()
+        exit_trace("root.destroy() 返回")
+
+    root.protocol("WM_DELETE_WINDOW", _on_wm_close)
+    exit_trace("即将进入 mainloop")
     root.mainloop()
+    exit_trace("mainloop 已返回")
     # mainloop 返回后**不要再走解释器正常收尾**：--windowed 打包后 Tk 在收尾阶段
     # 偶发死锁（界面已经关掉、文件也落盘了，进程却一直不退，实测卡过 10 分钟以上），
     # 结果是留一个看不见的僵尸进程在那儿占着。
@@ -1963,27 +2016,68 @@ def run_gui(smoke=False):
     # 要让它正常返回，否则脚本自己的收尾输出会被这一下截掉。
     if is_frozen():
         exit_now(0)
+    exit_trace("源码运行：正常返回，不硬退")
     return 0
+
+
+def hard_kill(code):
+    """不执行 DLL 卸载回调地把本进程干掉。Windows 上没杀成则返回 False。
+
+    为什么不能用 os._exit：`os._exit` → CRT `_exit` → **`ExitProcess`**，
+    而 ExitProcess 的第 3 步是「依次调用所有已加载 DLL 的 DLL_PROCESS_DETACH」。
+    实测（2026-09-17，插桩 exit_trace_probe.py）：卡点精确落在这一步 ——
+    日志停在「即将硬退」之后再无输出，faulthandler 的 20s 定时器线程
+    也被 ExitProcess 提前终止（dump 文件 0 字节），子进程 CPU 70 秒只涨 0.4s
+    （阻塞等待，非忙等）。典型成因是某个线程被终止时正持有加载器锁，
+    detach 枚举就永远等下去；本程序有 daemon 线程在跑网络轮询，
+    退出瞬间正好撞上就是**偶发**的。
+
+    `TerminateProcess` 不走 DLL 卸载，因此没有这个死锁面。代价是不执行
+    CRT 的 atexit / 缓冲刷新 —— 本程序所有文件写入都用 `with open(...)`
+    或 `os.replace` 即时落盘，没有待刷的缓冲，所以没有影响。
+    """
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.GetCurrentProcess.restype = ctypes.c_void_p
+        k32.TerminateProcess.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+        k32.TerminateProcess.restype = ctypes.c_int
+        # 成功的话这里不会返回；返回了就说明没杀成，交给调用方兜底。
+        k32.TerminateProcess(k32.GetCurrentProcess(), code & 0xFFFFFFFF)
+        exit_trace("!! TerminateProcess 返回了（没杀成），退回 os._exit")
+        return False
+    except Exception:
+        exit_trace("TerminateProcess 异常:\n%s" % traceback.format_exc())
+        return False
 
 
 # ==================== 入口 ====================
 def exit_now(code):
     """立刻结束进程，不走 Python 的正常收尾。
 
-    坑：--windowed 打包后，Tk 在解释器收尾阶段偶发死锁——界面已经建好、
-    结果文件也落盘了，进程却一直不退出（实测卡住 10 分钟以上，父进程
-    subprocess.run 永远等不到它）。诊断/静默这几条路径本来就不跑 mainloop，
-    没必要走正常收尾，直接 os._exit。
+    坑一（已修）：--windowed 打包后，Tk 在解释器收尾阶段偶发死锁——界面已经
+    建好、结果文件也落盘了，进程却一直不退出。所以这里直接硬退，不跑
+    mainloop 之后的解释器收尾。
+
+    坑二（已修，2026-09-17）：光换成 os._exit 还不够 —— `os._exit` 在
+    Windows 上仍走 ExitProcess，会执行 DLL_PROCESS_DETACH，在那一步同样会
+    偶发死锁（详见 hard_kill 的说明）。现在优先用 TerminateProcess。
 
     安全性：所有文件写入都用 `with open(...)` 或 `os.replace` 即时落盘，
     没有待刷的缓冲；onefile 的 _MEI 临时目录由 bootloader 父进程负责清理，
     子进程硬退不影响。
     """
+    exit_trace("exit_now(%r) 进入" % code)
     try:
         sys.stdout.flush()
         sys.stderr.flush()
     except Exception:
         pass
+    exit_trace("即将硬退（TerminateProcess）")
+    hard_kill(code)
+    # 非 Windows，或 TerminateProcess 意外没杀成：退回 os._exit。
     os._exit(code)
 
 
