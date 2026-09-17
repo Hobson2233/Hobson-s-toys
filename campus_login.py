@@ -70,6 +70,28 @@ UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like 
 CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 
 
+# 同一个 IP 的「下线 / 登录」这类会改变门户会话状态的动作，一次只许一个跑。
+#
+# 为什么需要：界面的忙碌标志（state["busy"]）是**每个窗口各自**的普通布尔，
+# 而后台任务跑在另一个线程里。程序**没有单实例闸门**（双击图标、托盘再点一次
+# 都会起新进程），所以同时开两个窗口时：
+#     窗口 A 点「切换账号」→ 后台线程开始下线
+#     窗口 B 点「退出当前账号」→ 它自己的 busy 是 False，按钮没灰，于是也能点
+# 两个动作各拿着同一个账号的密码去要 distoken、再各发一次下线请求。
+# 谁先下线谁成功，后来那个面对的是一个**已经不在线的 IP**，门户不会回
+# 「下线成功」，于是界面弹「退出失败，请稍后重试」——用户什么都没做错。
+#
+# 这是**进程内**的锁。多窗口其实是同一个进程里的多个顶层窗口，所以进程内锁
+# 就能拦住它们；两个独立的 exe 进程拦不住 —— 那种情况由 portal_logout 的
+# 重试 + 三态判定兜底（重复下线时门户回「未在线」，已按成功处理）。
+_LOGOUT_LOCK = threading.Lock()
+
+# 拿不到锁时等多久（秒）。等到了就按顺序执行，等不到就直接告诉用户
+# 「另一个操作正在执行」——**不要**默默排队：两个「退出」排下来第二个必然
+# 面对已下线的 IP，那正是这个 bug 的现象。
+_LOGOUT_LOCK_WAIT = 8.0
+
+
 # ==================== 路径 ====================
 CSIDL_APPDATA = 0x001A         # %APPDATA%（Roaming，用户级）
 CSIDL_COMMON_APPDATA = 0x0023  # C:\ProgramData（机器级）
@@ -805,15 +827,66 @@ def get_distoken():
     return None
 
 
+# 门户下线响应里表示「已经不在线了」的措辞。
+# 实测正文形如 `--> WIFI authentication 下线成功!`；重复下线时门户会回
+# 「未在线 / 已经下线 / 不存在」这类说法。这些都必须算**成功**——用户的意图是
+# 「让这个 IP 下线」，而它本来就不在线，意图已经达成。
+# 只按字面匹配已知措辞，匹配不上就退回网络探测判定（见下面 logout_result_is_ok）。
+LOGOUT_ALREADY_OFFLINE = ("未在线", "不在线", "已经下线", "已下线", "没有在线",
+                          "不存在", "请勿重复", "重复下线", "未登录")
+
+
+def logout_body_verdict(text):
+    """从下线响应正文里读出门户自己的结论，返回 True/False/None。
+
+        True  —— 正文明确说了「下线成功」或「本来就不在线」（两者都算达成意图）
+        False —— 正文明确说了下线没成功
+        None  —— 看不出结论（空正文、模板变了、拿到的不是预期页面）
+
+    为什么要读正文：原来的实现只把正文**打日志**，然后**完全靠「3 秒后再探一次
+    能不能上网」来下结论**。那个探测是间接证据 —— 门户会话还没断干净、或者
+    探测目标本身抽风，都会让一次**已经成功**的下线被报成「退出失败」。
+    而正文是服务端对这次请求的直接答复，是**更硬**的证据。
+
+    保守起见：认不出来一律返回 None，绝不猜 —— 猜错会静默失败（把没下线
+    说成已下线），比多报一次失败严重得多。
+    """
+    if not text:
+        return None
+    t = re.sub(r"<[^>]+>", " ", text)
+    t = re.sub(r"\s+", " ", t)
+    # 先判「本来就不在线」：有些门户在重复下线时回的话里同时含「下线」和
+    # 「未在线」，顺序反过来会误判成成功后又落到失败分支。
+    if any(k in t for k in LOGOUT_ALREADY_OFFLINE):
+        return True
+    if "下线成功" in t or "注销成功" in t or "已断开" in t or "断开成功" in t:
+        return True
+    if "下线失败" in t or "注销失败" in t or "断开失败" in t:
+        return False
+    return None
+
+
 def portal_logout():
     """复刻认证后页面「离线」按钮：POST /webdisconn.do?<urlParameter>，
-    必须带 other1=disconn 和 distoken"""
+    必须带 other1=disconn 和 distoken
+
+    返回 True/False/None 三态（与 test_internet 同样的理由 —— 「确定没成功」
+    和「看不出来」必须分开）：
+        True  —— 已确认下线（门户正文说的，或明确已能判定不在线）
+        False —— 确定仍然在线（还能上网）
+        None  —— 判不出来（请求异常、正文无法解读、探测也不确定）
+
+    调用方**只应在 False 时报「退出失败」**；None 要按「可能要重试」处理，
+    别把一次网络抖动当成一次确定的失败。
+    """
     cfg = load_config()
     host = cfg.get("portalHost") or DEFAULTS["portalHost"]
     token = get_distoken()
     if not token:
         log("未能取得 distoken，无法下线")
-        return False
+        # 拿不到 token 是**能力问题**不是结论：可能是取 token 的网络请求失败，
+        # 也可能真的没在线。不在这里下判断，交给调用方按 None 重试。
+        return None
     log("已取得 distoken")
     form = {
         "scheme": "http", "serverIp": "tomcat_server:80", "hostIp": "http://127.0.0.1:8080/",
@@ -827,23 +900,38 @@ def portal_logout():
     }
     post_url = "%s/webdisconn.do?%s" % (host, url_parameter())
     log("下线请求(POST): %s" % post_url)
+    body = ""
     try:
         r = http_post(post_url, data=form, timeout=15, headers={"User-Agent": UA})
-        txt = re.sub(r"(?s)<script.*?</script>", " ", r.text)
+        body = r.text or ""
+        txt = re.sub(r"(?s)<script.*?</script>", " ", body)
         txt = re.sub(r"<[^>]+>", " ", txt)
         txt = re.sub(r"\s+", " ", txt).strip()[:120]
         log("  状态 %s  正文: %s" % (r.status_code, txt))
     except Exception as e:
         log("  异常: %s" % e)
-    time.sleep(3)
-    # 只有「明确还能上网」才算下线未生效；测不出来时按已下线处理（与原来的
-    # `not test_internet()` 一致，但那时单点失败会被当成下线成功，现在多地址
-    # 探测基本不会漏掉「其实还在线」的情况）。
-    if test_internet(timeout=5) is not True:
-        log("已确认下线")
+    # 服务端对**这次请求**的直接答复，比 3 秒后的间接探测更硬。
+    verdict = logout_body_verdict(body)
+    if verdict is True:
+        log("  门户正文确认已下线（含「本来就不在线」）")
         return True
-    log("  仍可联网，下线未生效")
-    return False
+    if verdict is False:
+        log("  门户正文明确说下线失败")
+        return False
+    time.sleep(3)
+    # 正文读不出结论时才靠网络探测兜底。三态：只有「明确还能上网」才算没下线；
+    # 测不出来时返回 None（**不能**当成成功 —— 见 do_logout，那会让界面显示
+    # 「已退出」而实际还在线）。（与原来的 `not test_internet()` 的差别就在这：
+    # 原来单点失败会被当成下线成功。）
+    net = test_internet(timeout=5)
+    if net is False:
+        log("已确认下线（正文无结论，网络探测显示已被门户拦截）")
+        return True
+    if net is True:
+        log("  仍可联网，下线未生效")
+        return False
+    log("  下线结果无法判定（正文无结论，网络探测也不确定）")
+    return None
 
 
 # ==================== 业务动作 ====================
@@ -893,13 +981,51 @@ def do_logout():
         set_last_online("")
         write_result("logout", "OK", True, "当前未登录校园网")
         return 0
-    if portal_logout():
-        log("=== 已下线 ===")
-        set_last_online("")
-        write_result("logout", "OK", True, "已退出当前账号")
-        return 0
-    log("=== 下线失败 ===")
-    write_result("logout", "LOGOUT_FAILED", False, "退出失败，请稍后重试")
+
+    # 拿「共享 IP 的写权限」。另一个窗口/线程正在下线时它是拿不到的。
+    # 没有它的话，两个窗口各发一次下线请求，谁先谁成功，后到那个面对的是
+    # 一个已经不在线的 IP —— 界面就弹「退出失败，请稍后重试」，
+    # 而用户什么都没做错（这就是这次修的 bug 的主因之一）。
+    if not _LOGOUT_LOCK.acquire(timeout=_LOGOUT_LOCK_WAIT):
+        log("=== 另一个操作正在执行（%.0f 秒内没拿到锁），中止 ===" % _LOGOUT_LOCK_WAIT)
+        write_result("logout", "BUSY", False,
+                     "另一个操作正在执行，请等它结束后再试")
+        return 3
+    try:
+        # 重试：portal_logout() 返回 None 表示**判不出来**（拿不到 distoken、
+        # 请求异常、正文读不出结论、网络探测也不确定）——那多半是一次网络抖动，
+        # 再试一次往往就成。返回 False 才是「确定还在线」，重试没有意义。
+        #
+        # 为什么必须重试：原来只试一次，任何一次抖动都直接弹「退出失败，请稍后重试」。
+        # 而下线请求本身是幂等的（门户对已下线的 IP 回「未在线」这类话，已按成功处理），
+        # 多试几次不会造成额外影响，却能把大部分瞬时失败消化掉。
+        last = None
+        for attempt in (1, 2, 3):
+            v = portal_logout()
+            last = v
+            if v is True:
+                log("=== 已下线（第 %d 次尝试）===" % attempt)
+                set_last_online("")
+                write_result("logout", "OK", True, "已退出当前账号")
+                return 0
+            if v is False:
+                log("=== 下线未生效：门户仍认定为在线（第 %d 次尝试）===" % attempt)
+                break
+            log("=== 下线结果不确定，稍后重试（第 %d 次尝试）===" % attempt)
+            if attempt < 3:
+                time.sleep(2)
+    finally:
+        _LOGOUT_LOCK.release()
+
+    if last is False:
+        write_result("logout", "LOGOUT_FAILED", False, "退出失败，请稍后重试")
+        return 3
+    # 三次都判不出来：**不能说「已退出」**（那会让用户在还联网的情况下以为
+    # 自己退了），但也要把「可能已经退了、只是确认不了」说清楚，
+    # 否则用户会以为程序坏了。
+    log("=== 下线结果无法确认（已重试 3 次）===")
+    write_result("logout", "LOGOUT_UNKNOWN", False,
+                 "无法确认是否已退出，请检查网络状态后重试")
     return 3
 
 
@@ -940,10 +1066,30 @@ def do_switch(uid, pwd, prev_uid):
         log("当前未认证，直接登录目标账号")
     else:
         log("切换账号：先下线当前账号")
-        if not portal_logout():
+        # portal_logout() 现在返回三态，`not portal_logout()` 会把 None 也当失败 ——
+        # 那正是「判不出来」的合法情形（网络抖动），直接中止切换太武断。
+        # 只有 False（**确定**还在线）才中止：那时再登目标账号必然被服务端拒绝，
+        # 报「此IP已在线」，切换其实没发生。
+        # 与 do_logout 共用同一把锁：切换的第一步就是下线，和「退出当前账号」
+        # 争的是同一个门户会话。两个同时跑会互相把对方的 IP 弄下线。
+        if not _LOGOUT_LOCK.acquire(timeout=_LOGOUT_LOCK_WAIT):
+            log("=== 另一个操作正在执行（%.0f 秒内没拿到锁），中止切换 ===" % _LOGOUT_LOCK_WAIT)
+            write_result("switch", "BUSY", False,
+                         "另一个操作正在执行，请等它结束后再试")
+            return 3
+        try:
+            out = portal_logout()
+        finally:
+            _LOGOUT_LOCK.release()
+        if out is False:
             log("=== 下线失败：当前账号仍在线，已中止切换 ===")
             write_result("switch", "LOGOUT_FAILED", False, "切换失败：当前账号仍在线，请稍后重试")
             return 3
+        if out is None:
+            # 判不出来：继续走登录。最坏情况是当前账号还在线、登录被拒，
+            # 那由下面 portal_login 的探测暴露出来并触发回滚 ——
+            # 比在这里无谓地中止一次切换要好。
+            log("下线结果不确定，仍继续登录目标账号（失败会回滚）")
         time.sleep(2)
 
     log("开始登录 %s" % uid)
@@ -1151,6 +1297,12 @@ HELP_TEXT = ("校园网自动登录 —— 使用说明（v%s）\n" % VERSION) +
 
   退出当前账号
       主动下线。下线后本机暂时上不了网。
+      下线要连校园网的门户，偶尔会碰上网络抖动，程序会自动再试两次，
+      不会一次不成就报「退出失败」。
+      如果同时开了两个设置窗口，一个在操作时另一个会提示
+      「另一个操作正在执行」，等前一个结束再点就行。
+      没测准是否真退成功时，会明确说「无法确认是否已退出」——
+      宁可让你自己再看一眼，也不会谎报「已退出」。
 
 
 【密码框怎么用】

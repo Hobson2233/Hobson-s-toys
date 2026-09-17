@@ -60,6 +60,22 @@ import time
 
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 
+# HANDLE 是**指针宽度**：不声明 restype 时 ctypes 默认按 `c_int` 返回，
+# 64 位下句柄值一旦超过 2^31 就会被截断成负数（`if not h` 也就失去意义）。
+# 这里把返回 HANDLE 的几个函数声明清楚。
+kernel32.OpenProcess.restype = ctypes.c_void_p
+kernel32.OpenProcess.argtypes = [ctypes.c_uint, ctypes.c_int, ctypes.c_uint]
+kernel32.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
+kernel32.CreateJobObjectW.restype = ctypes.c_void_p
+kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+kernel32.GetProcessTimes.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
+                                     ctypes.c_void_p, ctypes.c_void_p,
+                                     ctypes.c_void_p]
+kernel32.GetProcessTimes.restype = ctypes.c_int
+kernel32.TerminateProcess.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+kernel32.TerminateProcess.restype = ctypes.c_int
+
 CREATE_NO_WINDOW = 0x08000000
 DEVNULL = subprocess.DEVNULL
 
@@ -72,6 +88,11 @@ STILL_ACTIVE = 259
 
 # 看门狗触发时的退出码。故意和「断言失败(1)」分开，好判断到底是代码错还是卡住。
 WATCHDOG_EXIT = 4
+
+
+class _FILETIME(ctypes.Structure):
+    _fields_ = [("lo", ctypes.c_uint32), ("hi", ctypes.c_uint32)]
+
 
 
 class _IO_COUNTERS(ctypes.Structure):
@@ -142,6 +163,55 @@ def snapshot():
 def children_of(pid):
     """pid 的直接子进程列表。"""
     return [p for p, pp in snapshot().items() if pp == pid]
+
+
+def snapshot_names():
+    """返回 {pid: 进程名}（含 .exe 后缀）。
+
+    ⚠️ **不要拿 `snapshot()` 的返回值按名字过滤** —— 它给的是 `{pid: 父pid}`，
+    拿父 pid 去比 `'python.exe'` 永远不相等，过滤器恒空，检查就变成**空转**：
+    「没找到残留进程」既可能是真干净、也可能是过滤器坏了，两者输出一模一样。
+    2026-09-17 踩过（看门狗残留检查空转了一轮）。要按名字找就用这个函数。
+    """
+    TH32CS_SNAPPROCESS = 0x00000002
+    INVALID = ctypes.c_void_p(-1).value
+    h = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    if h == INVALID:
+        return {}
+    out = {}
+    try:
+        e = PROCESSENTRY32W()
+        e.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+        ok = kernel32.Process32FirstW(h, ctypes.byref(e))
+        while ok:
+            out[e.th32ProcessID] = e.szExeFile
+            ok = kernel32.Process32NextW(h, ctypes.byref(e))
+    finally:
+        kernel32.CloseHandle(h)
+    return out
+
+
+def find_by_name(name, exclude=()):
+    """按进程名（不含 .exe 也行）找 pid 列表，方便做「有没有残留」的检查。
+
+    ⚠️ **用 venv 里的解释器跑脚本时，一个「python.exe」其实是两个同名进程**：
+    venv 的 `python.exe` / `pythonw.exe` 只是 redirector，它自己会再
+    `CreateProcess` 出真解释器（实测：venv 起 1 个 → 新增 2 个同名进程；
+    managed 解释器起 1 个 → 新增 1 个）。所以：
+
+    - **按名字数个数会多算一倍**，`len()` 不能当「起了几个」用；
+    - `Popen.pid` 拿到的是 **redirector**，不是跑代码的那个（真解释器是它的子进程）；
+    - 好在 redirector 用 Job Object 绑着子进程，**kill 掉壳，真解释器跟着没**
+      （实测 0.6s 内消失），所以「kill 完再查有没有残留」仍然成立。
+
+    做「残留检查」时正确写法是**前后做差**（`after - before`），不是看绝对值。
+    """
+    want = name.lower()
+    if not want.endswith(".exe"):
+        want += ".exe"
+    skip = set(exclude)
+    return sorted(p for p, n in snapshot_names().items()
+                  if str(n).lower() == want and p not in skip)
 
 
 def wait_done(proc, timeout=60):
@@ -332,13 +402,23 @@ def sweep_mei_temp(min_age=600, verbose=True):
     运行中的程序搞崩。而**目录里有任何文件被打开着，改名就会失败**，
     所以「改名成功 = 这个目录确实没人用」才是可靠判据。改完名再删。
     另外还加一个时间门槛，避免碰到刚起来的进程。
+
+    **跳过分两种，报告里分开写**（`太新 N / 还在用 N`）—— 处置完全相反：
+    「太新」等一会儿或把 `min_age` 降下来就能删；「还在用」说明真有进程握着
+    句柄，别硬删。合并成一句「还在用/太新」会让人不知道该等还是该收手。
+
+    **这笔开销有多大**（09-17 实测）：每个 `_MEIxxxx` 解压出来 **17.3 MB**，
+    一轮回归（`exit_stress` / `exit_regression_test` / `proc_tree_test` 都会强杀进程树）
+    能攒 **17~27 个，约 300~470 MB**。`proc_tree_test.py` 结尾会自己调一次
+    `sweep_mei_temp(min_age=600)`，所以那批「已经放了 10 分钟以上」的会被它清掉。
     """
     import shutil
     import tempfile
     root = tempfile.gettempdir()
     now = time.time()
     removed = 0
-    skipped = 0
+    skipped_new = 0        # 太新（没过 min_age 门槛）
+    skipped_busy = 0       # 改名失败 = 目录里还有文件被打开着
     try:
         names = [n for n in os.listdir(root) if n.startswith("_MEI")]
     except Exception:
@@ -349,7 +429,7 @@ def sweep_mei_temp(min_age=600, verbose=True):
             continue
         try:
             if now - os.path.getmtime(p) < min_age:
-                skipped += 1
+                skipped_new += 1
                 continue
         except Exception:
             continue
@@ -358,15 +438,18 @@ def sweep_mei_temp(min_age=600, verbose=True):
         try:
             os.rename(p, dead)
         except OSError:
-            skipped += 1          # 还在用（或有权限问题）—— 跳过就是，别报错
+            skipped_busy += 1     # 还在用（或有权限问题）—— 跳过就是，别报错
             continue
         try:
             shutil.rmtree(dead)
         except Exception:
             pass                  # 改名已经成功了，删不干净也不算「还在用」
         removed += 1
-    if verbose and (removed or skipped):
-        print("清理 _MEI 残留: 删掉 %d 个，跳过 %d 个（还在用/太新）" % (removed, skipped))
+    if verbose and (removed or skipped_new or skipped_busy):
+        # 两种跳过要**分开报**：它们的意思和下一步完全不同，合并成一句
+        # 「还在用/太新」会让人不知道该等一等还是该收手（09-17 为此多查了两步）。
+        print("清理 _MEI 残留: 删掉 %d 个，跳过 %d 个（太新 %d / 还在用 %d）"
+              % (removed, skipped_new + skipped_busy, skipped_new, skipped_busy))
     return removed
 
 
@@ -417,9 +500,6 @@ def hard_kill(code):
     应用本体不能依赖本模块（本模块是排障工具，不随 exe 打包）。
     """
     try:
-        kernel32.GetCurrentProcess.restype = ctypes.c_void_p
-        kernel32.TerminateProcess.argtypes = [ctypes.c_void_p, ctypes.c_uint]
-        kernel32.TerminateProcess.restype = ctypes.c_int
         kernel32.TerminateProcess(kernel32.GetCurrentProcess(), code & 0xFFFFFFFF)
     except Exception:
         pass
@@ -427,11 +507,72 @@ def hard_kill(code):
     os._exit(code)
 
 
-def arm_watchdog(seconds, note=""):
-    """到点还没解除就强制退出。返回一个「解除」函数（可重复调用）。
+def _creation_time(pid):
+    """进程创建时间（FILETIME 的 100ns 计数）。取不到返回 None。
 
-    Tk 卡住时解释器正常收尾根本不会发生，所以 atexit / try/finally 都靠不住 ——
-    只有另开一个 daemon 线程到点硬退才拦得住「窗口留在用户桌面上」。
+    用途：看门狗要确认「这个 PID 还是当初那个进程」。**PID 会被系统回收**，
+    如果看门狗只是 sleep 到点就按 PID 杀，遇到目标早已退出、PID 被别人复用
+    的情况就会**误杀无关进程** —— 那比不杀严重得多。
+    """
+    h = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not h:
+        return None
+    try:
+        c, e, kt, u = _FILETIME(), _FILETIME(), _FILETIME(), _FILETIME()
+        ok = kernel32.GetProcessTimes(h, ctypes.byref(c), ctypes.byref(e),
+                                      ctypes.byref(kt), ctypes.byref(u))
+        return ((c.hi << 32) | c.lo) if ok else None
+    finally:
+        kernel32.CloseHandle(h)
+
+
+def watchdog_child_main():
+    """看门狗**进程**的主体：睡够时间后按 PID 硬杀目标。由 `arm_watchdog()` 拉起。
+
+    为什么必须是独立进程、不能用线程：
+        主线程若卡在**持 GIL 的 C 调用**里（Tk 卡住正是这种），看门狗线程
+        `time.sleep` 醒来后永远抢不到 GIL，**到点也不会触发**。而它存在的意义
+        恰恰是这种卡法。2026-09-17 实测（`watchdog_gil_test.py --synthetic`，
+        用 `setswitchinterval(1000)` + 忙循环确定性占住 GIL）：线程版 15 秒看门狗
+        **一次都没触发**，子进程活过 25 秒只能外部杀。独立进程没有 GIL 依赖。
+
+    参数（`sys.argv`，因为是用 `python -c` 起的）：
+        argv[1] 目标 pid / argv[2] 秒数 / argv[3] 退出码 /
+        argv[4] 目标创建时间 / argv[5] 备注
+    """
+    pid = int(sys.argv[1])
+    secs = float(sys.argv[2])
+    code = int(sys.argv[3])
+    created = int(sys.argv[4])
+    note = sys.argv[5]
+    time.sleep(secs)
+    if _creation_time(pid) != created:
+        sys.stderr.write(
+            "\n[看门狗] 目标进程 %s 已经不在了（或 PID 已被复用），不动手。\n" % pid)
+        return 0
+    try:
+        sys.stderr.write(
+            "\n[看门狗] %s 秒内没结束，强制退出（%s）\n"
+            "         —— 窗口不会留在桌面上。断言多半已经跑完了，\n"
+            "            看上面的输出判断结果。\n"
+            % (secs, note or "多半是 Tk 卡住"))
+        sys.stderr.flush()
+    except Exception:
+        pass
+    h = kernel32.OpenProcess(PROCESS_TERMINATE, False, pid)
+    if h:
+        try:
+            kernel32.TerminateProcess(h, code & 0xFFFFFFFF)
+        finally:
+            kernel32.CloseHandle(h)
+    return 0
+
+
+def _arm_thread_watchdog(seconds, note):
+    """退化路径：起不了独立进程时（例如被冻结打包）用线程版。
+
+    ⚠️ 线程版在「主线程占着 GIL」时**救不了**（见 `watchdog_child_main` 的说明），
+    所以它只是「聊胜于无」，不是等价替代。
     """
     state = {"done": False}
 
@@ -441,10 +582,7 @@ def arm_watchdog(seconds, note=""):
             return
         try:
             sys.stderr.write(
-                "\n[看门狗] %s 秒内没结束，强制退出（%s）\n"
-                "         —— 窗口不会留在桌面上。断言多半已经跑完了，\n"
-                "            看上面的输出判断结果。\n"
-                % (seconds, note or "多半是 Tk 卡住"))
+                "\n[看门狗-线程版] %s 秒内没结束，强制退出（%s）\n" % (seconds, note))
             sys.stderr.flush()
         except Exception:
             pass
@@ -454,6 +592,65 @@ def arm_watchdog(seconds, note=""):
 
     def disarm():
         state["done"] = True
+
+    return disarm
+
+
+def arm_watchdog(seconds, note=""):
+    """到点还没解除就强制退出。返回一个「解除」函数（可重复调用）。
+
+    Tk 卡住时解释器正常收尾根本不会发生，所以 atexit / try/finally 都靠不住 ——
+    只能另起一个**独立进程**到点硬退，才拦得住「窗口留在用户桌面上」。
+    （为什么不线程：见 `watchdog_child_main` 的说明 —— 线程版抢不到 GIL。）
+    """
+    src = ("import sys\n"
+           "sys.path.insert(0, %r)\n"
+           "import proc_tree\n"
+           "sys.exit(proc_tree.watchdog_child_main())\n"
+           % os.path.dirname(os.path.abspath(__file__)))
+    proc = None
+    if not getattr(sys, "frozen", False):
+        try:
+            proc = subprocess.Popen(
+                [sys.executable, "-c", src,
+                 str(os.getpid()), str(seconds), str(WATCHDOG_EXIT),
+                 str(_creation_time(os.getpid())), note],
+                stdout=DEVNULL, creationflags=CREATE_NO_WINDOW)
+        except Exception as exc:
+            # ⚠️ 这里**不能一声不吭**。`proc is None` 有两种来源，处置完全不同：
+            #   · 打包后（frozen）—— 预期内，没别的解释器可用，退化是设计好的；
+            #   · Popen 真的失败（杀软拦截、解释器被挪走……）—— **意外**，
+            #     而退化后的线程版在「主线程占着 GIL」时不会触发，那恰恰是
+            #     看门狗唯一存在的理由。静默退化 = 安全网悄悄消失。
+            # 测试脚本的 stderr 是继承来的真句柄（pythonw.exe 下也一样，实测），
+            # 所以这行留声是真的有人看得见。
+            proc = None
+            try:
+                sys.stderr.write(
+                    "\n[看门狗] ⚠️ 独立进程起不来（%s: %s），退化成线程版 ——\n"
+                    "         线程版在主线程占着 GIL 时**不会触发**，别把它当安全网。\n"
+                    % (type(exc).__name__, exc))
+                sys.stderr.flush()
+            except Exception:
+                pass
+    if proc is None:
+        return _arm_thread_watchdog(seconds, note)
+
+    # 把看门狗放进一个 KILL_ON_JOB_CLOSE 的 job，**并且故意不关句柄**：
+    # 父进程一死（正常退、硬退、被看门狗杀掉都算），它持有的 job 句柄被系统关掉
+    # → job 关闭 → 看门狗跟着没。否则脚本用 exit_hard() 结束时不会调 disarm()，
+    # 看门狗会一直挂到超时才自己退出，白留一个进程。
+    # 系统不让嵌套 job 时 join_job 返回 False —— 那种情况下看门狗仍会超时自退。
+    job = make_job()
+    if job:
+        join_job(job, proc.pid)
+
+    def disarm():
+        if proc.poll() is None:
+            try:
+                proc.kill()
+            except Exception:
+                pass
 
     return disarm
 

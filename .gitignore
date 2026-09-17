@@ -9,6 +9,9 @@ last-result.json
 campus-login.log
 selftest.txt
 guitest.txt
+# watchdog_gil_test.py 的「子进程跑完了没」标记。脚本正常退出会自己删，
+# 被强杀时会留下来 —— 留着的是未跟踪文件，而内容看着像「通过」，别误提交。
+_watchdog_gil_marker.txt
 
 # ---- 构建产物 ----
 # PyInstaller 的 workpath / distpath。体积大（build1 13M / dist1 9.4M），

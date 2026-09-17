@@ -21,6 +21,7 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import exit_hang_probe as P   # noqa: E402  复用 cpu_seconds / threads_of / windows_of
+import paths                  # noqa: E402
 import shot                   # noqa: E402
 
 user32 = P.user32
@@ -32,8 +33,7 @@ def main():
     observe = 60.0
     if args and args[-1].replace(".", "").isdigit():
         observe = float(args.pop())
-    exe = args[0] if args else os.path.join(
-        os.path.expanduser("~"), "Desktop", "校园网自动登录.exe")
+    exe = args[0] if args else paths.default_exe()
     if not os.path.isfile(exe):
         print("找不到 exe: %s" % exe)
         return 1

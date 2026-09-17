@@ -219,6 +219,52 @@ def test_sweep():
             pass
     check("测试自己建的目录已清理", os.path.isdir(new) or os.path.isdir(locked), False)
 
+    # 报告必须能分清「太新」和「还在用」—— 两者的下一步**完全相反**：
+    # 太新 → 等一会儿或把 min_age 降下来；还在用 → 有进程握着句柄，别硬删。
+    # 合并成一句「跳过 N 个（还在用/太新）」会让人不知道该等还是该收手。
+    # 我为此多查了两步才搞明白，所以钉一条测试。
+    import contextlib
+    import io as _io
+    import re
+
+    print()
+    print("=== 6b. 跳过原因要分开报（太新 / 还在用）===")
+    rep_old = root + os.sep + tag + "_rep_old"
+    rep_new = root + os.sep + tag + "_rep_new"
+    rep_busy = root + os.sep + tag + "_rep_busy"
+    for d in (rep_old, rep_new, rep_busy):
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "dummy.txt"), "w") as f:
+            f.write("x")
+    os.utime(rep_old, (two_hours_ago, two_hours_ago))
+    # ⚠️ rep_busy 也必须拨老。不拨的话它会先在 min_age 那道门槛被拦下、
+    #    根本走不到改名探测，「还在用」这条分支等于没测到（我第一版就这么错了）。
+    os.utime(rep_busy, (two_hours_ago, two_hours_ago))
+    fh2 = open(os.path.join(rep_busy, "dummy.txt"), "r")
+    buf = _io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            proc_tree.sweep_mei_temp(min_age=600)
+    finally:
+        fh2.close()
+    line = buf.getvalue().strip()
+    print("  实际输出: %s" % line)
+    m = re.search(r"太新 (\d+) / 还在用 (\d+)", line)
+    check("报告里有「太新 N / 还在用 N」两个数", m is not None, True)
+    if m:
+        # 用 >= 而不是 ==：别的测试也会留下刚生成的 _MEI 目录，数量不是我能独占的
+        check("太新 >= 1（刚建的那个）", int(m.group(1)) >= 1, True)
+        check("还在用 >= 1（句柄没放的那个）", int(m.group(2)) >= 1, True)
+    check("够老且没人用的那个被删了", os.path.isdir(rep_old), False)
+    check("刚建的还在", os.path.isdir(rep_new), True)
+    check("被占用的还在", os.path.isdir(rep_busy), True)
+
+    for d in (rep_old, rep_new, rep_busy):
+        try:
+            shutil.rmtree(d)
+        except Exception:
+            pass
+
 
 def test_guitest_exit():
     """--guitest 必须按时返回 —— 这是「启动器父进程挂着不退」那个坑的回归测试。
@@ -245,11 +291,61 @@ def test_guitest_exit():
               (rc, timed_out), (0, False))
 
 
+def test_watchdog_fallback():
+    """独立进程起不来时必须**出声**，不能静默退化成线程版。
+
+    `proc is None` 有两种来源，处置完全不同：
+      · 打包后（frozen）—— 预期内，没别的解释器可用，退化是设计好的；
+      · `Popen` 真的失败（杀软拦截、解释器被挪走……）—— **意外**。
+    而退化后的线程版在「主线程占着 GIL」时**不会触发**，那恰恰是看门狗唯一
+    存在的理由。**静默退化 = 安全网悄悄消失**，所以这条得钉住。
+
+    阳性对照是把 `Popen` 换成必抛异常的假货；阴性对照是走正常路径 ——
+    只测「有警告」是不够的，还得证明**正常时不警告**，否则一个恒真的警告
+    也能让测试通过。
+    """
+    print()
+    print("=== 8. 看门狗降级要出声（不能静默）===")
+    code = (
+        "import sys\n"
+        "sys.path.insert(0, %r)\n"
+        "import proc_tree\n"
+        "class Boom:\n"
+        "    def __init__(self, *a, **k):\n"
+        "        raise OSError('模拟被杀软拦截')\n"
+        "proc_tree.subprocess.Popen = Boom\n"
+        "d = proc_tree.arm_watchdog(20, '降级测试')\n"
+        "d()\n"
+        "print('降级路径结束')\n" % HERE
+    )
+    rc, secs, out = run_snippet(code)
+    check("起不来时打了警告", "独立进程起不来" in out, True)
+    check("说明了退化成线程版", "退化成线程版" in out, True)
+    check("说明了线程版救不了 GIL 场景", "GIL" in out, True)
+    check("降级后仍然正常返回", "降级路径结束" in out, True)
+    check("降级路径退出码 0", rc, 0)
+
+    print()
+    print("=== 8b. 对照：正常路径**不该**出现这条警告 ===")
+    code = (
+        "import sys\n"
+        "sys.path.insert(0, %r)\n"
+        "import proc_tree\n"
+        "d = proc_tree.arm_watchdog(20, '正常')\n"
+        "d()\n"
+        "print('正常路径结束')\n" % HERE
+    )
+    rc, secs, out = run_snippet(code)
+    check("正常时不出现这条警告", "独立进程起不来" in out, False)
+    check("正常路径退出码 0", rc, 0)
+
+
 def main():
     test_watchdog()
     test_tree()
     test_sweep()
     test_guitest_exit()
+    test_watchdog_fallback()
 
     print()
     if FAILS:

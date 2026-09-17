@@ -79,7 +79,6 @@ def threads_of(pid):
     try:
         te = TE()
         te.dwSize = ctypes.sizeof(TE)
-        p = ctypes.pointer(te)
         if kernel32.Thread32First(h, ctypes.byref(te)):
             while True:
                 if te.th32OwnerProcessID == pid:
