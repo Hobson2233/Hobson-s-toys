@@ -75,11 +75,20 @@ check("load_accounts 为空", acc.get("accounts") == {})
 if "--no-gui" in sys.argv:
     print("%-46s SKIP (--no-gui)" % "无配置时界面可构建")
 else:
+    # 受控会话里建 Tk 可能直接挂住，而 `run_gui(smoke=True)` 是**进程内**调用，
+    # 外面没有超时能拦它 —— 2026-09-17 实测挂了 28 分钟没返回（tail 一直等，
+    # 看起来像「测试很慢」，其实是永远不结束）。
+    # 所以给它套一个看门狗：到点硬退，退出码 4（和「断言失败 1」区分开），
+    # 让人一眼看出是卡住而不是测试没过。**超时不算通过**，别假装测过。
+    import proc_tree
+    disarm = proc_tree.arm_watchdog(120, "fresh_test 建 Tk 窗口（受控会话可能挂住）")
     try:
         C.run_gui(smoke=True)
         check("无配置时界面可构建", True)
     except Exception as e:
         check("无配置时界面可构建", False, repr(e))
+    finally:
+        disarm()
 
 # 6) 存一个账号后能正常读回，并自动补全其余字段
 C.save_config({"userId": "1234567890", "passwd": "pw"})
