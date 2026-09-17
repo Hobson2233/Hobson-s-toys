@@ -21,7 +21,6 @@ import argparse
 import ctypes
 import os
 import struct
-import subprocess
 import sys
 import time
 import zlib

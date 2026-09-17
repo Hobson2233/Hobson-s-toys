@@ -5,7 +5,6 @@
     python verify_exe.py
 """
 import os
-import subprocess
 import sys
 import time
 

@@ -18,7 +18,6 @@
 用法：
     python proc_tree_test.py
 """
-import ctypes
 import os
 import subprocess
 import sys

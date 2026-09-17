@@ -86,6 +86,8 @@ paths.py                统一的路径解析（不要在脚本里写死绝对�
 proc_tree.py            进程树管理：Job Object + 看门狗 + _MEI 残留清理
 build.py                构建入口，带四道门槛
 savepoint.py            本地存档：改代码前打快照，搞砸了能回退
+ast_bugscan.py          AST 级 bug 扫描（自查用，带阳性/阴性对照）
+stack_probe.py          卡住时打印所有线程堆栈（排障用）
 local_secrets.example.py  本地凭据模板（复制成 local_secrets.py 填真值，已被 gitignore）
 docs/                   README 用的界面截图
 ```
@@ -158,6 +160,7 @@ python savepoint.py diff                       # 先看看现在跟存档差在�
 | `wiring_gate_test.py` | 验「接线自检」这道门槛的报警链路本身通不通 | 否 |
 | `verify_exe.py` | 只验不打包 | 否 |
 | `pwd_test.py` | 密码框显示规则（纯函数） | 否 |
+| `poll_test.py` | 界面轮询队列：出错要不要记日志、会不会中断整批 | 否 |
 | `pwd_gui_test.py` | 密码框真实窗口绑定 | 否（要真桌面） |
 | `geometry_test.py` | 9 种屏幕尺寸下窗口不超出屏幕 | 否 |
 | `proc_tree_test.py` | 进程树与看门狗，含「故意复现孤儿进程」 | 否 |
@@ -165,8 +168,21 @@ python savepoint.py diff                       # 先看看现在跟存档差在�
 | `ui_shot.py` / `layout_probe.py` | 截图 / 量布局（要真桌面） | 否 |
 | `png_zoom.py` | 裁切放大 PNG 局部、数字形个数（核对截图里画了什么） | 否 |
 | `savepoint.py` | 本地存档：改代码前打快照，搞砸了能整体回退 | 否（改代码前用） |
+| `ast_bugscan.py` | AST 级 bug 扫描：重复字典键 / 重复定义 / `is` 比字面量 / 可变默认参数 / 空 except / `finally` 里 return / `if x==1 or 2` / 赋值后未用 | 否（自查用，带阳性+阴性对照） |
+| `stack_probe.py` | 跑到卡住时把**所有线程**的堆栈打出来（`faulthandler`） | 否（排障用） |
 
 跑测试要用**带 PyInstaller 的解释器**（`leak_check` / `help_check` / `portability_check` 依赖它）。
+
+#### ⚠️ 从源码跑 GUI 检查要用 `pythonw.exe`
+
+实测（2026-09-17）：用 **`python.exe`（控制台子系统）** 跑 `--guitest`，程序会**卡住不退出**，
+连 `os._exit(0)` 都杀不掉进程。最小复现是 `tk.Tk(); withdraw(); update_idletasks(); destroy()` ——
+只要 Tk 窗口真正实例化过，带控制台的进程在 `ExitProcess` 的 DLL detach 阶段就会挂住。
+换成 **`pythonw.exe`（GUI 子系统，无控制台）** 立刻正常退出。
+
+打包出来的 exe 是 `--windowed`，属于 GUI 子系统，**不受影响**（`--guitest` 3.3s 退出码 0）。
+所以：从源码验界面用 `pythonw.exe`，或者直接验 exe（`verify_exe.py`）。
+`build.py` 的门槛跑的是 exe，因此一直是准的。
 
 ## 适配其它学校
 

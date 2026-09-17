@@ -20,6 +20,7 @@ import sys
 import json
 import time
 import socket
+import queue
 import threading
 import subprocess
 import traceback
@@ -129,7 +130,7 @@ def _writable(d):
     try:
         os.makedirs(d, exist_ok=True)
         probe = os.path.join(d, ".write_probe")
-        with open(probe, "w") as f:
+        with open(probe, "w", encoding="utf-8") as f:
             f.write("1")
         os.remove(probe)
         return True
@@ -549,7 +550,11 @@ def local_mac():
         if m:
             return m.group(1).replace("-", ":").lower()
     except Exception:
-        pass
+        log("getmac 取 MAC 失败:\n%s" % traceback.format_exc())
+    # 两条路都失败 → 返回空串。**必须留痕**：这个空值会直接填进登录表单的
+    # mac 字段，门户拿不到 MAC 就会拒绝认证，而界面只会显示一句含糊的失败，
+    # 完全看不出是 MAC 没取到。这是"登录失败但毫无线索"的典型来源。
+    log("取本机 MAC 失败：psutil 和 getmac 都没拿到，登录可能被门户拒绝")
     return ""
 
 
@@ -1054,7 +1059,10 @@ def set_autostart(on):
                 try:
                     os.remove(p)
                 except Exception:
-                    pass
+                    # 删不掉就留着，但必须留痕：旧链接（比如指向 .bat 的）还在的话，
+                    # 开机时它和新建的 .lnk 会**同时触发**，等于登录两遍。
+                    log("旧自启链接删不掉，可能残留:\n%s\n%s"
+                        % (p, traceback.format_exc()))
             lnk_path = os.path.join(d, AUTOSTART_LNK_NAME)
             make_lnk(lnk_path, exe, arguments="--auto", icon=exe, work_dir=os.path.dirname(exe))
             return (True, "") if os.path.isfile(lnk_path) else (False, "快捷方式未生成")
@@ -1389,10 +1397,15 @@ EXTRA_H = 40        # 给标题栏/边框留的余量
 SCREEN_MARGIN_H = 80    # 给任务栏 + 标题栏留的余量
 
 
-def window_geometry(sw, sh, reqh, reqw=0):
+def window_geometry(sw, sh, reqh):
     """按屏幕尺寸和内容需要的高度算窗口几何，返回 (w, h, x, y)。
 
-    **必须按屏幕收口。** 原来的写法只把高度限制在 560..1000，完全没看屏幕多高 ——
+    **宽度只按屏幕算**，跟内容想要多宽无关（内容宽度由下面 820 的下限兜住）。
+    原来签名里还有个 `reqw` 参数，但全仓没有任何调用点传它、函数体里也从不使用
+    —— 一个"看起来会让宽度自适应内容、实际完全不影响"的死参数，只会误导人，
+    已经删掉。真要按内容调宽度，得先有调用点传 `winfo_reqwidth()` 再说。
+
+    **高度必须按屏幕收口。** 原来的写法只把高度限制在 560..1000，完全没看屏幕多高 ——
     在 1366x768、或者 1080p 开了 150% 缩放（虚拟化后只剩 720 高）这类屏幕上，
     窗口会比屏幕还高。要是界面又没滚动条，底部的「开机自启」就永远够不到，
     那是**真的没法开自启**，不只是难看。
@@ -1414,6 +1427,39 @@ def minsize_for(sw, sh):
     """最小尺寸同样要按屏幕收口，否则小屏幕上用户连缩都缩不动。"""
     return (min(700, max(360, sw - 40)),
             min(520, max(320, sh - SCREEN_MARGIN_H)))
+
+
+def drain_queue(q, handle, empty_exc=queue.Empty):
+    """把队列里的消息全部处理掉，返回 (成功条数, 出错条数)。
+
+    抽成模块级函数是为了**能测** —— 原来这段逻辑内嵌在 GUI 闭包里，
+    不建真窗口就碰不到，于是它带着一个 bug 活了很久。
+
+    两条设计要点，都是踩过的坑：
+
+      1. 「队列空了」用 `queue.Empty` **精确**判定，它是正常结束条件，不是错误。
+         原来写成 `except Exception: pass` 把两者混在一起，结果是真错误被当成
+         "没消息了"静默吞掉，日志里一个字都看不到，排查时无从下手。
+      2. 单条消息出错只影响那一条，后面的继续处理。原来一条出错就中断整批，
+         排队等着的其它消息（比如网络状态更新）永远处理不到。
+
+    注意：`handle` 自己负责"不管出什么事都要收尾"的清理（比如解除忙碌状态），
+    用 try/finally 写在它里面。
+    """
+    n_ok = 0
+    n_err = 0
+    while True:
+        try:
+            msg = q.get_nowait()
+        except empty_exc:
+            break                       # 队列空了 = 正常，不是错误
+        try:
+            handle(msg)
+            n_ok += 1
+        except Exception:
+            n_err += 1
+            log("界面刷新异常:\n%s" % traceback.format_exc())
+    return n_ok, n_err
 
 
 # ==================== 界面 ====================
@@ -1705,30 +1751,43 @@ def run_gui(smoke=False):
 
         threading.Thread(target=work, daemon=True).start()
 
+    def handle_msg(msg):
+        """处理一条队列消息。异常往上抛，由 drain_queue 记日志并继续下一条。"""
+        kind, payload = msg
+        if kind == "status":
+            on = payload
+            if on is True:
+                dot.itemconfigure(dot_id, fill="#28a745")
+                status_text.configure(text="已连接校园网")
+            elif on is False:
+                dot.itemconfigure(dot_id, fill="#dc3545")
+                status_text.configure(text="未连接校园网")
+            else:
+                dot.itemconfigure(dot_id, fill="#bbbbbb")
+                status_text.configure(text="网络状态未知")
+        elif kind == "job":
+            code, text = payload
+            try:
+                load_all()
+                show(text, "ok" if code == 0 else "err")
+                refresh_status()
+            finally:
+                # **必须在 finally 里**：上面任何一步抛异常，界面就会永久卡在
+                # "忙碌"——三个按钮全灰点不动，而用户看不到任何原因，
+                # 看起来就是"窗口卡死了"。这正是最难查的那种症状。
+                set_busy(False)
+
     def poll():
         try:
-            while True:
-                kind, payload = state["queue"].get_nowait()
-                if kind == "status":
-                    on = payload
-                    if on is True:
-                        dot.itemconfigure(dot_id, fill="#28a745")
-                        status_text.configure(text="已连接校园网")
-                    elif on is False:
-                        dot.itemconfigure(dot_id, fill="#dc3545")
-                        status_text.configure(text="未连接校园网")
-                    else:
-                        dot.itemconfigure(dot_id, fill="#bbbbbb")
-                        status_text.configure(text="网络状态未知")
-                elif kind == "job":
-                    code, text = payload
-                    set_busy(False)
-                    load_all()
-                    show(text, "ok" if code == 0 else "err")
-                    refresh_status()
+            drain_queue(state["queue"], handle_msg)
         except Exception:
-            pass
-        root.after(120, poll)
+            log("界面轮询异常:\n%s" % traceback.format_exc())
+        # 无论上面发生了什么，下一次轮询都要排上。否则轮询链条一断，
+        # 界面就再也不刷新了（后台任务的结果永远回不来）。
+        try:
+            root.after(120, poll)
+        except Exception:
+            log("排下一次轮询失败:\n%s" % traceback.format_exc())
 
     # --- 按钮动作 ---
     def form():
@@ -1842,9 +1901,8 @@ def run_gui(smoke=False):
         show("已开启开机自启" if want else "已关闭开机自启", "ok")
 
     # --- 启动 ---
-    import queue as _q
-    state["queue"] = _q.Queue()
-    import tkinter.font as _f
+    # queue 已在模块顶层导入（poll() 要按名字捕获 queue.Empty）
+    state["queue"] = queue.Queue()
     root.option_add("*Font", (fam, BASE))
 
     load_all()
@@ -1917,11 +1975,14 @@ def exit_now(code):
 
 
 def main():
-    # --windowed 打包后 stdout/stderr 是 None，某些库会因此报错
+    # --windowed 打包后 stdout/stderr 是 None，某些库会因此报错。
+    # 显式指定 utf-8 + errors="replace"：中文 Windows 的默认编码是 cp936，
+    # 一旦有代码 print 出 cp936 表示不了的字符（emoji 之类）就会抛
+    # UnicodeEncodeError —— 而这里本来就是为了"兜住异常"才接的 devnull。
     if sys.stdout is None:
-        sys.stdout = open(os.devnull, "w")
+        sys.stdout = open(os.devnull, "w", encoding="utf-8", errors="replace")
     if sys.stderr is None:
-        sys.stderr = open(os.devnull, "w")
+        sys.stderr = open(os.devnull, "w", encoding="utf-8", errors="replace")
 
     args = [a.lower() for a in sys.argv[1:]]
 
@@ -1938,7 +1999,9 @@ def main():
     try:
         migrate_legacy_data()
     except Exception:
-        pass
+        # 不记日志的话，新机器上"账号没继承过来"就完全没线索：
+        # 用户只看到一张空表单，分不清是"本来就没有旧数据"还是"继承时炸了"。
+        log("继承旧数据失败（不影响启动）:\n%s" % traceback.format_exc())
 
     if "--selftest" in args:
         common = (_shell_folder(CSIDL_COMMON_APPDATA) or "").lower()
@@ -1977,7 +2040,10 @@ def main():
             with open(os.path.join(data_dir(), "selftest.txt"), "w", encoding="utf-8") as f:
                 f.write(text)
         except Exception:
-            pass
+            # 落盘失败要留痕：这个文件是 --windowed 打包后**唯一**能验到结果的通道
+            # （那种 exe 没有 stdout）。写不进去却没人知道，验证脚本就只能去读
+            # 上一轮留下的旧文件 —— 那会报出"假通过"。
+            log("selftest.txt 写入失败:\n%s" % traceback.format_exc())
         exit_now(0)
 
     if "--guitest" in args:
@@ -1996,7 +2062,9 @@ def main():
             with open(os.path.join(data_dir(), "guitest.txt"), "w", encoding="utf-8") as f:
                 f.write(result)
         except Exception:
-            pass
+            # 同 selftest.txt：这是 --windowed 下唯一的验证通道，写失败必须留痕，
+            # 否则验证脚本会去读上一轮的旧标记，把失败报成通过。
+            log("guitest.txt 写入失败:\n%s" % traceback.format_exc())
         exit_now(code)
 
     if "--switch" in args:

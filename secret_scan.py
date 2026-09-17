@@ -157,6 +157,19 @@ def edit_message():
         return ""
 
 
+def mask(n):
+    """把凭据打成可辨认但不能复原的样子。
+
+    为什么要打码：报告要能区分"泄漏的是账号还是密码"（两者的处置完全不同），
+    但**不能把凭据原文再打一遍** —— 这个脚本的输出经常被贴进 issue、CI 日志、
+    聊天窗口，那等于换个地方再泄漏一次。留前 2 位就够人对上号了。
+    """
+    n = str(n)
+    if len(n) <= 2:
+        return "*" * len(n)
+    return n[:2] + "*" * (len(n) - 2)
+
+
 def scan_messages(msgs, needles):
     """扫提交信息。返回问题列表，元素是 (sha, 类别, 说明)。"""
     problems = []
@@ -164,7 +177,8 @@ def scan_messages(msgs, needles):
         for n in needles:
             if n in body:
                 problems.append((sha, "提交信息里有已知凭据",
-                                 "命中一个已知账号/密码（信息共 %d 字）" % len(body)))
+                                 "命中一个已知账号/密码（%s…，信息共 %d 字）"
+                                 % (mask(n), len(body))))
                 break
         for pat, what in SUSPICIOUS:
             for m in pat.finditer(body):
@@ -216,11 +230,13 @@ def scan(files, needles):
         #    所以文本文件搜原始字节，非文本文件连 UTF-16 也搜）
         for enc_needle, original in nb:
             if enc_needle in raw:
-                problems.append((rel, "已知真实凭据", "命中一个已知账号/密码"))
+                problems.append((rel, "已知真实凭据",
+                                 "命中一个已知账号/密码（%s…）" % mask(original)))
         if ext not in TEXT_EXT:
             for enc_needle, original in n16:
                 if enc_needle in raw:
-                    problems.append((rel, "已知真实凭据(UTF-16)", "命中一个已知账号/密码"))
+                    problems.append((rel, "已知真实凭据(UTF-16)",
+                                     "命中一个已知账号/密码（%s…）" % mask(original)))
 
         if ext not in TEXT_EXT and not rel.endswith(".gitignore"):
             continue
@@ -278,6 +294,22 @@ def self_test(needles):
             found += 1
     ok = found >= 2
     check("埋进去的假凭据能被两类规则同时抓到", ok, "命中 %d 类" % found)
+
+    # mask() 的硬性要求：打码后**不能**还原出原文，也不能比原文更长还带原文片段
+    # 注意样本必须用**假**学号：这里写真实学号会被本扫描器自己抓出来
+    #（实测过，报"已知真实凭据"），等于换个地方再泄漏一次。
+    bad_mask = []
+    for n in list(needles) + ["", "a", "ab", "abc", "2025000000"]:
+        m = mask(n)
+        if len(n) > 2 and n in m:
+            bad_mask.append(n)
+        if len(n) > 2 and m[-1] != "*":
+            bad_mask.append(n)
+    check("mask() 打码后不含原文（不会二次泄漏）", not bad_mask,
+          "有问题: %s" % bad_mask if bad_mask else "%d 个样本全部通过"
+          % (len(needles) + 5))
+    check("mask() 样例", mask("2025000000") == "20********", mask("2025000000"))
+
     try:
         os.remove(p)
         os.rmdir(tmpdir)

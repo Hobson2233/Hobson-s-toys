@@ -9,7 +9,6 @@
 用法：
     python switch_test.py
 """
-import os
 import sys
 import time
 
