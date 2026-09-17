@@ -8,6 +8,7 @@
   - --selftest      : 环境自检，结果打印并写入数据目录 selftest.txt
   - --guitest       : 只构建界面不显示，结果写入数据目录 guitest.txt
   - --purge         : 清除本机保存的账号密码等隐私数据
+  - --version (-v)  : 只打印版本号就退出（打包后没有 stdout，改为弹窗）
 
 数据目录：C:\\ProgramData\\CampusLogin
           （该目录写不进去时自动退回 %APPDATA%\\CampusLogin）
@@ -32,7 +33,16 @@ from urllib.parse import urlparse, parse_qs, urlencode
 
 APP_NAME = "CampusLogin"
 APP_TITLE = "校园网自动登录"
-VERSION = "2.0"
+
+# 对外版本号，语义化版本：主版本.次版本.修订号
+#   主版本：不兼容的改动（改配置格式、换认证协议）
+#   次版本：加了功能但向后兼容
+#   修订号：只修 bug
+#
+# ⚠️ 这里是**唯一来源**。界面标题、使用说明、--version、--selftest、
+#    以及 exe 文件属性里的版本，全部由它推导 —— 不要在别处另写一份，
+#    否则迟早漂移（改了一处忘了另一处，用户看到的版本号就是错的）。
+VERSION = "0.1.0"
 
 # 学校 portal 默认参数（拷到同校其他电脑上可直接用）
 DEFAULTS = {
@@ -1077,8 +1087,9 @@ def set_autostart(on):
 # 说明文字直接写进程序，不再随 exe 附带 .txt —— 拷一个 exe 过去就能看到。
 # 面向使用者：不写实现细节，短句、少术语，第一次用的人照着做就行。
 # （排障用的 --selftest 之类留在 --help 和日志里，不占说明篇幅。）
-HELP_TEXT = r"""校园网自动登录 —— 使用说明
-
+# 标题行用拼接的方式带上版本号，**不把它写死在下面的长文本里** ——
+# 否则以后改版本号时很容易漏掉这一处，用户看到的说明就成了旧版本。
+HELP_TEXT = ("校园网自动登录 —— 使用说明（v%s）\n" % VERSION) + r"""
 【第一次使用】
 
   1. 填上你的校园网账号和密码
@@ -1477,7 +1488,7 @@ def run_gui(smoke=False):
     root = tk.Tk()
     if smoke:
         root.withdraw()          # 自检时不显示窗口
-    root.title("%s · 设置" % APP_TITLE)
+    root.title("%s v%s · 设置" % (APP_TITLE, VERSION))
     root.configure(bg=BG)
 
     # 按屏幕高度决定字号，避免高分屏上字太小
@@ -1545,6 +1556,8 @@ def run_gui(smoke=False):
     head = tk.Frame(inner, bg=CARD)
     head.pack(fill="x", pady=(0, 14))
     lbl(head, "%s · 设置" % APP_TITLE, TITLE, True).pack(side="left")
+    # 版本号紧跟在标题右边，小字弱色。用户要报问题时第一眼就能看到它。
+    lbl(head, "v%s" % VERSION, SMALL, fg=SUB).pack(side="left", padx=(8, 0))
     tk.Button(head, text="使用说明", font=(fam, SMALL), bg="#eef0f3", fg="#333",
               activebackground="#e0e4ea", activeforeground="#333",
               relief="flat", bd=0, cursor="hand2", padx=14, pady=3,
@@ -1843,7 +1856,7 @@ def run_gui(smoke=False):
         拷到别的电脑上，照样点得开说明。
         """
         win = tk.Toplevel(root)
-        win.title("使用说明 · %s" % APP_TITLE)
+        win.title("使用说明 · %s v%s" % (APP_TITLE, VERSION))
         win.configure(bg=CARD)
         win.transient(root)              # 跟随主窗口，不单独占一个任务栏项
         ico = icon_path()
@@ -1985,6 +1998,27 @@ def main():
         sys.stderr = open(os.devnull, "w", encoding="utf-8", errors="replace")
 
     args = [a.lower() for a in sys.argv[1:]]
+
+    # --version：纯查询，没有副作用，所以放在最前面。
+    # 也**必须**在 migrate 之前 —— 只想问一句版本号，不该顺手改动数据目录。
+    # （args 已转小写，所以 -V 在这里就是 -v，不用另判一次。）
+    if "--version" in args or "-v" in args:
+        text = "%s %s" % (APP_TITLE, VERSION)
+        if is_frozen():
+            # 坑：--windowed 打包出来的 exe 没有 stdout（sys.stdout 是 None），
+            # print 出来的东西直接扔掉，用户什么也看不到。弹窗才看得见。
+            try:
+                import tkinter as _tk
+                import tkinter.messagebox as _mb
+                _r = _tk.Tk()
+                _r.withdraw()
+                _mb.showinfo("版本", text)
+                _r.destroy()
+            except Exception:
+                log("--version 弹窗失败:\n%s" % traceback.format_exc())
+        else:
+            print(text)
+        exit_now(0)
 
     # 必须在继承旧数据**之前**处理：否则刚继承进来的账号又被这里删掉，
     # 顺序反了会让人以为清除失败（或者以为继承成功）。

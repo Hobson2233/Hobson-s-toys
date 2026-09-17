@@ -26,7 +26,7 @@ DESKTOP_DIR = os.path.join(os.path.expanduser("~"), "Desktop")
 # 两处硬编码同一个字符串迟早会漂移，那时构建门槛就永远搜不到、静默失效。
 # campus_login 顶层不 import tkinter（都是延迟导入），所以这里导入是安全的。
 sys.path.insert(0, HERE)
-from campus_login import WIRING_FAIL_PHRASE  # noqa: E402
+from campus_login import APP_TITLE, WIRING_FAIL_PHRASE, VERSION  # noqa: E402
 import proc_tree  # noqa: E402  —— 收进程树（onefile 是父子两个进程，别只杀父）
 
 # 从包里剔掉的模块。每一项都有具体理由，别凭感觉往里加。
@@ -135,6 +135,123 @@ def _small_icon(src, dst, sizes):
     return len(head) + len(body)
 
 
+# exe 的版本资源（右键 → 属性 → 详细信息 里能看到的那几行）。
+# Windows 只认 VS_VERSIONINFO 这种结构，用 PyInstaller 的 --version-file 传进去，
+# 它在打包时把资源写进 PE。
+# **版本号从 campus_login.VERSION 派生，不要在这里再写一份字面量** ——
+# 两处硬编码迟早漂移，变成「界面上写 0.2.0、文件属性里还写着 0.1.0」，
+# 而且没有任何东西会报错。
+VERSION_INFO_TEMPLATE = """\
+VSVersionInfo(
+  ffi=FixedFileInfo(
+    filevers=%(quad)s,
+    prodvers=%(quad)s,
+    mask=0x3f,
+    flags=0x0,
+    OS=0x40004,
+    fileType=0x1,
+    subtype=0x0,
+    date=(0, 0)
+    ),
+  kids=[
+    StringFileInfo(
+      [
+      StringTable(
+        u'%(table_key)s',
+        [StringStruct(u'CompanyName', u'Hobson'),
+        StringStruct(u'FileDescription', u'%(title)s'),
+        StringStruct(u'FileVersion', u'%(ver)s'),
+        StringStruct(u'InternalName', u'%(name)s'),
+        StringStruct(u'LegalCopyright', u'MIT License'),
+        StringStruct(u'OriginalFilename', u'%(title)s.exe'),
+        StringStruct(u'ProductName', u'%(title)s'),
+        StringStruct(u'ProductVersion', u'%(ver)s')])
+      ]),
+    VarFileInfo([VarStruct(u'Translation', [%(lang)d, %(codepage)d])])
+  ]
+)
+"""
+
+
+def _ver_tuple(v):
+    """"0.1.0" → (0, 1, 0, 0)。
+
+    Windows 的 filevers / prodvers **只接受 4 段纯数字**，不接受 "0.1.0-beta"
+    这种后缀，所以非数字段一律丢掉、不足 4 段补 0、多的截掉。
+
+    注意只取每段**开头**的连续数字：`"0.2.0-rc1"` 的第三段是 `"0-rc1"`，
+    它是第 0 版、不是第 01 版 —— 把段内所有数字都捞出来会得到 (0,2,1,0)，
+    悄悄把一个预发布版报成了修订号 1。
+    """
+    nums = []
+    for part in str(v).split("."):
+        digits = ""
+        for ch in part.strip():
+            if not ch.isdigit():
+                break
+            digits += ch
+        nums.append(int(digits) if digits else 0)
+    return tuple((nums + [0, 0, 0, 0])[:4])
+
+
+def _version_file(dst):
+    """生成 --version-file 用的文本，返回路径。
+
+    两个容易踩的点：
+    - `StringTable` 的键必须是**语言 + 代码页**拼起来的十六进制
+      （0804 = 2052 简体中文，04b0 = 1200 Unicode），且要和下面
+      `VarFileInfo` 的 Translation 一致；对不上资源在属性页里读不出来。
+    - 写成**不带 BOM 的 UTF-8**。PyInstaller 用 `miscutils.decode()` 读它，
+      该函数认 BOM 和编码声明，没有 BOM 时按 UTF-8 走 —— 所以中文标题是安全的。
+    """
+    lang, codepage = 2052, 1200
+    text = VERSION_INFO_TEMPLATE % {
+        "quad": repr(_ver_tuple(VERSION)),
+        "ver": VERSION,
+        "title": APP_TITLE,
+        "name": NAME,
+        "table_key": "%04x%04x" % (lang, codepage),
+        "lang": lang,
+        "codepage": codepage,
+    }
+    with open(dst, "w", encoding="utf-8", newline="\n") as f:
+        f.write(text)
+    return dst
+
+
+def _read_exe_version(path):
+    """从 exe 的 PE 资源里读回 FileVersion 字符串。读不到返回 ""。
+
+    为什么要读回来：`--version-file` 失败时 PyInstaller 往往**不报错**，
+    只是资源没进去 —— 那样「传了参数」和「真写进去了」输出一模一样。
+    走 Win32 的 version.dll，不为读一个版本号去装 pefile。
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    ver = ctypes.WinDLL("version")
+    size = ver.GetFileVersionInfoSizeW(path, None)
+    if not size:
+        return ""
+    buf = ctypes.create_string_buffer(size)
+    if not ver.GetFileVersionInfoW(path, 0, size, buf):
+        return ""
+    ptr = ctypes.c_void_p()
+    length = wintypes.UINT()
+    # 先问资源里实际的语言/代码页，再按它拼查询路径。
+    # 写死 080404b0 平时也能用，但读回来更稳 —— 万一资源没按我们指定的语言块落地。
+    if not ver.VerQueryValueW(buf, "\\VarFileInfo\\Translation",
+                              ctypes.byref(ptr), ctypes.byref(length)):
+        return ""
+    if length.value < 4:
+        return ""
+    lang, codepage = ctypes.cast(ptr, ctypes.POINTER(wintypes.WORD * 2)).contents
+    sub = "\\StringFileInfo\\%04x%04x\\FileVersion" % (lang, codepage)
+    if not ver.VerQueryValueW(buf, sub, ctypes.byref(ptr), ctypes.byref(length)):
+        return ""
+    return ctypes.wstring_at(ptr.value)
+
+
 def main():
     try:
         import tkinter  # noqa: F401
@@ -169,9 +286,14 @@ def main():
         print("图标裁剪失败，改用原图标")
 
     hooks_dir = os.path.join(HERE, "hooks")
+    # exe 的版本资源：生成一份 VS_VERSIONINFO 文本喂给 PyInstaller。
+    # 落在 HERE 而不是 work/ 里 —— 构建目录每次换新的，调试时想看一眼还得去翻。
+    vf = _version_file(os.path.join(HERE, "version_info.txt"))
+    print("版本资源: %s（%s）" % (VERSION, vf))
     cmd = [sys.executable, "-m", "PyInstaller", "--noconfirm",
            "--onefile", "--windowed", "--name", NAME,
-           "--icon", ICON, "--add-data", "%s%s." % (small_icon, os.pathsep),
+           "--icon", ICON, "--version-file", vf,
+           "--add-data", "%s%s." % (small_icon, os.pathsep),
            "--distpath", dist,
            "--workpath", work,
            "--specpath", work,

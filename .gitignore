@@ -19,6 +19,9 @@ dist*/
 icon_small/
 # 裁图标时的中间产物
 *.ico.orig
+# exe 的版本资源文本：build.py 每次从 campus_login.VERSION 重新生成，
+# 提交它等于给版本号留了第二个来源，改版本时就会漂移。
+version_info.txt
 
 # ---- Python ----
 __pycache__/
