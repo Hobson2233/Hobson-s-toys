@@ -26,6 +26,14 @@ icon_small/
 # 提交它等于给版本号留了第二个来源，改版本时就会漂移。
 version_info.txt
 
+# 构建日志（python build.py > build_out.txt）。**里面有本机绝对路径**
+# （C:\Users\<用户名>\...），而且是未跟踪的 txt —— 不挡的话 `git add -A`
+# 会连着用户目录名一起推上公开仓库。
+# ⚠️ 2026-09-18 实测发现这个洞：`git check-ignore` 对 build_out.txt 无输出
+#    （= 没匹配任何规则），而 `git status` 里它是 `??`。当时 secret_scan 报的
+#    就是它 —— 那次报警是**对的**，只是没人去看里面到底是什么。
+build_out*.txt
+
 # ---- Python ----
 __pycache__/
 *.py[cod]

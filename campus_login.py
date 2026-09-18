@@ -31,6 +31,11 @@ import urllib.request
 from datetime import datetime
 from urllib.parse import urlparse, parse_qs, urlencode
 
+# 检查更新模块。纯标准库，不引入新依赖（打包体积的三条手段一条都不破坏）。
+# ⚠️ 顶层 import 而不是延迟 import：updater 只 import 标准库，开销可以忽略，
+#    但**打包时必须让 PyInstaller 看见它** —— 藏在函数里的 import 容易被漏掉。
+import updater
+
 APP_NAME = "CampusLogin"
 APP_TITLE = "校园网自动登录"
 
@@ -42,7 +47,7 @@ APP_TITLE = "校园网自动登录"
 # ⚠️ 这里是**唯一来源**。界面标题、使用说明、--version、--selftest、
 #    以及 exe 文件属性里的版本，全部由它推导 —— 不要在别处另写一份，
 #    否则迟早漂移（改了一处忘了另一处，用户看到的版本号就是错的）。
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 
 # 学校 portal 默认参数（拷到同校其他电脑上可直接用）
 DEFAULTS = {
@@ -1338,6 +1343,23 @@ HELP_TEXT = ("校园网自动登录 —— 使用说明（v%s）\n" % VERSION) +
       校园网自动登录.exe --purge
 
 
+【检查更新】
+
+  标题右边那行小字（就是写着「v版本号　检查更新」的那块）就是入口，点它一下。
+  （版本号写的是当前版本，不用记具体数字。）
+
+  如果有新版本，会问你「是否现在下载并升级」。
+  点「是」之后：下载 → 校验 → 替换 → 自动重新打开，整个过程不用你动手。
+  升级只换程序本身，保存在 C:\ProgramData\CampusLogin 里的账号不动。
+
+  为什么升级前要「校验」：下载下来的文件会跟发布方公布的哈希值对一遍，
+  对不上就直接丢掉，不会装一个来路不明的文件。
+
+  如果显示「检查更新失败」，多半是当时网络不通，稍后再点一次就行。
+  注意：**失败时会明确说「失败」，不会含糊地显示「已是最新版本」。**
+  这两件事必须分清楚 —— 没查成功不等于没有新版本。
+
+
 【注意】
 
   · 只适用于本校校园网。
@@ -1666,6 +1688,79 @@ def drain_queue(q, handle, empty_exc=queue.Empty):
 
 
 # ==================== 界面 ====================
+def _self_update_desc():
+    """给 --selftest 用的一句话：能不能自我替换，不能的话为什么。
+
+    抽出来是为了 selftest 那段保持「只拼字符串」——那里已经有 14 行字面量了，
+    再塞判断逻辑进去，以后改起来没人敢动。
+    """
+    try:
+        ok, detail = updater.can_self_update()
+    except Exception:
+        return "判定失败（见日志）"
+    return "能（%s）" % detail if ok else "不能（%s）" % detail
+
+
+def update_wiring_check(btn_ver):
+    """在真实界面里验证「版本号小字 → 检查更新」这条接线真的通了。
+
+    为什么要有这一条（和 pwd_wiring_check 同一个理由）：
+    `updater.py` 的自检测的是纯逻辑，`grep 'bind("<Button-1>")'` 只说明
+    源码里出现过这行字 —— **都证明不了「点下去真的会跑检查」**。常见的静默
+    失败是：控件被别的控件盖住、bind 写在了没 pack 的对象上、lambda 抓错闭包。
+    这些光看代码都看不出来，表现就是「用户点了版本号，什么也没发生」，
+    而且**没有任何报错**。
+
+    做法：把 `updater.check` 临时换成探针，往那个 Label 上真发一个
+    <Button-1>，然后确认探针被调到了 —— 这验证的是**真实的那条调用链**，
+    而不是我另外写的一个平行函数。比对完把探针换回去。
+    """
+    if btn_ver is None:
+        raise AssertionError("版本号控件不存在，标题行的更新入口没建出来")
+    # 文案只做**前缀**匹配（`v0.1.0`），不要求整串相等 ——
+    # 后面可能为了好看加/改后缀（比如「检查更新」），
+    # 写死整串会让测试因为一次文案微调就变红，那种红没人愿意查。
+    text = str(btn_ver.cget("text"))
+    if not text.startswith("v%s" % VERSION):
+        raise AssertionError(
+            "更新入口控件的文字是 %r，应以 'v%s' 开头（版本号必须能被看到）" % (
+                text, VERSION))
+    # 1. 控件得是「看起来能点」的（否则用户根本不会去点）。
+    cur = str(btn_ver.cget("cursor"))
+    if cur != "hand2":
+        raise AssertionError("版本号控件的 cursor 是 %r，应为 hand2（看不出可点）" % cur)
+    # 2. 得真的挂着 <Button-1> 的绑定。
+    if not btn_ver.bind("<Button-1>"):
+        raise AssertionError("版本号控件没有绑定 <Button-1>，点了不会有反应")
+
+    # 3. 换探针，真发点击事件，看它会不会被调到。
+    calls = []
+    real = updater.check
+
+    def probe(cur_ver, *a, **k):
+        calls.append(cur_ver)
+        # 返回 CURRENT 是最短路径：不弹确认框、不下载。
+        return updater.STATE_CURRENT, cur_ver
+
+    updater.check = probe
+    try:
+        btn_ver.event_generate("<Button-1>")
+        # 事件处理里是起后台线程 + 往队列丢消息，等一小会儿让线程跑起来。
+        # 不能只 update_idletasks —— 那不等线程。
+        for _ in range(40):
+            btn_ver.update()
+            if calls:
+                break
+            time.sleep(0.02)
+    finally:
+        updater.check = real
+
+    if not calls:
+        raise AssertionError(
+            "给版本号控件发了 <Button-1>，但 updater.check 没被调用（接线断了）")
+    return "更新入口接线：cursor=hand2、<Button-1> 已绑定、点击确实触发了检查"
+
+
 def run_gui(smoke=False):
     import tkinter as tk
     import tkinter.font as tkfont
@@ -1752,7 +1847,22 @@ def run_gui(smoke=False):
     head.pack(fill="x", pady=(0, 14))
     lbl(head, "%s · 设置" % APP_TITLE, TITLE, True).pack(side="left")
     # 版本号紧跟在标题右边，小字弱色。用户要报问题时第一眼就能看到它。
-    lbl(head, "v%s" % VERSION, SMALL, fg=SUB).pack(side="left", padx=(8, 0))
+    # **同时它也是「检查更新」的入口**（做成链接样式的小字，不新增第四个按钮 ——
+    # 主按钮固定三个是既有的界面铁律，改按钮要同步改 set_busy 的控件元组）。
+    #
+    # ⚠️ 视觉上必须让人看出「这行字能点」：只绑 cursor 是没用的 ——
+    # 截图里它跟普通灰字一模一样，用户根本不会去点。所以给它加：
+    #   ① 下划线（链接的通用约定）
+    #   ② 浅蓝底色（和后面的灰底「使用说明」按钮区分开，但不抢主按钮的视觉）
+    # 这两个加起来，一眼就知道是可点的东西。
+    btn_ver = tk.Label(head, text="v%s　检查更新" % VERSION,
+                       font=(fam, SMALL, "underline"),
+                       fg="#0b5ed7", bg="#e7f0ff", cursor="hand2", padx=7, pady=1)
+    btn_ver.pack(side="left", padx=(8, 0))
+    # hover 时加深底色，进一步确认「可点」。
+    btn_ver.bind("<Enter>", lambda e: btn_ver.configure(bg="#d2e4ff"))
+    btn_ver.bind("<Leave>", lambda e: btn_ver.configure(bg="#e7f0ff"))
+    btn_ver.bind("<Button-1>", lambda e: on_check_update())
     tk.Button(head, text="使用说明", font=(fam, SMALL), bg="#eef0f3", fg="#333",
               activebackground="#e0e4ea", activeforeground="#333",
               relief="flat", bd=0, cursor="hand2", padx=14, pady=3,
@@ -1842,7 +1952,9 @@ def run_gui(smoke=False):
             warn_auto.pack_forget()
 
     # --- 状态 ---
-    state = {"busy": False, "queue": None, "buttons": None}
+    state = {"busy": False, "queue": None, "buttons": None,
+             # 升级用的临时状态。都要走界面线程，所以放在这里而不是局部变量。
+             "pending": None, "dl_text": ""}
 
     def show(text, kind="info"):
         color = {"ok": ("#e6f6ea", "#155724"),
@@ -1856,6 +1968,22 @@ def run_gui(smoke=False):
         st = "disabled" if b else "normal"
         for w in (btn_switch, btn_save, btn_out):
             w.configure(state=st)
+        # 升级期间版本号小字也不能点，否则会并发起两个检查/两次替换。
+        try:
+            btn_ver.configure(cursor="arrow" if b else "hand2")
+        except Exception:
+            pass
+        # 用「改文案」而不是「加控件」来表示忙碌：不加第四个按钮，
+        # 也就不用去动 set_busy 那个控件元组（那是最容易被改漏的地方）。
+        try:
+            if b and state["dl_text"]:
+                btn_ver.configure(text=state["dl_text"])
+            elif not b:
+                btn_ver.configure(text="v%s　检查更新" % VERSION,
+                                  fg="#0b5ed7", bg="#e7f0ff",
+                                  font=(fam, SMALL, "underline"))
+        except Exception:
+            pass
 
     def refresh_status():
         def work():
@@ -1984,6 +2112,97 @@ def run_gui(smoke=False):
                 # "忙碌"——三个按钮全灰点不动，而用户看不到任何原因，
                 # 看起来就是"窗口卡死了"。这正是最难查的那种症状。
                 set_busy(False)
+        elif kind == "upd_progress":
+            # 下载进度。只改文案，不碰按钮状态 —— 进度消息会来很多次，
+            # 每次都去动控件代价大而且容易闪。
+            state["dl_text"] = payload
+            try:
+                btn_ver.configure(text=payload)
+            except Exception:
+                pass
+        elif kind == "upd_result":
+            # 参数：state（updater 的四态之一）+ info
+            st, info = payload
+            try:
+                if st == updater.STATE_NEWER:
+                    # 有新版且校验信息齐全 → 问用户要不要升级。
+                    # **这一步必须在界面线程里问**，后台线程弹 messagebox 会出问题。
+                    v = info["version"]
+                    ok = messagebox.askyesno(
+                        APP_TITLE,
+                        "发现新版本 v%s。\n\n%s\n\n是否现在下载并升级？\n"
+                        "（升级过程会关闭当前窗口，稍后自动重开）" % (
+                            v, info.get("notes") or "无更新说明"))
+                    if not ok:
+                        show("已跳过升级，当前仍是 v%s" % VERSION, "info")
+                        set_busy(False)
+                        return
+                    state["pending"] = info
+                    state["dl_text"] = "下载中 0%"
+                    show("正在下载 v%s…" % v, "info")
+                    start_upgrade(info)
+                elif st == "done":
+                    # 替换已经成功，现在重启到新版本。
+                    show("升级完成，正在重新启动…", "ok")
+                    root.update_idletasks()
+                    restart_self()
+                else:
+                    show(updater.describe(st, info),
+                         "ok" if st in (updater.STATE_CURRENT,) else "info")
+                    set_busy(False)
+            except Exception:
+                # 任何意外都不能让界面卡在忙碌态。
+                log("处理更新结果异常:\n%s" % traceback.format_exc())
+                show("检查更新时出错，请查看日志", "err")
+                set_busy(False)
+
+    def start_upgrade(info):
+        """下载 + 校验 + 替换自己。全在后台线程里做，界面只收进度。"""
+        def work():
+            exe = None
+            try:
+                # 目标目录必须与当前 exe 同目录 —— os.rename 同卷才是原子的。
+                exe = sys.executable if getattr(sys, "frozen", False) else None
+                if exe is None:
+                    state["queue"].put(("upd_result", (
+                        updater.STATE_MANUAL, "当前是源码运行，无法自我替换，请手动下载")))
+                    return
+                dest = os.path.join(os.path.dirname(exe),
+                                    "campus-login-%s.new" % info["version"])
+                state["queue"].put(("upd_progress", "下载中 0%"))
+
+                def on_prog(got, total):
+                    # 节流：每 3% 才推一次，不然队列会被进度消息淹没。
+                    pct = 0 if not total else int(got * 100 / total)
+                    if pct < 3 or pct == getattr(on_prog, "_last", -1):
+                        return
+                    if pct < getattr(on_prog, "_last", 0) + 3 and pct != 100:
+                        return
+                    on_prog._last = pct
+                    state["queue"].put(("upd_progress", "下载中 %d%%" % pct))
+
+                ok, reason = updater.download(
+                    info["url"], dest, sha256=info.get("sha256"),
+                    size=info.get("size"), on_progress=on_prog)
+                if not ok:
+                    state["queue"].put(("upd_result", (
+                        updater.STATE_UNKNOWN, "下载失败：%s" % reason)))
+                    return
+
+                state["queue"].put(("upd_progress", "正在替换…"))
+                ok, reason = updater.apply_update(exe, dest)
+                if not ok:
+                    state["queue"].put(("upd_result", (
+                        updater.STATE_UNKNOWN, "升级失败：%s" % reason)))
+                    return
+                # 替换成功 → 重启新版本。**先放消息再退出**，让界面把提示显示出来。
+                state["queue"].put(("upd_result", (
+                    "done", "升级完成，正在重新启动…")))
+            except Exception:
+                log("升级异常:\n%s" % traceback.format_exc())
+                state["queue"].put(("upd_result", (
+                    updater.STATE_UNKNOWN, "升级过程出错，请查看日志")))
+        threading.Thread(target=work, daemon=True).start()
 
     def poll():
         try:
@@ -1998,6 +2217,42 @@ def run_gui(smoke=False):
             log("排下一次轮询失败:\n%s" % traceback.format_exc())
 
     # --- 按钮动作 ---
+    def restart_self():
+        """用新 exe 重新拉起自己，然后硬退出当前进程。
+
+        为什么必须「先起新的、再退旧的」：
+        `updater.apply_update` 已经把旧 exe 改名成 `.old`、新 exe 写到原路径。
+        这里只是启动同一个路径，拿到的是新版本。
+        ⚠️ 退出走 exit_now()（内部是 TerminateProcess）—— 不能用 os._exit()，
+        那会在 Tcl/Tk 的 DLL_PROCESS_DETACH 上卡 11~12 秒甚至永久卡死。
+        """
+        try:
+            subprocess.Popen([sys.executable], close_fds=True)
+        except Exception:
+            log("重启自身失败:\n%s" % traceback.format_exc())
+            show("升级已完成，请手动重新打开程序", "ok")
+            set_busy(False)
+            return
+        exit_now(0)
+
+    def on_check_update():
+        """点版本号触发。全流程在后台线程，界面只收队列消息。"""
+        if state["busy"]:
+            show("正在处理上一个操作，请稍候", "info")
+            return
+        state["dl_text"] = ""
+        set_busy(True)
+        show("正在检查更新…", "info")
+
+        def work():
+            try:
+                st, info = updater.check(VERSION)
+            except Exception:
+                log("检查更新异常:\n%s" % traceback.format_exc())
+                st, info = updater.STATE_UNKNOWN, "检查更新时出错"
+            state["queue"].put(("upd_result", (st, info)))
+        threading.Thread(target=work, daemon=True).start()
+
     def form():
         uid = var_uid.get().strip()
         pwd = pwd_field.get()
@@ -2137,6 +2392,9 @@ def run_gui(smoke=False):
         # 失败就抛出去 —— 让 --guitest 落成 GUI_FAIL，别静默放过。
         wiring = pwd_wiring_check(pwd_field, (load_config().get("passwd") or None))
         log(wiring)
+        # 更新入口接线自检：真给版本号小字发一个点击，确认整条链通。
+        # 同 pwd_wiring_check —— 光看代码证明不了「点下去真的会跑」。
+        log(update_wiring_check(btn_ver))
         # 顺便把说明弹窗也建一次，确认它能起来（不显示，建完就销毁）
         try:
             hv = show_help()
@@ -2283,6 +2541,14 @@ def main():
         # 用户只看到一张空表单，分不清是"本来就没有旧数据"还是"继承时炸了"。
         log("继承旧数据失败（不影响启动）:\n%s" % traceback.format_exc())
 
+    # 清理上一次自我更新留下的 .old。**必须放在这里**（每次启动都跑）：
+    # 替换时旧 exe 正被当前进程占用，删不掉；只能等它退出后、下次启动时清。
+    # 失败不影响使用 —— 留一个几 MB 的残留文件而已。
+    try:
+        updater.cleanup_stale(sys.executable if is_frozen() else None)
+    except Exception:
+        log("清理旧版本残留失败:\n%s" % traceback.format_exc())
+
     if "--selftest" in args:
         common = (_shell_folder(CSIDL_COMMON_APPDATA) or "").lower()
         dd = data_dir()
@@ -2308,6 +2574,13 @@ def main():
             "本机MAC: %s" % local_mac(),
             "联网: %s" % {True: "已联网", False: "未认证（被门户拦截）",
                           None: "无法判定（请求异常/超时）"}[test_internet()],
+            # 更新入口。这两行是排查「检查更新失败」时的第一手信息 ——
+            # 不用去猜程序里写的是哪个地址。
+            # ⚠️ 只列地址，**不发网络请求**：--selftest 本来是快操作（3 秒），
+            #    加一次联网会拖慢它，而且网络结果本来就该用 --checkupdate 单独看。
+            "更新清单: %s" % updater.MANIFEST_URL,
+            "更新兜底: %s" % updater.FALLBACK_MANIFEST_URL,
+            "可自我更新: %s" % _self_update_desc(),
         ]
         try:
             import psutil
@@ -2325,6 +2598,22 @@ def main():
             # 上一轮留下的旧文件 —— 那会报出"假通过"。
             log("selftest.txt 写入失败:\n%s" % traceback.format_exc())
         exit_now(0)
+
+    # --checkupdate：命令行查一次版本（不下载、不替换）。
+    # 有这个分支是为了**能自动化验证**：--windowed 的 exe 没有 stdout，
+    # 光靠点界面没法在脚本里断言「更新接口通不通」。结果同时落盘。
+    if "--checkupdate" in args:
+        st, info = updater.check(VERSION)
+        text = "检查更新: %s" % updater.describe(st, info)
+        print(text)
+        try:
+            with open(os.path.join(data_dir(), "checkupdate.txt"), "w",
+                      encoding="utf-8") as f:
+                f.write("%s\n状态: %s\n清单地址: %s\n" % (
+                    text, st, updater.MANIFEST_URL))
+        except Exception:
+            log("checkupdate.txt 写入失败:\n%s" % traceback.format_exc())
+        exit_now(0 if st in (updater.STATE_CURRENT, updater.STATE_NEWER) else 1)
 
     if "--guitest" in args:
         # 无窗口地构建一遍界面，用来确认 tcl/tk 运行库打包完整。

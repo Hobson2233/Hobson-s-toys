@@ -40,7 +40,14 @@ import proc_tree  # noqa: E402  —— 收进程树（onefile 是父子两个进
 #   其余
 #       本程序从不使用的开发工具与可选模块（编译/测试/文档/数据库/压缩格式等）。
 EXCLUDES = (
-    "ssl", "_ssl", "_hashlib",
+    # ⚠️ 这里原来排除了 ssl/_ssl/_hashlib，理由是「校园网 portal 是 http，
+    #    用不上 TLS」+ 压体积。**那个前提在 2026-09-18 之后不成立了**：
+    #    「检查更新」要从 https 下载新版本，必须要 ssl；校验 sha256 必须要 _hashlib。
+    #    排除掉的表现是**打包时完全不报错**，等运行到 --selftest 才炸：
+    #        ModuleNotFoundError: No module named 'ssl'
+    #    （实测：--selftest 45s 超时，build.py 报「界面可能有问题」——
+    #     症状和真正的原因隔了十万八千里，查了很久。）
+    #    ⇒ 这三个模块**必须留在包里**，别再排除。
     "requests", "urllib3", "idna", "charset_normalizer", "certifi", "chardet",
     "xml", "pyexpat",
     "sqlite3", "_sqlite3",
@@ -219,6 +226,103 @@ def _version_file(dst):
     return dst
 
 
+def _check_modules(exe):
+    """确认「检查更新」需要的模块真的打进了 exe。返回 0 通过、非 0 失败。
+
+    ⚠️ 为什么必须查这一条：
+      `EXCLUDES` 里一旦排除了更新功能用到的模块，**打包过程完全不报错** ——
+      直到运行 `--selftest` 才在 `import updater` 那行炸 ModuleNotFoundError，
+      而 exe 是 --windowed 的、没有 stdout，报错落到 devnull 里看不见。
+      表现就是「--selftest 45 秒超时 / 界面可能有问题」，
+      和真实原因（缺模块）隔了十万八千里。2026-09-18 实测踩到。
+
+    ⚠️ 必须**同时**查顶层和 PYZ 两层，只查一层会得出完全相反的结论：
+      * 纯 Python 模块（`ssl.py`）在 **PYZ** 里，`CArchiveReader.toc` 只有顶层条目，
+        只查顶层会把「在包里」误判成「缺失」→ **假警报**（实测踩到）。
+      * 扩展模块（`_ssl.pyd`）在**顶层**，只查 PYZ 又会漏掉它们。
+      这和 help_check / leak_check 里「两层都要搜」是同一个道理。
+    """
+    # 更新功能必需。少任何一个，程序一跑到 import updater 就崩。
+    #   ssl      —— 纯 Python 的 TLS 包装（PYZ 层）
+    #   _ssl     —— 它的 C 扩展（顶层 .pyd）
+    #   _hashlib —— hashlib.sha256 的底层实现，校验下载文件靠它（顶层 .pyd）
+    REQUIRED = ("ssl", "_ssl", "_hashlib")
+    print("关键模块检查:", ", ".join(REQUIRED))
+
+    names = set()          # 顶层：扩展模块 .pyd/.dll/数据文件
+    pyz_names = set()      # PYZ 层：纯 Python 模块
+
+    try:
+        from PyInstaller.archive.readers import CArchiveReader
+        r = CArchiveReader(exe)
+    except Exception as e:
+        # 读不了归档 = 这个检查本身失效，必须报失败而不是放行 ——
+        # 「检查没跑成」和「检查通过」是两件事。
+        print("  [失败] 无法读取归档，模块检查没跑成：%s" % e)
+        return 1
+
+    import marshal
+    import os as _os
+    import tempfile
+
+    try:
+        for nm in list(r.toc):
+            names.add(str(nm))
+            name = getattr(nm, "name", None)
+            if name:
+                names.add(str(name))
+            # PYZ 是顶层里的一个条目，把它的模块表也读出来。
+            # 坑：toc 给的是**压缩后**的偏移，直接喂 ZlibArchiveReader 会报
+            # "PYZ magic pattern mismatch!"，必须先 extract() 落成临时文件。
+            if str(nm).endswith(".pyz"):
+                tmp = tempfile.NamedTemporaryFile(suffix=".pyz", delete=False)
+                tmp.close()
+                try:
+                    with open(tmp.name, "wb") as f:
+                        f.write(r.extract(nm))
+                    from PyInstaller.archive.readers import ZlibArchiveReader
+                    z = ZlibArchiveReader(tmp.name)
+                    for key in list(z.toc):
+                        pyz_names.add(str(key))
+                finally:
+                    try:
+                        _os.unlink(tmp.name)
+                    except OSError:
+                        pass
+    except Exception as e:
+        print("  [失败] 遍历归档目录失败：%s" % e)
+        return 1
+
+    print("  归档条目：顶层 %d，PYZ %d" % (len(names), len(pyz_names)))
+
+    def has(mod):
+        """模块是否在包里。两层都查，任一层命中就算。
+
+        比较用「去掉目录和扩展名后恰好等于模块名」，避免
+        `_ssl_something` 这种被误判成 `_ssl`。
+        """
+        for pool in (names, pyz_names):
+            for nm in pool:
+                base = nm.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+                stem = base.split(".")[0]
+                if stem == mod:
+                    return True
+                # PYZ 里的键可能是 `ssl`，也可能带包路径 `urllib.request`。
+                if nm == mod or nm.endswith("/" + mod):
+                    return True
+        return False
+
+    missing = [m for m in REQUIRED if not has(m)]
+    if missing:
+        print("  [失败] 以下模块不在包里：%s" % "、".join(missing))
+        print("         ⇒ 检查 build.py 的 EXCLUDES，别把更新功能要用的模块排除了。")
+        print("         ⇒ 排除了的表现是**打包不报错**、运行到 import updater 才崩。")
+        return 1
+
+    print("  [OK] %s 都在包里" % "、".join(REQUIRED))
+    return 0
+
+
 def _read_exe_version(path):
     """从 exe 的 PE 资源里读回 FileVersion 字符串。读不到返回 ""。
 
@@ -309,6 +413,15 @@ def main():
 
     src = os.path.join(dist, NAME + ".exe")
     print("产物:", src, os.path.getsize(src), "字节")
+
+    # 关键模块必须在包里。**放在冒烟测试之前**，因为漏掉模块的表现是
+    # 「exe 启动即崩」→ 冒烟测试要跑满 45 秒超时才报错，而且报的是
+    # 「界面可能有问题」，完全指不到真实原因（2026-09-18 实测：
+    # 因 EXCLUDES 排除了 ssl，--selftest 45s 超时，查了很久才发现是缺模块）。
+    # 这里用归档读取直接查，秒级出结果、且能指名道姓说缺哪个。
+    rc = _check_modules(src)
+    if rc:
+        return rc
 
     # 冒烟测试。跑的是刚构建出来的产物本身，不依赖桌面副本是否已就位 ——
     # 桌面那份可能正被打开着的程序占着，而复制是唯一会因此失败的一步，
