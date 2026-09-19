@@ -50,7 +50,7 @@ APP_TITLE = "校园网自动登录"
 # ⚠️ 这里是**唯一来源**。界面标题、使用说明、--version、--selftest、
 #    以及 exe 文件属性里的版本，全部由它推导 —— 不要在别处另写一份，
 #    否则迟早漂移（改了一处忘了另一处，用户看到的版本号就是错的）。
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 
 # 学校 portal 默认参数（拷到同校其他电脑上可直接用）
 DEFAULTS = {
@@ -1913,7 +1913,8 @@ def set_autostart(on):
 # ==================== 使用说明 ====================
 # 说明文字直接写进程序，不再随 exe 附带 .txt —— 拷一个 exe 过去就能看到。
 # 面向使用者：不写实现细节，短句、少术语，第一次用的人照着做就行。
-# （排障用的 --selftest 之类留在 --help 和日志里，不占说明篇幅。）
+# （排障用的 --selftest 之类**不写进这里** —— 它们由 --help 单独列出，见下面的
+#   SWITCH_HELP。这一段是给普通用户看的，出现 --xxx 只会让人困惑。）
 # 标题行用拼接的方式带上版本号，**不把它写死在下面的长文本里** ——
 # 否则以后改版本号时很容易漏掉这一处，用户看到的说明就成了旧版本。
 #
@@ -2024,6 +2025,45 @@ HELP_TEXT = (("校园网自动登录 —— 使用说明（v%s）\n" % VERSION) 
     升级到新版本后如果提示「旧设置」，同样处理：取消再重新勾一次。
   · 出问题时看日志：C:\ProgramData\CampusLogin\campus-login.log
 """)
+
+
+# 命令行开关清单，**故意不并进 HELP_TEXT**（2026-09-19 决定）：
+#   1. HELP_TEXT 是给普通用户的「使用说明」，同一份文本也在界面的说明窗口里显示
+#      （run_gui 里 txt.insert("1.0", HELP_TEXT)）。往里面塞 --xxx 只会让
+#      第一次用的人莫名其妙。
+#   2. 更要紧的是 help_check.py 会在**打包后的 exe 归档里逐字节核对** HELP_TEXT。
+#      往里加字会让那条检查报 BAD —— 那不是「检查过时了」，是提醒你别动这段文本。
+# 所以 --help 打的是两截：HELP_TEXT + 本段。改这里不影响 help_check.py。
+#
+# ⚠️ 写这里的每一条都必须在 main() 里真有对应分支，且行为与描述一致 ——
+#    这份清单是用户排查问题的第一手依据，写错比不写更坏。
+SWITCH_HELP = r"""
+【命令行开关】
+
+  平时用不到：双击 exe 走界面就行。下面这些是给排障和脚本用的。
+
+  --help / -h / /?    显示这份说明，然后退出
+                      （没有终端时——比如双击——会弹一个窗口显示）
+  --version / -v      显示版本号，然后退出
+                      （打包版没有终端，会弹一个窗口显示）
+  --purge             清掉本机保存的账号密码；退出码 0=清干净了，1=有文件删不掉
+  --selftest          打一份环境自检：版本、数据目录、自启参数、本机 IP、
+                      联没联网、在不在校园网、更新地址……
+                      结果同时写到数据目录下的 selftest.txt
+  --checkupdate       只查一次更新，不下载也不替换；结果写 checkupdate.txt。
+                      退出码 0=已是最新或有新版，1=没查出来
+  --guitest           无窗口地构建一遍界面，用来确认界面运行库打包完整
+                      （结果写 guitest.txt）
+  --switch <学号>     切换到指定账号，密码取自已保存的账号。
+                      没给学号会打印用法并退出（退出码 2）
+  --auto              只做一次自动登录，然后退出
+  --auto --guard      自动登录后继续守护 30 分钟（开机自启用的就是这两个）
+  --guard             先试一次登录，再进守护（单独用，排障用）
+  --logout            主动退出当前账号（下线）
+
+  上面这些命令都是「跑完就退出」，不会弹主界面。
+  不带任何开关（直接双击）就是正常开界面。
+"""
 
 
 # ==================== 密码框的显示与编辑规则 ====================
@@ -2413,6 +2453,82 @@ def update_wiring_check(btn_ver):
     return "更新入口接线：cursor=hand2、<Button-1> 已绑定、点击确实触发了检查"
 
 
+# 界面配色。**提到模块级**是为了让 run_gui 之外的窗口也能用同一套 ——
+# `--help` 在打包版里要弹一个说明窗口（没有 stdout，print 出去看不见），
+# 颜色写两份迟早会漂移，两块界面就不一样了。
+BG = "#f0f2f5"
+CARD = "#ffffff"
+FG = "#222222"
+SUB = "#666666"
+BLUE = "#0078d4"
+
+
+def _ui_font(root, tkfont):
+    """按屏幕高度挑字号 + 挑一个装得上的中文字体。返回 (字体名, 字号)。"""
+    try:
+        sh = root.winfo_screenheight()
+    except Exception:
+        sh = 1080
+    base = 12 if sh >= 1400 else 10
+    fam = "Microsoft YaHei UI"
+    try:
+        if fam not in tkfont.families():
+            fam = "Microsoft YaHei"
+    except Exception:
+        fam = "Microsoft YaHei"
+    return fam, base
+
+
+def show_text_window(title, text, width=780, height=640):
+    """把一个长文本用「可滚动、可复制」的只读窗口显示出来。
+
+    为什么需要它（2026-09-19 实测）：打包版是 `--windowed`，`sys.stdout` 是 None，
+    `print` 出去的东西直接进 devnull。`--help` 如果只 print，用户双击、或者在
+    cmd 里敲，都**什么都看不到** —— 只会觉得「这命令没反应」，比不实现还糟。
+    `--version` 早就为同一件事弹窗了，这里保持一致。
+
+    返回 True = 用户把窗口关掉了；False = 窗口没建起来（调用方自己兜底）。
+    """
+    try:
+        import tkinter as tk
+        import tkinter.font as tkfont
+
+        r = tk.Tk()
+        r.title(title)
+        r.configure(bg=BG)
+        ico = icon_path()
+        if ico:
+            try:
+                r.iconbitmap(default=ico)
+            except Exception:
+                pass
+        fam, base = _ui_font(r, tkfont)
+        r.geometry("%dx%d" % (width, height))
+
+        body = tk.Frame(r, bg=CARD)
+        body.pack(fill="both", expand=True, padx=14, pady=(12, 0))
+        txt = tk.Text(body, wrap="word", font=(fam, base), bg=CARD, fg=FG,
+                      relief="flat", bd=0, padx=6, pady=2, cursor="arrow")
+        sb = tk.Scrollbar(body, command=txt.yview)
+        txt.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        txt.pack(side="left", fill="both", expand=True)
+        txt.insert("1.0", text)
+        txt.configure(state="disabled")      # 只读；仍可选中、可 Ctrl+C 复制
+
+        bar = tk.Frame(r, bg=CARD)
+        bar.pack(fill="x", padx=14, pady=12)
+        tk.Button(bar, text="知道了", font=(fam, base), bg=BLUE, fg="#ffffff",
+                  activebackground="#106ebe", activeforeground="#ffffff",
+                  relief="flat", bd=0, cursor="hand2", padx=26, pady=6,
+                  command=r.destroy).pack(side="right")
+        r.mainloop()
+        return True
+    except Exception:
+        log("显示文本窗口失败:\n%s" % traceback.format_exc())
+        return False
+
+
 def run_gui(smoke=False):
     import tkinter as tk
     import tkinter.font as tkfont
@@ -2421,33 +2537,17 @@ def run_gui(smoke=False):
     arm_exit_watchdog()
     exit_trace("run_gui 开始（smoke=%s）" % smoke)
 
-    BG = "#f0f2f5"
-    CARD = "#ffffff"
-    FG = "#222222"
-    SUB = "#666666"
-    BLUE = "#0078d4"
-
     root = tk.Tk()
     if smoke:
         root.withdraw()          # 自检时不显示窗口
     root.title("%s v%s · 设置" % (APP_TITLE, VERSION))
     root.configure(bg=BG)
 
-    # 按屏幕高度决定字号，避免高分屏上字太小
-    try:
-        sh = root.winfo_screenheight()
-    except Exception:
-        sh = 1080
-    BASE = 12 if sh >= 1400 else 10
+    # 按屏幕高度决定字号，避免高分屏上字太小。
+    # 字体挑选和字号规则跟 `--help` 的说明窗口共用一份（_ui_font），别再抄一遍。
+    fam, BASE = _ui_font(root, tkfont)
     TITLE = BASE + 5
     SMALL = BASE - 2
-
-    fam = "Microsoft YaHei UI"
-    try:
-        if fam not in tkfont.families():
-            fam = "Microsoft YaHei"
-    except Exception:
-        fam = "Microsoft YaHei"
 
     root.option_add("*Font", (fam, BASE))
     ico = icon_path()
@@ -2836,9 +2936,15 @@ def run_gui(smoke=False):
                     on_prog._last = pct
                     state["queue"].put(("upd_progress", "下载中 %d%%" % pct))
 
+                def on_retry(attempt, attempts, why):
+                    # 重试必须说一句：否则进度会卡在某个百分比不动，
+                    # 用户以为死机了就会再点一次 —— 那就并发下两份、还可能互相覆盖。
+                    state["queue"].put(("upd_progress", "网络中断，正在重试 %d/%d…"
+                                        % (attempt, attempts)))
+
                 ok, reason = updater.download(
                     info["url"], dest, sha256=info.get("sha256"),
-                    size=info.get("size"), on_progress=on_prog)
+                    size=info.get("size"), on_progress=on_prog, on_retry=on_retry)
                 if not ok:
                     state["queue"].put(("upd_result", (
                         updater.STATE_UNKNOWN, "下载失败：%s" % reason)))
@@ -2980,7 +3086,7 @@ def run_gui(smoke=False):
         txt.configure(yscrollcommand=sb.set)
         sb.pack(side="right", fill="y")
         txt.pack(side="left", fill="both", expand=True)
-        txt.insert("1.0", HELP_TEXT)
+        txt.insert("1.0", HELP_TEXT + SWITCH_HELP)
         txt.configure(state="disabled")  # 只读；仍可选中复制
 
         bar = tk.Frame(win, bg=CARD)
@@ -3151,6 +3257,10 @@ def main():
     # 显式指定 utf-8 + errors="replace"：中文 Windows 的默认编码是 cp936，
     # 一旦有代码 print 出 cp936 表示不了的字符（emoji 之类）就会抛
     # UnicodeEncodeError —— 而这里本来就是为了"兜住异常"才接的 devnull。
+    # ⚠️ 先把「本来有没有 stdout」记下来，**再**做下面的 devnull 兜底 ——
+    #    兜底之后 sys.stdout 永远不是 None，就再也分辨不出「双击（没有终端）」
+    #    和「从终端里启动」了。`--help` 要靠这个决定打印还是弹窗（见那边的注释）。
+    had_stdout = sys.stdout is not None
     if sys.stdout is None:
         sys.stdout = open(os.devnull, "w", encoding="utf-8", errors="replace")
     if sys.stderr is None:
@@ -3177,6 +3287,48 @@ def main():
                 log("--version 弹窗失败:\n%s" % traceback.format_exc())
         else:
             print(text)
+        exit_now(0)
+
+    # --help：把内置的使用说明打到终端。同 --version，纯查询、不碰数据目录。
+    #
+    # ⚠️ 必须在**落到 GUI 之前**认领它（2026-09-19 实测踩到）：0.3.1 之前没有这个
+    #    分支，`--help` 不被任何分支认领 → 一路走到最后开 GUI 弹个窗口；而
+    #    --windowed 的 exe 没有 stdout，用户既看不到说明也看不到任何错误，
+    #    只会觉得「敲了个 --help 就弹窗，莫名其妙」。
+    #    这个意图一直写在 HELP_TEXT 上方的注释里（「排障用的 --selftest 之类
+    #    留在 --help 里」），但分支本身从没实现 —— 注释描述的是设计意图，不是现状，
+    #    别拿它当「这功能已经在了」的证据。0.3.1 补上。
+    # 顺带认 `-h`（Unix 习惯）和 `/?`（Windows 习惯）。args 已转小写，够用。
+    #
+    # 输出是两截：HELP_TEXT（面向使用者，也被界面上的说明窗口复用）
+    #             + SWITCH_HELP（命令行开关）。
+    # 分开的理由写在 SWITCH_HELP 上面 —— 核心是别动 HELP_TEXT，
+    # help_check.py 要在打包后的 exe 里逐字节核对它。
+    #
+    # ⚠️ 打包版要**弹窗**，不能只 print（2026-09-19 实测）：`--windowed` 的 exe
+    #    双击起来没有可用的 stdout，print 出去就没了 —— 用户敲了 --help 什么也
+    #    看不到，比不实现还糟。
+    #    ⚠️ 但**不能只看 is_frozen 就弹窗**：从终端里启动时标准句柄是继承来的，
+    #       实测在 Git Bash 里跑 `CampusLogin.exe --help`，文字真的打到了终端上。
+    #       那种情况下弹窗反而多此一举（2800 字的说明塞进弹窗也不好读）。
+    #       所以判据是「打包版 **且** 没有 stdout」才弹窗 —— had_stdout 是 main()
+    #       开头、做 devnull 兜底**之前**记下来的（兜底之后就永远不是 None 了）。
+    #    ⚠️ 这里和 `--version` 的行为**故意不一样**：--version 只要打包就弹窗。
+    #       别顺手去「统一」它们 —— version_test.py 第 6 节正把 --version 的
+    #       「10 秒不退出（停在模态窗上）」当成成功信号在断言。
+    if "--help" in args or "-h" in args or "/?" in args:
+        text = HELP_TEXT + SWITCH_HELP
+        if is_frozen() and not had_stdout:
+            if not show_text_window("%s v%s · 命令行说明" % (APP_TITLE, VERSION), text):
+                log("--help 的窗口没能显示出来，说明文字没能到用户眼前")
+        else:
+            try:
+                print(text)
+            except UnicodeEncodeError:
+                # 系统区域不是中文时，控制台代码页放不下这些汉字。一个「帮助」命令
+                # 自己崩掉是最糟的失败方式，所以降级成「能打多少打多少」。
+                enc = getattr(sys.stdout, "encoding", None) or "utf-8"
+                print(text.encode(enc, "replace").decode(enc, "replace"))
         exit_now(0)
 
     # 必须在继承旧数据**之前**处理：否则刚继承进来的账号又被这里删掉，

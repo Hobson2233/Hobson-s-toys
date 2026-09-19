@@ -188,8 +188,26 @@ def part_failure_is_not_current():
     所有用例都从「地址不合法」这个分支出去，看起来全绿，实际上
     404 分支、DNS 分支、端口分支**一个都没被跑到**。
     2026-09-18 实测踩到过：三条用例的原因文字全是 "ascii codec can't encode"。
+
+    ⚠️ 但关键词断言有个副作用：**本机网络抖一下，它也会报失败**。
+    2026-09-19 实测：连跑 5 轮，第 3 轮「真实 404」这条挂了 ——
+    原因是那次 api.github.com 没通，reason 变成了连接类错误，
+    于是「HTTP 404」当然不在里面。而它旁边的 `state == UNKNOWN` 是过的。
+    这种假失败最坏的地方不是烦人，是**会教人忽略红色**：一旦习惯了
+    「这条偶尔红」，真出 bug 时也会被当成抖动放过去。
+    所以这里把两类「对不上」分开报（本文件 NETWORK_HINTS 那段注释讲的就是这个）：
+      · 主机这次确实不通  → 记 skip，明说「这条没被验证」
+      · 主机通、关键词却不对 → 那是代码分支走错，报失败
     """
     print("\n=== 2. 网络失败不能被当成「已是最新」（关键行为）===")
+
+    # 独立探一次「这台主机本身通不通」。**必须独立探**，不能拿被测用例自己的
+    # 结果去解释自己 —— 否则「代码把 404 误判成连接错误」也会被当成网络抖动 skip 掉，
+    # 而那正是这一段要防的 bug。
+    host_ok, host_body = U._get("https://api.github.com/zen", 10)
+    print("  参照探测：api.github.com 这次%s（%s）"
+          % ("通" if host_ok else "不通", (host_body or b"")[:28]))
+
     cases = [
         # (名字, URL, 原因文字里必须出现的关键词)
         ("真实 404", URL_404, "HTTP 404"),
@@ -205,8 +223,13 @@ def part_failure_is_not_current():
         ck_true("%s → 不是 NEWER" % name, st != U.STATE_NEWER)
         ck("%s → 就是 UNKNOWN" % name, st, U.STATE_UNKNOWN)
         # 这一条才是真正区分各分支的断言。上面三条在「分支走错」时都会假绿。
-        ck_true("%s → 原因里带 %r（证明走的是该走的分支）" % (name, must),
-                must in str(reason))
+        if must in str(reason):
+            ck_true("%s → 原因里带 %r（证明走的是该走的分支）" % (name, must), True)
+        elif not host_ok and any(h in str(reason) for h in NETWORK_HINTS):
+            skip("%s → 分支关键字核对" % name,
+                 "本机到那台主机这次不通，关键词核对没做成")
+        else:
+            ck_true("%s → 原因里带 %r（证明走的是该走的分支）" % (name, must), False)
         print("       %s" % reason)
 
 
@@ -225,6 +248,11 @@ ASSET_PROBE_BUDGET = 40
 
 
 def part3_download():
+    """下载与校验。
+
+    返回值：拿到参照文件时返回 (sha256, size)，否则 None —— 3c 段要拿它去
+    构造「下载完了但大小不符」的真实场景（没有参照文件就没法构造）。
+    """
     print("\n=== 3. 下载与校验 ===")
     print("  --- 3a. 机制验证（用可靠的 CDN 目标）---")
 
@@ -240,10 +268,11 @@ def part3_download():
         time.sleep(1.5)
     if not ok:
         skip("下载机制验证", "取不到参照文件：" + reason)
-        return
+        return None
     real_sha = U.sha256_file(probe)
     real_size = os.path.getsize(probe)
     print("       参照文件 %d 字节 sha256 %s…" % (real_size, real_sha[:12]))
+    ref = (real_sha, real_size)
 
     d1 = os.path.join(TMP, "ok.bin")
     ok, reason = U.download(RELIABLE_URL, d1, real_sha, real_size, timeout=40)
@@ -276,7 +305,7 @@ def part3_download():
     print("\n  --- 3b. 发布资产完整性（GitHub，本机网络不稳定，只报告不判失败）---")
     if not os.path.isfile(LOCAL_EXE):
         skip("发布资产比对", "本地没有桌面 exe 可比对")
-        return
+        return ref
     local_sha = U.sha256_file(LOCAL_EXE)
     local_size = os.path.getsize(LOCAL_EXE)
     t0 = time.time()
@@ -305,7 +334,7 @@ def part3_download():
         skip("GitHub 发布资产比对",
              "本机取不到（%.0fs 外层闸门到点，线程仍未返回 —— 沙箱代理挂住）" % dt)
         print("       （注意：被放弃的那个线程还挂在网络调用里，属预期）")
-        return
+        return ref
     ok, reason = result.get("v", (False, "没有结果"))
     if ok:
         print("       ✅ 从 GitHub 下载成功，与本地 exe 逐字节相同（%.1f MB / %.1f 秒，%.1f KB/s）"
@@ -315,6 +344,212 @@ def part3_download():
     else:
         ck("GitHub 资产与本地 exe 一致", False, True)
         print("       原因：%s" % reason)
+    return ref
+
+
+def part3c_retry(ref):
+    """下载重试（0.3.1 新增）。
+
+    为什么必须单独测：`download()` 原先**一次重试都没有**，而这条路径要下 12 MB ——
+    实测同一台机器 8 次下载失败 1 次，形态是连接级停顿（`TimeoutError`）。
+    加重试之后最怕的错是「写了重试但没生效」：那种错在正常网络上**永远看不出来**
+    （正常网络一次就成功，走不到重试分支），所以必须专门构造失败。
+
+    分三段，失败来源各不相同：
+      3c-A  策略矩阵 —— 打桩 _attempt，把「试几次 / 什么时候不试 / 回调怎么报数」
+            这些分支一次撞全（真实网络上撞不全，也搭不出那么听话的服务器）
+      3c-B  真实 socket —— 连一个没人听的端口，验证 _attempt **自己**失败时确实重试
+      3c-C  真实 HTTPS —— 故意报错大小，验证「下完了但大小不符」也重试
+                          （这条最反直觉：断流不抛异常，就长这个样子）
+      3c-D  透传 —— stage_update 有没有把 on_retry 交给 download
+
+    ⚠️ 为什么这里允许打桩，而本文件开头说「打桩等于把要测的东西测掉了」：
+    那条针对的是**网络层**（状态码、超时、Content-Length、编码、代理），
+    由 3a/3b 用真实网络覆盖。本段要测的是 _attempt **之上**的重试策略，
+    它的判据就是 _attempt 的第三个返回值 —— 打桩打掉的不是被测对象。
+    即便如此仍然用 3c-B / 3c-C 在真实 socket / 真实 HTTPS 上各验一次，
+    确认「剧本里的假设」和真实世界对得上。
+    """
+    print("\n=== 3c. 下载重试（0.3.1 新增）===")
+    print("  背景：原先一次重试都没有；实测 8 次下载失败 1 次（连接级停顿）。")
+    print("  注意：正常网络一次就成功，所以「重试没生效」这种错平时看不出来 ——")
+    print("        必须主动构造失败才能验。")
+
+    # ---------------------------------------------- 3c-A 策略矩阵
+    print("\n  --- 3c-A. 重试策略矩阵（打桩 _attempt，只测策略）---")
+    real_attempt = U._attempt
+
+    def scripted(seq):
+        """按剧本依次返回 (ok, 原因, 可重试)。
+
+        ok=True 时要把 tmp 写出来 —— download() 成功后会 os.replace(tmp, dest)，
+        没有这个文件就会抛 FileNotFoundError（那是**测试自己**的 bug，不是被测代码的）。
+        """
+        calls = []
+
+        def fake(url, tmp, size, timeout, on_progress):
+            calls.append(len(calls) + 1)
+            ok, reason, retryable = next(it, (False, "剧本用完了", False))
+            if ok:
+                with open(tmp, "wb") as f:
+                    f.write(b"X" * 64)
+            return ok, reason, retryable
+
+        it = iter(seq)
+        return fake, calls
+
+    try:
+        # A1 断两次、第三次成功 —— 「重试真的有用」的全部意义所在
+        fake, calls = scripted([(False, "连接失败：timed out", True),
+                                (False, "连接失败：timed out", True),
+                                (True, None, True)])
+        U._attempt = fake
+        seen = []
+        d1 = os.path.join(TMP, "retry_ok.bin")
+        ok, reason = U.download("http://x/y", d1,
+                                on_retry=lambda a, n, w: seen.append((a, n)))
+        ck("前两次失败、第三次成功 → 最终成功", ok, True)
+        if not ok:
+            print("       原因：%s" % reason)
+        ck("  实际尝试 3 次（没重试的话只会是 1）", len(calls), 3)
+        ck("  on_retry 响了 2 次", len(seen), 2)
+        ck("  报的序号是「第 2 次」「第 3 次」", [a for a, _ in seen], [2, 3])
+        ck("  报的总数一直是 ATTEMPTS=%d" % U.ATTEMPTS,
+           [n for _, n in seen], [U.ATTEMPTS, U.ATTEMPTS])
+        ck("  产物落地", os.path.exists(d1), True)
+        ck("  不留 .part", os.path.exists(d1 + ".part"), False)
+
+        # A2 一直失败 —— 必须停在 ATTEMPTS 次，不能无限重试
+        fake, calls = scripted([(False, "连接失败：timed out", True)] * U.ATTEMPTS)
+        U._attempt = fake
+        seen = []
+        d2 = os.path.join(TMP, "retry_dead.bin")
+        ok, reason = U.download("http://x/y", d2,
+                                on_retry=lambda a, n, w: seen.append(a))
+        ck("一直失败 → 最终失败", ok, False)
+        ck("  失败原因原样透传上来", reason, "连接失败：timed out")
+        ck("  恰好试 ATTEMPTS 次就停（没无限重试）", len(calls), U.ATTEMPTS)
+        ck("  重试回调响了 ATTEMPTS-1 次", len(seen), U.ATTEMPTS - 1)
+        ck("  不留目标文件", os.path.exists(d2), False)
+        ck("  不留 .part", os.path.exists(d2 + ".part"), False)
+
+        # A3 4xx：服务端明确说「没有」，重试只是白等
+        fake, calls = scripted([(False, "HTTP 404", False)])
+        U._attempt = fake
+        seen = []
+        ok, reason = U.download("http://x/y", os.path.join(TMP, "retry_404.bin"),
+                                on_retry=lambda a, n, w: seen.append(a))
+        ck("4xx → 失败", ok, False)
+        ck("  原因里带 HTTP 404", "HTTP 404" in str(reason), True)
+        ck("  不重试：只试了 1 次", len(calls), 1)
+        ck("  重试回调没响", len(seen), 0)
+
+        # A4 体积超限：重试三次还是超限，同样不该重试
+        fake, calls = scripted([(False, "下载体积超过上限，中止", False)])
+        U._attempt = fake
+        U.download("http://x/y", os.path.join(TMP, "retry_big.bin"))
+        ck("体积超限 → 不重试", len(calls), 1)
+
+        # A5 回调自己抛异常不能带崩下载
+        fake, calls = scripted([(False, "连接失败：timed out", True), (True, None, True)])
+        U._attempt = fake
+
+        def boom(*a):
+            raise RuntimeError("回调自己炸了")
+
+        ok, reason = U.download("http://x/y", os.path.join(TMP, "retry_cb.bin"),
+                                on_retry=boom)
+        ck("on_retry 抛异常不影响下载", ok, True)
+        if not ok:
+            print("       原因：%s" % reason)
+    finally:
+        U._attempt = real_attempt
+        print("       （已还原 _attempt）")
+
+    # ---------------------------------------------- 3c-B 真实 socket
+    print("\n  --- 3c-B. 真实 socket：连不上时会不会重试 ---")
+    seen = []
+    d3 = os.path.join(TMP, "retry_dead_port.bin")
+    # timeout 压到 3 秒：这条路径注定要失败，而且本沙箱的回环连接会被**丢弃**
+    # （不是立刻 refuse），每次尝试都要等满超时 → 3 次约 9 秒。
+    ok, reason = U.download("http://127.0.0.1:1/v.json", d3, timeout=3,
+                            on_retry=lambda a, n, w: seen.append((a, n)))
+    ck("端口没人听 → 失败", ok, False)
+    ck("  重试了 ATTEMPTS-1 次（真实失败路径也重试）", len(seen), U.ATTEMPTS - 1)
+    # 没东西在听，就不可能拿到 HTTP 状态码 —— 这条能证明走的是 socket 异常分支，
+    # 而不是「服务端回了个 4xx/5xx」那个分支。
+    ck("  走的是连接异常分支（原因里没有 HTTP 状态码）", "HTTP" in str(reason), False)
+    print("       原因：%s" % reason)
+    ck("  不留目标文件", os.path.exists(d3), False)
+    ck("  不留 .part", os.path.exists(d3 + ".part"), False)
+
+    # ---------------------------------------------- 3c-C 真实 HTTPS
+    print("\n  --- 3c-C. 真实 HTTPS：下完了但大小不符 ---")
+    if ref is None:
+        skip("真实网络上的重试", "3a 没取到参照文件")
+    else:
+        real_sha, real_size = ref
+        seen = []
+        d4 = os.path.join(TMP, "retry_size.bin")
+        # 故意把期望大小写错 7 字节：每次都能完整下完，但校验必然不过。
+        # 这正是**断流**的样子 —— 连接中途断掉时 r.read() 只是提前返回 b""，
+        # 不抛异常，于是表现成「大小不符」。只重试「抛异常那一类」会漏掉它。
+        ok, reason = U.download(RELIABLE_URL, d4, real_sha, real_size + 7, timeout=40,
+                                on_retry=lambda a, n, w: seen.append(a))
+        ck("真实网络：大小故意写错 → 失败", ok, False)
+        ck("  原因点明是大小不符", "大小不符" in str(reason), True)
+        print("       原因：%s" % reason)
+        ck("  重试了 ATTEMPTS-1 次（真实网络上也生效）", len(seen), U.ATTEMPTS - 1)
+        ck("  不留目标文件", os.path.exists(d4), False)
+        ck("  不留 .part", os.path.exists(d4 + ".part"), False)
+
+    # ---------------------------------------------- 3c-D 透传
+    print("\n  --- 3c-D. stage_update 有没有把 on_retry 交给 download ---")
+    seen = []
+    ok, reason = U.stage_update(os.path.join(TMP, "stage_fake.exe"),
+                                {"url": "http://127.0.0.1:1/v.json"},
+                                timeout=3,
+                                on_retry=lambda a, n, w: seen.append(a))
+    ck("stage_update 下载失败 → 整体失败", ok, False)
+    ck("  on_retry 被透传下去（响了 ATTEMPTS-1 次）", len(seen), U.ATTEMPTS - 1)
+    print("       原因：%s" % reason)
+
+    # ---------------------------------------------- 3c-E 阳性对照
+    print("\n  --- 3c-E. 阳性对照：把重试拿掉，上面的断言必须对不上 ---")
+    real_dl = U.download
+
+    def no_retry(url, dest, sha256=None, size=None, timeout=U.TIMEOUT,
+                 on_progress=None, on_retry=None):
+        """0.3.1 **之前**的 download：只试一次，不重试。
+
+        拿它当阳性对照 —— 如果上面 3c-B / 3c-C 那几条断言在这份实现上照样通过，
+        说明它们根本没在测重试（典型症状：条件写错导致检查空转）。
+        """
+        tmp = dest + ".part"
+        U._unlink(tmp)
+        ok, reason, _ = U._attempt(url, tmp, size, timeout, on_progress)
+        if not ok:
+            U._unlink(tmp)
+            return False, reason
+        os.replace(tmp, dest)
+        return True, None
+
+    try:
+        U.download = no_retry
+        seen = []
+        U.download("http://127.0.0.1:1/v.json", os.path.join(TMP, "ctrl.bin"),
+                   timeout=3, on_retry=lambda a, n, w: seen.append(a))
+    finally:
+        U.download = real_dl
+    ck("去掉重试后 on_retry 一次都不响（对照）", len(seen), 0)
+    # 这条把两件事一起钉住：① 对照实现的回调次数确实和真实实现不同
+    # （所以 3c-B/3c-C 那几条 `== ATTEMPTS-1` 是真在测重试，不是空转）；
+    # ② ATTEMPTS 一旦被改成 1，重试就等于没有，这里会跟着失败 ——
+    # 否则 3c-B/3c-C 的期望值会变成 `== 0` 而**静默通过**，检查空转。
+    ck("  对照实现的回调次数 ≠ 真实实现的（且 ATTEMPTS > 1）",
+       len(seen) != U.ATTEMPTS - 1, True)
+    print("       对照实现下 on_retry 响 %d 次，真实实现下响 %d 次 —— 对不上才算测到了"
+          % (len(seen), U.ATTEMPTS - 1))
 
 
 def part4_real_replace():
@@ -406,7 +641,8 @@ def main():
         else:
             part1_realnet()
         part_failure_is_not_current()
-        part3_download()
+        ref = part3_download()
+        part3c_retry(ref)
         part4_real_replace()
         part5_self_guard()
         part6_negative_control()

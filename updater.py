@@ -35,7 +35,9 @@ import urllib.request
 
 # 发布清单的地址。域名定下来之后改这一行即可（也可以由调用方传入覆盖）。
 # 域名 = hobson2233.dpdns.org（DigitalPlat 免费二级域名，NS 托管在 Cloudflare），
-# 站点部署在 Cloudflare Pages。改这里时记得同步改 make_manifest.py 的 BASE_URL。
+# 站点托管在 **Cloudflare Worker `campus-login` 的静态资源**上（⚠️ 不是 Pages 项目，
+# 原 Pages 已并入 Workers；自定义域名绑的是**服务名**，所以那个名字不能改）。
+# 改这里时记得同步改 make_manifest.py 的 BASE_URL。
 MANIFEST_URL = "https://hobson2233.dpdns.org/version.json"
 
 # 兜底清单地址：主域名被回收 / 解析不了时还能查到版本号。
@@ -56,6 +58,21 @@ TIMEOUT = 10
 MAX_SIZE = 60 * 1024 * 1024
 
 OLD_SUFFIX = ".old"
+
+# 下载最多尝试几次。为什么必须有重试（2026-09-19 实测）：
+#   这条路径要下 12 MB，而它原先**一次重试都没有**。同一台机器上 8 次下载失败 1 次，
+#   失败形态是 `TimeoutError: The read operation timed out` —— 连接级停顿。
+#   ⚠️ 注意**问题不在超时值上**：实测每次 read 之间的间隔中位只有几十毫秒、
+#      最大 1.55s，相对 TIMEOUT=10 有 6.5 倍余量，所以放大 TIMEOUT 治不了它。
+#
+# 为什么「大小不符 / 哈希不符」也必须重试（这条最反直觉）：
+#   **传输被截断不会抛异常**。连接中途断掉时 `r.read()` 只是提前返回 b""，
+#   循环正常结束 —— 于是表现成「文件大小不符」，看着像清单写错了。
+#   只重试「抛异常的那类」会把真实断流当成清单错误，直接判死。
+#
+# 唯一不重试的是 HTTP 4xx：那是服务端明确说「没有 / 不给」，重试只是白白拖慢。
+#   新版发布后旧文件名就是 404，GitHub 兜底路径上尤其不该在这里耗时间。
+ATTEMPTS = 3
 
 # 检查结果的状态。调用方必须三种都处理，不能把 UNKNOWN 当 CURRENT。
 STATE_NEWER = "newer"       # 有新版，info 里带下载信息
@@ -314,20 +331,18 @@ def sha256_file(path, chunk=1 << 20):
     return h.hexdigest()
 
 
-def download(url, dest, sha256=None, size=None, timeout=TIMEOUT, on_progress=None):
-    """下载到 dest 并校验。返回 (True, None) 或 (False, 原因)。
+def _attempt(url, tmp, size, timeout, on_progress):
+    """下载**一次**到 tmp。返回 (ok, 原因, 是否值得重试)。
 
-    dest 必须和目标 exe **同一个目录** —— 同一卷上 os.rename 才是原子的
-    （跨卷会退化成复制，中途断电就留下半个文件）。
-    校验不通过会把临时文件删掉，绝不留一个来路不明的 exe 在磁盘上。
+    重试判定集中在这里，别让调用方去猜原因串的内容 —— 那是「过滤条件写错 =
+    检查空转」的同类：拿字符串做判断，改一个字就静默失效。
     """
-    ok, reason = False, "未开始"
-    tmp = dest + ".part"
     try:
         req = urllib.request.Request(url, headers={"User-Agent": UA})
         with _opener().open(req, timeout=timeout) as r:
             if r.status != 200:
-                return False, "HTTP %s" % r.status
+                # 4xx 是「服务端说没有」，重试不会变
+                return False, "HTTP %s" % r.status, not (400 <= r.status < 500)
             total = size or (int(r.headers.get("Content-Length") or 0) or None)
             got = 0
             with open(tmp, "wb") as f:
@@ -337,37 +352,64 @@ def download(url, dest, sha256=None, size=None, timeout=TIMEOUT, on_progress=Non
                         break
                     got += len(b)
                     if got > MAX_SIZE:
-                        raise ValueError("下载体积超过上限，中止")
+                        return False, "下载体积超过上限，中止", False
                     f.write(b)
                     if on_progress:
                         on_progress(got, total)
-        ok, reason = True, None
+        return True, None, True
     except urllib.error.HTTPError as e:
-        reason = "HTTP %s" % e.code
+        return False, "HTTP %s" % e.code, not (400 <= e.code < 500)
     except urllib.error.URLError as e:
-        reason = "连接失败：%s" % e.reason
+        return False, "连接失败：%s" % e.reason, True
     except (OSError, ValueError) as e:
-        reason = "%s: %s" % (type(e).__name__, e)
+        return False, "%s: %s" % (type(e).__name__, e), True
 
-    if not ok:
-        _unlink(tmp)
-        return False, reason
 
-    if size is not None:
-        # 先把大小读出来再删文件。写成 `_unlink(tmp)` 之后再 getsize(tmp) 的话，
-        # 报错信息里那句「实际 %d」会抛 FileNotFoundError —— **错误处理路径自己崩掉**，
-        # 而且只在「大小不符」这个罕见分支才触发。这个 bug 是靠负面对照逼出来的。
-        actual_size = os.path.getsize(tmp)
-        if actual_size != size:
+def download(url, dest, sha256=None, size=None, timeout=TIMEOUT, on_progress=None,
+             on_retry=None):
+    """下载到 dest 并校验。返回 (True, None) 或 (False, 原因)。
+
+    dest 必须和目标 exe **同一个目录** —— 同一卷上 os.rename 才是原子的
+    （跨卷会退化成复制，中途断电就留下半个文件）。
+    校验不通过会把临时文件删掉，绝不留一个来路不明的 exe 在磁盘上。
+
+    传输失败会自动重试（最多 ATTEMPTS 次，理由见 ATTEMPTS 的注释）。
+    `on_retry(第几次尝试, 总次数, 原因)` 在每次重试**之前**回调 —— 调用方拿它提示
+    「不是卡死了，是在重试」。回调抛异常会被吞掉：它只是提示，不该带崩下载。
+    """
+    tmp = dest + ".part"
+    reason = "未开始"
+    for attempt in range(1, ATTEMPTS + 1):
+        _unlink(tmp)                       # 清掉上一轮的残骸，别让两次的数据混在一起
+        ok, reason, retryable = _attempt(url, tmp, size, timeout, on_progress)
+
+        if ok and size is not None:
+            # 先把大小读出来再决定删文件。写成 `_unlink(tmp)` 之后再 getsize(tmp) 的话，
+            # 报错信息里那句「实际 %d」会抛 FileNotFoundError —— **错误处理路径自己崩掉**，
+            # 而且只在「大小不符」这个罕见分支才触发。这个 bug 是靠负面对照逼出来的。
+            actual_size = os.path.getsize(tmp)
+            if actual_size != size:
+                # 注意这里 retryable 置 True：截断**不会抛异常**，就是走到这个分支的
+                ok, retryable = False, True
+                reason = "文件大小不符（期望 %d，实际 %d）" % (size, actual_size)
+
+        if ok and sha256:
+            actual = sha256_file(tmp)
+            if actual != sha256:
+                # 把两个哈希都打出来 —— 排查时最想知道的就是「差在哪」
+                ok, retryable = False, True
+                reason = "校验失败（期望 %s…，实际 %s…）" % (sha256[:12], actual[:12])
+
+        if ok:
+            break
+        if not retryable or attempt == ATTEMPTS:
             _unlink(tmp)
-            return False, "文件大小不符（期望 %d，实际 %d）" % (size, actual_size)
-
-    if sha256:
-        actual = sha256_file(tmp)
-        if actual != sha256:
-            _unlink(tmp)
-            # 把两个哈希都打出来 —— 排查时最想知道的就是「差在哪」
-            return False, "校验失败（期望 %s…，实际 %s…）" % (sha256[:12], actual[:12])
+            return False, reason
+        if on_retry:
+            try:
+                on_retry(attempt + 1, ATTEMPTS, reason)
+            except Exception:
+                pass
 
     try:
         os.replace(tmp, dest)
@@ -464,14 +506,15 @@ def apply_update(exe, new_file):
     return True, None
 
 
-def stage_update(exe, info, timeout=TIMEOUT, on_progress=None):
+def stage_update(exe, info, timeout=TIMEOUT, on_progress=None, on_retry=None):
     """下载 + 校验 + 替换，一条龙。返回 (True, None) 或 (False, 原因)。
 
     临时文件放在 exe 同目录，保证最后一步 os.replace 是同卷操作。
     """
     dest = exe + ".new"
     ok, reason = download(info["url"], dest, info.get("sha256"), info.get("size"),
-                          timeout=timeout, on_progress=on_progress)
+                          timeout=timeout, on_progress=on_progress,
+                          on_retry=on_retry)
     if not ok:
         return False, reason
     ok, reason = apply_update(exe, dest)
