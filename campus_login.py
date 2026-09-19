@@ -3,12 +3,15 @@
 校园网自动登录（单文件版）
   - 不带参数        : 打开设置界面
   - --auto          : 静默模式（开机自启用），未联网才登录，不弹任何窗口
+  - --guard         : 静默登录后继续守一段时间，掉线自动重连（到点自己退出）
   - --logout        : 静默下线
   - --switch <学号> : 静默切换到指定账号（密码取自 accounts.json）
   - --selftest      : 环境自检，结果打印并写入数据目录 selftest.txt
   - --guitest       : 只构建界面不显示，结果写入数据目录 guitest.txt
   - --purge         : 清除本机保存的账号密码等隐私数据
   - --version (-v)  : 只打印版本号就退出（打包后没有 stdout，改为弹窗）
+
+开机自启用的是 `--auto --guard`（见 AUTOSTART_ARGS）。
 
 数据目录：C:\\ProgramData\\CampusLogin
           （该目录写不进去时自动退回 %APPDATA%\\CampusLogin）
@@ -47,7 +50,7 @@ APP_TITLE = "校园网自动登录"
 # ⚠️ 这里是**唯一来源**。界面标题、使用说明、--version、--selftest、
 #    以及 exe 文件属性里的版本，全部由它推导 —— 不要在别处另写一份，
 #    否则迟早漂移（改了一处忘了另一处，用户看到的版本号就是错的）。
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 
 # 学校 portal 默认参数（拷到同校其他电脑上可直接用）
 DEFAULTS = {
@@ -56,6 +59,18 @@ DEFAULTS = {
     "wlanAcName": "ZZHK-ZAX-BRAS",
     "timeoutSec": 8,
 }
+
+# 校园网给终端分配的网段前缀。**判断「在不在校园网」用它，不用「能不能上网」**。
+#
+# 为什么必须分开（2026-09-19 修的 bug）：
+#   原来界面直接把 test_internet() 的结果翻译成「已连接校园网」，
+#   而 test_internet() 测的是「能不能上公网」—— 于是**在宿舍/家用 Wi-Fi 上
+#   也显示「已连接校园网」**，用户根本分不清自己是连上了校园网还是别的网。
+#   实测本校给的是 10.x（日志里 wlanuserip=10.15.116.156）。
+#
+# 写成可配置的：别的学校/别的校区网段不同，改 config.json 里的
+# `campusSubnets` 就行，不用动代码。留空则用下面这个默认值。
+DEFAULT_CAMPUS_SUBNETS = ("10.",)
 
 TRIGGER_URL = "http://1.1.1.1/"
 # 连通性检测目标：逐个试，任一通过即算「已联网」。
@@ -207,6 +222,35 @@ CONFIG_FILE = os.path.join(data_dir(), "config.json")
 ACCOUNTS_FILE = os.path.join(data_dir(), "accounts.json")
 LOG_FILE = os.path.join(data_dir(), "campus-login.log")
 RESULT_FILE = os.path.join(data_dir(), "last-result.json")
+# 守护进程的「有人在跑」标记。里面记 pid 和启动时刻。
+# ⚠️ 这个文件**可能被残留**：退出走的是 TerminateProcess（见 exit_now），
+#    finally 和 atexit 都不会执行，所以不能指望正常删除它。
+#    靠 guard_running() 里的「过期」判定自愈，别改成「存在即视为在跑」。
+GUARD_FLAG = os.path.join(data_dir(), "guard.json")
+
+# ============ 开机自启的节奏参数 ============
+# 「开机自启生效相当慢」的实测定位（2026-09-19，见 auto_timing_probe.py）：
+#   正常一次 --auto 只要 **3 秒**；但网络没就绪时会白烧 80 秒超时
+#   （联网检测 16s + GET 10s + POST 15s + 认证后探测 41s），然后**一次不成就永久放弃**。
+#   所以「慢」的根因不是等网卡（70 次运行里 wait_for_campus 耗时全是 0 秒），
+#   而是「超时预算太长 + 没有重试」。下面这几个参数就是照这个结论定的。
+AUTO_ATTEMPTS = 3            # --auto 一共试几轮
+AUTO_RETRY_BACKOFF = 5       # 每轮之间等几秒（第 N 轮等 N × 这个值）
+AUTO_WAIT_FIRST = 60         # 第一轮等校园网的秒数（跟以前一样，别加大：
+                             #   实测 wait_for_campus 从来没等过，加大只是让
+                             #   「真的不在校园网」时多耗时间）
+AUTO_WAIT_RETRY = 20         # 后续几轮只给 20 秒
+AUTO_NET_TIMEOUT = 5         # --auto 里联网检测用的超时。默认配置是 8 秒，
+                             #   换算成每个探测目标 4 秒 → 4 个目标全超时 = 16 秒。
+                             #   给 5 秒 → 每个 2.5 秒 = 最多 10 秒。省下的 6 秒
+                             #   在开机那一刻很值；网络正常时第一个探测就返回了，
+                             #   这个上限根本用不到。
+GUARD_SECONDS = 1800         # 守护总时长：30 分钟（用户指定，覆盖开机 + 上课这段）
+GUARD_POLL = 30              # 每 30 秒看一次
+GUARD_CONFIRM = 2            # 「测不出来」要连续几次才动手（避免被一次网络抖动骗到）
+GUARD_FAIL_BACKOFF_MAX = 300 # 重连失败后的最大退避（秒）。没有它的话，网络真断了
+                             #   会在半小时里攒出几十次无效登录，把日志刷满。
+GUARD_RESPECT_LOGOUT = 7200  # 用户主动退出后，多久之内不去打扰他（2 小时）
 
 LEGACY_DIR = r"C:\tools"          # 最老的 PowerShell 版部署位置，首次运行时会尝试继承
 
@@ -360,6 +404,33 @@ def set_last_online(uid):
     save_accounts(store)
 
 
+def note_logout():
+    """记下「用户是**主动**退出的」这件事。
+
+    ⚠️ 为什么必须记时间（2026-09-19 加）：`--guard` 会在开机后 30 分钟里
+    自动重连。如果用户在这段时间里主动点了「退出当前账号」，守护进程一看
+    「在校园网但没认证」就把他又登回去 —— 用户会觉得这软件在跟他对着干。
+    光看 lastOnline 是否为空判不出来（开机时它本来就可能是空的），
+    所以单独记一个时刻，守护据此避让一段时间。
+    """
+    store = load_accounts()
+    store["lastOnline"] = ""
+    store["lastLogout"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    save_accounts(store)
+
+
+def logged_out_recently(within=GUARD_RESPECT_LOGOUT):
+    """用户在最近 `within` 秒内主动退出过吗。判不出来时返回 False（不阻拦）。"""
+    t = (load_accounts().get("lastLogout") or "").strip()
+    if not t:
+        return False
+    try:
+        dt = datetime.strptime(t, "%Y-%m-%d %H:%M:%S")
+    except ValueError:
+        return False
+    return (datetime.now() - dt).total_seconds() < within
+
+
 def set_active_account(uid, pwd):
     cfg = load_config()
     cfg["userId"] = uid
@@ -490,13 +561,49 @@ class Response(object):
             self.text = raw.decode("utf-8", "replace")
 
 
+def _direct_handlers():
+    """本程序所有请求都要用的「**不走系统代理**」处理器。
+
+    为什么必须显式关掉代理（2026-09-19 实测踩到，属于静默失败）：
+        urllib 的默认 opener 会走系统代理 —— 它既读 `HTTP_PROXY` /
+        `http_proxy` / `HTTPS_PROXY` 环境变量，**在 Windows 上还会读
+        IE/WinINET 注册表里的代理设置**（getproxies()）。只要机器上装了
+        Clash / v2ray 这类会把系统代理打开的软件，或者有人设过环境变量，
+        本程序**所有**请求都会绕去那个代理。
+        而校园网门户就在局域网里，根本不该走代理 —— 表现是：TCP 能连通、
+        但 GET/POST 全部超时，登录必然失败，日志里只看得到
+        `<urlopen error timed out>`，**完全看不出是代理造成的**。
+        本机沙箱里就是 `HTTP_PROXY=http://127.0.0.1:10389` 导致全部超时，
+        一度被误判成「校园网故障」。
+
+    ⚠️ updater.py 早就这么做了（它开头第 14 行记着同一个坑：系统代理指向
+       不可用的 127.0.0.1:7897 时客户端直接卡死）。**门户会话当时漏了**，
+       于是「检查更新」正常、登录却全超时 —— 这种「一半能通」最容易查错方向。
+       两处现在用同一个理由，改一处别忘了另一处。
+
+    直连才是正确行为，不只是为了绕开沙箱：
+      · 门户在校园网内网，走公网代理必然失败；
+      · 公网探测目标（msftconnecttest 之类）也必须**直连**才有意义 ——
+        走代理就绕过了门户劫持，`test_internet()` 会把「未认证」误判成「已联网」。
+
+    ⚠️ 一个反直觉的细节，别把它当 bug「修」掉：
+        `build_opener(ProxyHandler({}))` 之后，`opener.handlers` 里**看不到**
+        ProxyHandler —— `OpenerDirector.add_handler` 会把 `proxy_open` 当作
+        「名字撞车」跳过，于是 ProxyHandler 一个协议方法都不贡献，根本不进列表。
+        效果正是我们要的（完全不查代理）。已实测：设了 `HTTP_PROXY` 指向一个
+        不通的地址，本 opener 仍然 0.5 秒直连成功。
+    """
+    return [urllib.request.ProxyHandler({})]
+
+
 class Session(object):
     """最小会话：cookie 罐 + 固定请求头。够这个 portal 流程用。"""
 
     def __init__(self, headers=None):
         self.jar = http.cookiejar.CookieJar()
-        self.opener = urllib.request.build_opener(
-            urllib.request.HTTPCookieProcessor(self.jar))
+        handlers = [urllib.request.HTTPCookieProcessor(self.jar)]
+        handlers += _direct_handlers()
+        self.opener = urllib.request.build_opener(*handlers)
         self.headers = dict(headers or {})
 
     def request(self, url, data=None, timeout=10):
@@ -582,6 +689,104 @@ def test_internet(timeout=None, rounds=1):
     return False if saw_blocked else None
 
 
+def campus_subnets():
+    """校园网给终端分配的网段前缀列表。可被 config.json 的 `campusSubnets` 覆盖。"""
+    cfg = load_config()
+    v = cfg.get("campusSubnets")
+    if isinstance(v, str):
+        items = [s.strip() for s in v.replace(";", ",").split(",")]
+    elif isinstance(v, (list, tuple)):
+        items = [str(s).strip() for s in v]
+    else:
+        items = []
+    items = [s for s in items if s]
+    return items or list(DEFAULT_CAMPUS_SUBNETS)
+
+
+def portal_reachable(timeout=3.0):
+    """门户主机的 80 端口通不通。True / False。"""
+    cfg = load_config()
+    host = urlparse(cfg.get("portalHost") or DEFAULTS["portalHost"]).hostname
+    if not host:
+        return False
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        s.connect((host, 80))
+        return True
+    except Exception:
+        return False
+    finally:
+        s.close()
+
+
+def on_campus_network(timeout=3.0):
+    """本机是不是接在**校园网**上。三态：True / False / None。
+
+    ⚠️ 这**不是**「能不能上网」—— 那是 test_internet() 的事，两者必须分开。
+       在宿舍/家用 Wi-Fi 上：test_internet() = True，但 on_campus_network() = False。
+       原来界面把前者直接当成后者显示，才会「随便连个网都显示已连接校园网」。
+
+    判据（满足任一即为真）：
+      1) 本机出口 IPv4 落在配置的校园网段（默认 10.*）
+      2) 门户主机 TCP 可达
+
+    第 2 条是**兜底**：万一学校换了网段，第 1 条会失效，但门户仍然连得上，
+    不会把「其实在校园网」误判成「不在」。
+    ⚠️ 已知残留风险：若门户恰好从公网也连得上，那么在校外用 10.x 的家庭路由器时
+    可能误报。缓解办法是把 `campusSubnets` 配得更精确（例如 `10.15.`）。
+    """
+    ip = local_ipv4()
+    if ip and any(ip.startswith(p) for p in campus_subnets()):
+        return True
+    if portal_reachable(timeout):
+        return True
+    if not ip:
+        return None                     # 连出口 IP 都拿不到 → 判不了
+    return False
+
+
+# 网络状态。**只在这里定义一次** —— 界面和命令行各写一套迟早会漂移。
+NET_OFF_CAMPUS = "off_campus"       # 不在校园网（跟能不能上网无关）
+NET_OK = "ok"                       # 在校园网且已认证
+NET_NEED_LOGIN = "need_login"       # 在校园网但被门户挡住
+NET_UNKNOWN = "unknown"             # 判定不了
+
+NET_TEXT = {
+    NET_OFF_CAMPUS: "未连接校园网",
+    NET_OK: "已连接校园网",
+    NET_NEED_LOGIN: "已连校园网，未认证",
+    NET_UNKNOWN: "网络状态未知",
+}
+
+NET_COLOR = {
+    NET_OFF_CAMPUS: "#bbbbbb",
+    NET_OK: "#28a745",
+    NET_NEED_LOGIN: "#dc3545",
+    NET_UNKNOWN: "#bbbbbb",
+}
+
+
+def network_state(timeout=None):
+    """一句话结论，界面和命令行共用。
+
+    先把「在不在校园网」和「认证没认证」两件事分开，再合成状态 ——
+    这样「不在校园网」就不会被误报成「已连接校园网」。
+    """
+    on = on_campus_network()
+    if on is False:
+        # 不在校园网 → 不管公网通不通，都**不能**说「已连接校园网」。
+        return NET_OFF_CAMPUS
+    net = test_internet(timeout=timeout)
+    if net is True:
+        # on 可能是 None（拿不到出口 IP）—— 那种情况不能断言「在校园网」，
+        # 宁可说未知，也不给用户一个可能错的结论。
+        return NET_OK if on is True else NET_UNKNOWN
+    if net is False:
+        return NET_NEED_LOGIN if on is True else NET_UNKNOWN
+    return NET_UNKNOWN
+
+
 def need_logout_before_switch(net):
     """切换账号前是否需要先下线当前账号。
 
@@ -607,25 +812,109 @@ def local_ipv4():
         s.close()
 
 
-def local_mac():
-    ip = local_ipv4()
+_MAC_RE = re.compile(r"^[0-9a-f]{2}(?::[0-9a-f]{2}){5}$")
+
+
+def norm_mac(m):
+    """把各种写法（大写 / 连字符 / 带空格）统一成 `aa:bb:cc:dd:ee:ff`。"""
+    return (m or "").strip().replace("-", ":").replace(" ", "").lower()
+
+
+def valid_mac(m):
+    """这个字符串能不能当 MAC 用。
+
+    为什么要专门校验（2026-09-19 实测踩到）：
+        开机自启那次登录，**门户自己在重定向 URL 里给了 `mac=00:00:00:00:00:00`**，
+        而 portal_login 优先信任门户给的参数，于是拿全零 MAC 去认证。认证能过
+        （门户不看 MAC 就发会话），但 BRAS 之后按 ARP 表对账时对不上，**几分钟后
+        把会话踢掉** —— 用户看到的就是「连上几分钟后莫名其妙掉线」。
+        日志证据：2026-09-19 11:49:49 那次 POST 的 mac 就是全零。
+
+    为什么全零要单独判：`00:00:00:00:00:00` 格式上是合法 MAC，
+    但它表示「未知」，是网卡未初始化 / ARP 表还没建立时的占位值，永远不该发出去。
+    """
+    m = norm_mac(m)
+    if not _MAC_RE.match(m):
+        return False
+    if m == "00:00:00:00:00:00":          # 未知
+        return False
+    if m == "ff:ff:ff:ff:ff:ff":          # 广播
+        return False
+    # 第一个字节的最低位 = 组播位。源 MAC 不可能是组播地址。
+    # ⚠️ 只查这一位：0x02（本地管理位）是合法的 —— Wi-Fi Direct 虚拟网卡
+    #    （Windows 的「本地连接* N」）用的就是它，实测本机有 86:9e:.. / 8a:9e:..
+    if int(m[:2], 16) & 0x01:
+        return False
+    return True
+
+
+def _mac_from_psutil(ip):
+    """按「哪块网卡拥有这个出口 IP」挑 MAC。挑不到返回 ""。
+
+    顺序很重要：先找 v4 与出口 IP 相同的那块网卡（那才是真正在跑流量的），
+    找不到才退回「第一块有合法 MAC 的物理网卡」。
+    ⚠️ 不能直接用第一块 —— 实测本机网卡顺序是
+    `以太网 / 本地连接*1 / 本地连接*2 / 以太网 2 / WLAN`，
+    第一块「以太网」是没插网线的 169.254 地址，MAC 是 BC-FC-E7-C7-84-AA，
+    拿它去认证就是错的（真值在 WLAN 上）。
+    """
     try:
         import psutil
-        for _name, addrs in psutil.net_if_addrs().items():
-            v4 = [a.address for a in addrs if a.family == socket.AF_INET]
-            if ip and ip not in v4:
-                continue
-            for a in addrs:
-                if a.family == psutil.AF_LINK and a.address and a.address != "00:00:00:00:00:00":
-                    return a.address.replace("-", ":").lower()
     except Exception:
-        pass
+        return ""
+    others = ""
+    for name, addrs in psutil.net_if_addrs().items():
+        v4 = [a.address for a in addrs if a.family == socket.AF_INET]
+        mac = ""
+        for a in addrs:
+            if a.family == psutil.AF_LINK and valid_mac(a.address):
+                mac = norm_mac(a.address)
+                break
+        if not mac:
+            continue
+        if ip and ip in v4:
+            return mac                      # 命中出口 IP，直接用它
+        if not others and not _is_virtual_nic(name):
+            others = mac                    # 退而求其次：非虚拟网卡
+    return others
+
+
+def _is_virtual_nic(name):
+    """名字像虚拟网卡吗（Wi-Fi Direct / 回环 / 蓝牙 / 隧道）。
+
+    只在「挑不到出口 IP 对应网卡」时才用得上，用来避免把
+    「本地连接* 1」这种 Wi-Fi Direct 虚拟网卡的 MAC 当成本机 MAC。
+    """
+    n = (name or "").lower()
+    return any(k in n for k in ("本地连接*", "loopback", "bluetooth", "vethernet",
+                                "vmware", "virtualbox", "tap-", "tunnel", "wi-fi direct"))
+
+
+def local_mac():
+    """本机用于访问校园网的网卡 MAC。取不到返回 ""（调用方必须能容忍）。
+
+    ⚠️ 这个值直接决定认证能不能站住：门户/BRAS 用它标识终端。
+    发错了（或发了全零）认证照样「成功」，但会话会在几分钟内被踢掉，
+    而且界面上看不出任何异常 —— 属于最难查的一类故障。
+    """
+    ip = local_ipv4()
+    m = _mac_from_psutil(ip)
+    if m:
+        return m
     try:
+        # ⚠️ 不能加 text=True：getmac 的输出是 **GBK**，用 UTF-8 解会抛
+        # UnicodeDecodeError，而且异常发生在读取线程里 —— stdout 直接变成 None，
+        # 后面 re.search(pattern, None) 抛 TypeError，**整个输出全丢**，
+        # 看起来就像「getmac 没输出」。实测本机必现。
         out = subprocess.run(["getmac", "/fo", "csv", "/nh"], capture_output=True,
-                             text=True, timeout=8, creationflags=CREATE_NO_WINDOW).stdout
-        m = re.search(r"([0-9A-Fa-f]{2}(?:-[0-9A-Fa-f]{2}){5})", out)
-        if m:
-            return m.group(1).replace("-", ":").lower()
+                             timeout=8, creationflags=CREATE_NO_WINDOW).stdout or b""
+        text = out.decode("gbk", errors="replace")
+        # ⚠️ 不能取第一个匹配：列表里可能混着 00-00-00-00-00-00（断开的网卡），
+        # 取到它就是那个「全零 MAC」故障。逐个验，取第一个**合法**的。
+        for cand in re.findall(r"([0-9A-Fa-f]{2}(?:-[0-9A-Fa-f]{2}){5})", text):
+            if valid_mac(cand):
+                return norm_mac(cand)
+        log("getmac 有输出但没有合法 MAC：%r" % text[:200])
     except Exception:
         log("getmac 取 MAC 失败:\n%s" % traceback.format_exc())
     # 两条路都失败 → 返回空串。**必须留痕**：这个空值会直接填进登录表单的
@@ -636,12 +925,23 @@ def local_mac():
 
 
 def wait_for_campus(max_seconds=60):
-    """轮询等待拿到校园网段（10.*）的地址"""
+    """轮询等待接入校园网。
+
+    判据与 on_campus_network() 一致（网段 或 门户可达），但这里要**便宜**：
+    每 0.5 秒只看一次本机 IP（纯本地、不发包），每 5 秒才做一次门户 TCP 探测
+    —— 门户探测要 3 秒超时，每次都做会让 60 秒的等待只够轮询十几次。
+    """
     deadline = time.time() + max_seconds
+    next_portal = 0.0
     while time.time() < deadline:
         ip = local_ipv4()
-        if ip and ip.startswith("10."):
+        if ip and any(ip.startswith(p) for p in campus_subnets()):
             return True
+        now = time.time()
+        if now >= next_portal:
+            next_portal = now + 5.0
+            if portal_reachable(2.0):
+                return True
         time.sleep(0.5)
     return False
 
@@ -703,6 +1003,31 @@ def portal_login(uid, pwd):
         }
 
     p = dict(p)
+
+    # ⚠️ **门户给的 mac 不可信**（2026-09-19 实测踩到，就是「连上几分钟后掉线」的根因）。
+    #    开机那次 GET，门户在重定向 URL 里给的是 `mac=00:00:00:00:00:00`
+    #    （它自己也还没查到 ARP 表）。拿它去认证：门户照发会话、程序探测也显示
+    #    「认证成功」，但 BRAS 之后按真实 MAC 对账时对不上 → 几分钟后踢掉会话。
+    #    所以在发出去之前一律换成校验过的真值。
+    got = p.get("mac") or ""
+    if valid_mac(got):
+        p["mac"] = norm_mac(got)
+    else:
+        real = local_mac()
+        log("门户给的 MAC 无效(%r)，改用本机 MAC(%r)" % (got, real))
+        if valid_mac(real):
+            p["mac"] = real
+        else:
+            # 两边都拿不到合法 MAC。**仍然发出去**（能上网几分钟总比完全不能好），
+            # 但必须留痕 —— 否则用户只会看到「连上又掉」，日志里毫无线索。
+            log("⚠️ 门户和本机都没给出合法 MAC，认证后可能被踢下线")
+            p["mac"] = real or got
+
+    # 同理校验 wlanuserip：门户偶尔会给空值，空着填进表单必被拒。
+    if not (p.get("wlanuserip") or "").strip():
+        p["wlanuserip"] = local_ipv4() or ""
+        log("门户没给 wlanuserip，改用本机出口 IP：%r" % p["wlanuserip"])
+
     for k, v in LOGIN_EXTRA.items():
         p.setdefault(k, v)
     p["userId"] = uid
@@ -713,8 +1038,10 @@ def portal_login(uid, pwd):
                        ("wlanacip", "wlanacname", "wlanuserip", "mac", "vlan", "url")})
     post_url = "%s/webauth.do?%s" % (host, query)
     log("POST %s" % post_url)
+    post_ok = False
     try:
         r = sess.post(post_url, data=p, timeout=15)
+        post_ok = True
         log("POST 状态: %s  长度: %s" % (r.status_code, len(r.text)))
     except Exception as e:
         log("POST 异常: %s" % e)
@@ -724,7 +1051,17 @@ def portal_login(uid, pwd):
     # 而网络其实几秒后就通了（门户重定向里甚至已经带着 act=LOGINSUCC）。
     # 结果是「明明登上了却报失败」—— switch 场景下还会触发一次没必要的回滚。
     # 改成隔几秒多探几次再下结论：正常 1 次就过，真的失败才会走满全程。
-    for i, delay in enumerate((2, 3, 3, 4, 4), 1):
+    #
+    # ⚠️ 但**探测表要按 POST 有没有真的发出去来分档**（2026-09-19 加）：
+    #    这张表的用途是「等门户把会话建起来」，不是「等一个死掉的网络活过来」。
+    #    POST 抛异常说明请求根本没落地（开机那一刻的典型情形），这时按 41 秒
+    #    走满全程纯属白等 —— 实测那次 21:47 就是这么烧掉 15 + 41 秒的。
+    #    缩短到两次探测（约 18 秒），把「没落地」和「落地了但响应丢了」都覆盖住，
+    #    剩下的交给 do_auto 的外层重试。
+    delays = (2, 3, 3, 4, 4) if post_ok else (3, 5)
+    if not post_ok:
+        log("POST 未落地，探测表缩短为 %s" % (delays,))
+    for i, delay in enumerate(delays, 1):
         time.sleep(delay)
         net = test_internet(timeout=5)
         if net is True:
@@ -940,7 +1277,28 @@ def portal_logout():
 
 
 # ==================== 业务动作 ====================
-def do_auto():
+def _log_stage(tag, t0):
+    """记一行「某阶段花了多久」。
+
+    为什么要专门记（2026-09-19 加）：用户报「开机自启生效相当慢」，但原来的
+    日志只有「开始检查」和「校园网就绪」两行，中间到底是在等网卡还是在烧
+    超时**完全分不出来** —— 当时只能另写 auto_timing_probe.py 去反推。
+    留一行耗时，下次一眼就能定位。
+    """
+    log("  [耗时] %s %.1f 秒" % (tag, time.time() - t0))
+
+
+def do_auto(attempts=AUTO_ATTEMPTS):
+    """开机自启 / 静默登录。返回退出码。
+
+    ⚠️ 为什么要重试（2026-09-19 修的，就是「开机自启生效相当慢」的根因）：
+        原来只试一次。而开机那一刻网络栈往往还没就绪（DNS 没通、门户不响应），
+        实测一次失败要白烧 80 秒超时（联网检测 16 + GET 10 + POST 15 + 探测 41），
+        然后**直接放弃**。用户看到的就是「等了半天没连上，而且它再也不会重来」。
+        现在改成试 AUTO_ATTEMPTS 轮、轮间退避；网络一就绪，下一轮 3 秒就成。
+        实测正常路径只要 3 秒（70 次历史运行里 wait_for_campus 耗时全是 0），
+        所以重试的代价几乎全在「本来就会失败」的场景里 —— 正是该重试的场景。
+    """
     cfg = load_config()
     uid = cfg.get("userId") or ""
     pwd = cfg.get("passwd") or ""
@@ -949,28 +1307,216 @@ def do_auto():
         log("账号或密码为空，退出")
         write_result("auto", "ERR_CONFIG", False, "账号或密码为空")
         return 4
-    if not wait_for_campus(60):
-        log("60 秒内未检测到校园网，退出")
-        write_result("auto", "NO_GATEWAY", False, "未检测到校园网，请确认已连接校园网 Wi-Fi")
-        return 4
-    log("校园网就绪")
-    net = test_internet()
+
+    t_all = time.time()
+    last_code, last_msg = 4, "未检测到校园网，请确认已连接校园网 Wi-Fi"
+    for attempt in range(1, max(1, attempts) + 1):
+        if attempt > 1:
+            backoff = AUTO_RETRY_BACKOFF * (attempt - 1)
+            log("--- 第 %d/%d 轮重试（先等 %d 秒）---" % (attempt, attempts, backoff))
+            time.sleep(backoff)
+        else:
+            log("--- 第 %d/%d 轮 ---" % (attempt, attempts))
+
+        t0 = time.time()
+        wait = AUTO_WAIT_FIRST if attempt == 1 else AUTO_WAIT_RETRY
+        if not wait_for_campus(wait):
+            log("%d 秒内未检测到校园网" % wait)
+            _log_stage("等校园网", t0)
+            last_code, last_msg = 4, "未检测到校园网，请确认已连接校园网 Wi-Fi"
+            continue
+        log("校园网就绪")
+        _log_stage("等校园网", t0)
+
+        t0 = time.time()
+        net = test_internet(timeout=AUTO_NET_TIMEOUT)
+        _log_stage("联网检测", t0)
+        if net is True:
+            log("网络已通，无需认证")
+            _log_stage("总计", t_all)
+            write_result("auto", "OK", True, "网络已连接")
+            return 0
+        log("联网检测：%s，开始登录" % ("未认证" if net is False else "无法判定"))
+
+        t0 = time.time()
+        ok = portal_login(uid, pwd)
+        _log_stage("登录", t0)
+        update_account_record(uid, pwd, ok)
+        if ok:
+            log("=== 认证成功（第 %d 轮）===" % attempt)
+            _log_stage("总计", t_all)
+            write_result("auto", "OK", True, "网络已连接")
+            return 0
+        log("=== 第 %d 轮认证后仍不通 ===" % attempt)
+
+        # 密码**确定**是错的：再试多少轮结果都一样，别让用户在开机那几分钟干等。
+        # （pw_ok 是 None 表示「判不出来」，那属于网络问题，要继续重试。）
+        pw_ok = check_password(uid, pwd)
+        if pw_ok is False:
+            log("密码校验不通过，不再重试")
+            _log_stage("总计", t_all)
+            write_result("auto", "LOGIN_FAILED", False, "登录失败，请检查密码是否正确")
+            return 2
+        last_code, last_msg = 2, "登录失败，网络异常，请稍后重试"
+
+    log("=== %d 轮都没成功 ===" % attempts)
+    _log_stage("总计", t_all)
+    write_result("auto", "NO_GATEWAY" if last_code == 4 else "LOGIN_FAILED",
+                 False, last_msg)
+    return last_code
+
+
+# ==================== 守护（--guard）====================
+GUARD_IDLE = "idle"          # 什么都不用做
+GUARD_WAIT = "wait"          # 测不出来，再观察一次
+GUARD_RELOGIN = "relogin"    # 确认掉线，重连
+
+
+def guard_running():
+    """已经有一个守护在跑吗。返回 (bool, 说明)。"""
+    info = read_json(GUARD_FLAG)
+    if not isinstance(info, dict):
+        return False, ""
+    try:
+        started = float(info.get("started"))
+    except (TypeError, ValueError):
+        return False, "记录里没有启动时刻"
+    age = time.time() - started
+    if age < 0:
+        return False, "记录时刻在未来（时钟被改过）"
+    # ⚠️ **过期记录必须当作「没在跑」**：退出走 exit_now() → TerminateProcess，
+    #    finally 不会执行，guard.json 经常是残留的。只看「文件在不在」的话，
+    #    残留一份就再也不会启动守护 —— 而且是**静默**的，界面上完全看不出来。
+    if age > GUARD_SECONDS + 300:
+        return False, "记录已过期（%.0f 秒前）" % age
+    pid = info.get("pid")
+    if not pid:
+        return False, "记录里没有 pid"
+    try:
+        import psutil
+        alive = psutil.pid_exists(int(pid))
+    except Exception:
+        # 判不了就保守当作在跑：宁可少起一个守护，也不要起两个 ——
+        # 两个守护会同时重连，反而更容易被 BRAS 踢。
+        return True, "无法确认进程 %s 是否还在（保守当作在跑）" % pid
+    return (True, "PID %s" % pid) if alive else (False, "进程 %s 已退出" % pid)
+
+
+def guard_decide(net, on_campus, unknown_streak):
+    """守护根据一次检测结果决定做什么。**纯函数、不发任何请求**，所以能直接测。
+
+    net / on_campus 都是三态（True / False / None），含义同 test_internet()
+    和 on_campus_network()。unknown_streak 是「连续测不出是否联网」的次数。
+    """
+    if on_campus is not True:
+        # 不在校园网（或判不出来）：什么都不做。
+        # 在家里、用手机热点时它本来就不该去登录 —— 登了也没用，只会把日志刷满。
+        return GUARD_IDLE
     if net is True:
-        log("网络已通，无需认证")
-        write_result("auto", "OK", True, "网络已连接")
+        return GUARD_IDLE
+    if net is False:
+        # 在校园网、但流量被门户挡着 —— 这就是「被踢下线」的样子。重连。
+        return GUARD_RELOGIN
+    # net is None：测不出来。可能只是一次抖动，**连够 GUARD_CONFIRM 次才动手**，
+    # 免得被一次瞬时失败牵着走（每 30 秒重连一次，本身就可能被 BRAS 盯上）。
+    return GUARD_WAIT if unknown_streak < GUARD_CONFIRM else GUARD_RELOGIN
+
+
+def run_guard(seconds=GUARD_SECONDS, poll=GUARD_POLL):
+    """开机后的一小段守护：掉线了自己重连，到点就退出。返回退出码。
+
+    为什么需要它（2026-09-19 用户报的第三个问题）：
+        `--auto` 登录成功后**进程就退了**。之后不管会话是被 BRAS 对账踢掉的、
+        还是碰上学校那边的空闲超时，都**没有任何东西再去重连** —— 用户看到的
+        就是「连上几分钟后莫名其妙掉线」，而且不会自己连回来。
+
+    为什么只工作 30 分钟（用户明确要求）：
+        开机 + 上课这一段是最容易掉线的时段，守住它收益最大；再往后就不值得
+        留一个常驻进程了。到点自动退出，不留后台进程。
+
+    ⚠️ 退出走 exit_now() → TerminateProcess，**finally / atexit 都不会执行**，
+       所以 guard.json 必然残留 —— 这是设计上接受的，靠 guard_running() 的
+       「过期」判定自愈。别改成「文件存在即视为在跑」。
+
+    ⚠️ 已确认**不会挡住自我更新**（不用再查一遍）：更新走的是
+       updater.apply_update()，它用 os.rename 把运行中的 exe 改名成 .old
+       —— Windows 把运行中的映像映射成 FILE_SHARE_DELETE，所以**有几个进程
+       正跑着它都不影响改名**（updtest_running_exe.py 实测过）。
+       守护会继续从改名后的 .old 跑完剩余时间，然后正常退出。
+    """
+    running, why = guard_running()
+    if running:
+        log("=== 已有守护在跑（%s），本进程直接退出 ===" % why)
         return 0
-    log("联网检测：%s，开始登录" % ("未认证" if net is False else "无法判定"))
-    ok = portal_login(uid, pwd)
-    update_account_record(uid, pwd, ok)
-    if ok:
-        log("=== 认证成功 ===")
-        write_result("auto", "OK", True, "网络已连接")
+    cfg = load_config()
+    uid = cfg.get("userId") or ""
+    pwd = cfg.get("passwd") or ""
+    if not uid or not pwd:
+        log("=== 守护：账号或密码为空，退出 ===")
         return 0
-    log("=== 认证后仍不通 ===")
-    pw_ok = check_password(uid, pwd)
-    msg = "登录失败，请检查密码是否正确" if pw_ok is False else "登录失败，网络异常，请稍后重试"
-    write_result("auto", "LOGIN_FAILED", False, msg)
-    return 2
+    write_json(GUARD_FLAG, {"pid": os.getpid(), "started": time.time(),
+                            "version": VERSION})
+    log("=== 守护开始：共 %d 秒，每 %d 秒查一次（pid=%s）==="
+        % (seconds, poll, os.getpid()))
+    deadline = time.time() + seconds
+    streak = 0        # 连续「测不出是否联网」的次数
+    fails = 0         # 连续重连失败次数
+    next_beat = time.time() + 300
+    while True:
+        left = deadline - time.time()
+        if left <= 0:
+            break
+        time.sleep(min(poll, left))
+        if time.time() >= deadline:
+            break
+        try:
+            if time.time() >= next_beat:
+                next_beat = time.time() + 300
+                log("守护运行中（还剩 %d 秒）" % int(deadline - time.time()))
+            on = on_campus_network(2.0)
+            # 不在校园网就不必花时间做联网检测 —— 那一项才是贵的（最多 10 秒）。
+            net = test_internet(timeout=AUTO_NET_TIMEOUT) if on is True else None
+            act = guard_decide(net, on, streak)
+            if act == GUARD_WAIT:
+                streak += 1
+                log("守护：在校园网但测不出是否联网（连续第 %d 次）" % streak)
+                continue
+            streak = 0
+            if act != GUARD_RELOGIN:
+                continue
+            # 用户主动退出过就别跟他对着干。**每一拍都要重新看** ——
+            # 用户完全可能在守护运行期间才点的「退出当前账号」。
+            if logged_out_recently():
+                log("守护：用户刚主动退出过，这一拍不重连")
+                continue
+            log("=== 守护：检测到掉线，重新登录 ===")
+            ok = portal_login(uid, pwd)
+            update_account_record(uid, pwd, ok)
+            if ok:
+                fails = 0
+                log("=== 守护：重连成功 ===")
+                write_result("guard", "OK", True, "掉线后已自动重连")
+            else:
+                # 重连失败要退避：网络真断了的时候，每 30 秒重试一次会在
+                # 半小时里攒出几十次无效登录，把日志刷满、还可能被 BRAS 盯上。
+                fails += 1
+                nap = min(GUARD_FAIL_BACKOFF_MAX, poll * (2 ** fails))
+                nap = min(nap, max(0.0, deadline - time.time()))
+                log("=== 守护：重连失败（连续第 %d 次），下次多等 %d 秒 ==="
+                    % (fails, int(nap)))
+                write_result("guard", "LOGIN_FAILED", False, "掉线后自动重连失败")
+                if nap > 0:
+                    time.sleep(nap)
+        except Exception:
+            # 守护里任何异常都不能让循环挂掉 —— 挂了就再也没人重连了，
+            # 而且用户只会看到「又掉线了」，日志里什么线索都没有。
+            log("守护循环异常（已忽略，继续）:\n%s" % traceback.format_exc())
+    log("=== 守护结束（已跑满 %d 秒）===" % seconds)
+    try:
+        os.remove(GUARD_FLAG)
+    except OSError:
+        pass
+    return 0
 
 
 def do_logout():
@@ -983,7 +1529,7 @@ def do_logout():
     # （用户点这个按钮的意图就是要下线，不该因为一次检测失败就不动作）。
     if test_internet() is False:
         log("本来就未联网，无需下线")
-        set_last_online("")
+        note_logout()
         write_result("logout", "OK", True, "当前未登录校园网")
         return 0
 
@@ -1010,7 +1556,7 @@ def do_logout():
             last = v
             if v is True:
                 log("=== 已下线（第 %d 次尝试）===" % attempt)
-                set_last_online("")
+                note_logout()
                 write_result("logout", "OK", True, "已退出当前账号")
                 return 0
             if v is False:
@@ -1129,6 +1675,12 @@ def do_switch(uid, pwd, prev_uid):
 
 # ==================== 开机自启 ====================
 AUTOSTART_LNK_NAME = "校园网自动登录.lnk"
+# 自启快捷方式带的命令行参数。
+#   --auto  : 静默登录（开机那一刻跑）
+#   --guard : 登录完再守 30 分钟，掉线了自动重连（见 run_guard）
+# ⚠️ 这里是**唯一来源**：set_autostart() 用它写 .lnk，
+#    autostart_outdated() 用它判断老链接要不要更新。两处都别再写字面量。
+AUTOSTART_ARGS = "--auto --guard"
 # 老版本 / 手工建的可能用这些名字
 LEGACY_LNK_NAMES = (
     "campus-login.bat - 快捷方式.lnk",
@@ -1230,6 +1782,85 @@ def autostart_stale():
     return all(_lnk_points_to_me(p) is False for p in links)
 
 
+# 认得出的命令行开关（白名单）。判断 .lnk 里的参数时**只能按这个表认**。
+# 为什么必须白名单（2026-09-19 实测）：参数串在 .lnk 里跟后面的字符串之间
+# **没有可靠的分隔符** —— 紧跟其后的那一个字符是二进制残留，实测见过 `?`
+# （0x3F）也见过 `A`（0x41）。撞上字母时，`--guard` 会被粘成 `--guardA`。
+# 所以「凡是 --xxx 都算」不行，按字符类截断也不行，只能认自己写过的开关。
+KNOWN_SWITCHES = ("--auto", "--guard", "--switch", "--selftest", "--guitest",
+                  "--purge", "--version", "--checkupdate", "--logout")
+
+
+def _match_switch(tok):
+    """把一个 token 认成已知开关。认不出返回 ""。
+
+    ⚠️ 用 startswith 而不是相等：token 末尾可能粘着残留字符（见 KNOWN_SWITCHES）。
+    """
+    low = (tok or "").lower()
+    for s in sorted(KNOWN_SWITCHES, key=len, reverse=True):
+        if low.startswith(s):
+            return s
+    return ""
+
+
+def _lnk_arguments(path):
+    """读 .lnk 里的命令行参数（小写，形如 `--auto --guard`）。读不出来返回 ""。
+
+    跟 `_lnk_points_to_me` 一样**不用 pylnk3** —— 它解析中文路径会丢段。
+    参数是纯 ASCII，快捷方式里按 UTF-16LE 明文存着，扫一遍就够。
+    奇偶两种对齐都试：字符串数据的起始偏移不保证是偶数。
+    """
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+    except Exception:
+        return ""
+    for off in (0, 1):
+        text = raw[off:].decode("utf-16-le", "ignore")
+        i = text.find("--auto")
+        if i < 0:
+            continue
+        out = []
+        # 只看开头这一小段，免得把后面别的字段里恰好出现的开关也吸进来。
+        for tok in text[i:i + 120].split()[:6]:
+            s = _match_switch(tok)
+            if not s:
+                break            # 遇到认不出的就当参数到头了
+            out.append(s)
+        if out:
+            return " ".join(out)
+    return ""
+
+
+def autostart_args():
+    """当前自启快捷方式实际带的参数（给 --selftest 展示用）。没有就返回 ""。"""
+    for p in autostart_links():
+        a = _lnk_arguments(p)
+        if a:
+            return a
+    return ""
+
+
+def autostart_outdated():
+    """自启链接指向的 exe 是对的，但**参数是旧版本的**（少了 --guard）。
+
+    为什么必须单独判（2026-09-19 加）：
+        `autostart_stale()` 只看**目标路径**。0.3.0 把参数从 `--auto` 改成
+        `--auto --guard` —— 老用户的 .lnk 指向的 exe 完全正确，所以
+        `autostart_stale()` 返回 False、勾照样打着、开机也照样登录，
+        只是**没有守护**：掉线后不会自动重连。
+        不提示的话，用户升级到 0.3.0 却发现「掉线还是不重连」，
+        会以为是没修好 —— 而真正的原因是那份开机快捷方式还停在旧参数上。
+    """
+    if not is_frozen():
+        return False
+    links = autostart_links()
+    if not links:
+        return False
+    return all(_lnk_points_to_me(p) is True and "--guard" not in _lnk_arguments(p)
+               for p in links)
+
+
 def make_lnk(lnk_path, target, arguments="", icon=None, work_dir=None):
     """写一个 Windows 快捷方式。
 
@@ -1265,7 +1896,12 @@ def set_autostart(on):
                     log("旧自启链接删不掉，可能残留:\n%s\n%s"
                         % (p, traceback.format_exc()))
             lnk_path = os.path.join(d, AUTOSTART_LNK_NAME)
-            make_lnk(lnk_path, exe, arguments="--auto", icon=exe, work_dir=os.path.dirname(exe))
+            # ⚠️ 参数里必须带 --guard。`--auto` 登录成功就退出了，
+            #    掉线之后没人重连（见 run_guard 的说明）。
+            #    改这里要同步改 autostart_outdated() 里认的参数，
+            #    否则老用户的 .lnk 不会被判成「要更新」。
+            make_lnk(lnk_path, exe, arguments=AUTOSTART_ARGS, icon=exe,
+                     work_dir=os.path.dirname(exe))
             return (True, "") if os.path.isfile(lnk_path) else (False, "快捷方式未生成")
         for p in links:
             os.remove(p)
@@ -1280,7 +1916,15 @@ def set_autostart(on):
 # （排障用的 --selftest 之类留在 --help 和日志里，不占说明篇幅。）
 # 标题行用拼接的方式带上版本号，**不把它写死在下面的长文本里** ——
 # 否则以后改版本号时很容易漏掉这一处，用户看到的说明就成了旧版本。
-HELP_TEXT = ("校园网自动登录 —— 使用说明（v%s）\n" % VERSION) + r"""
+#
+# ⚠️ 守护分钟数这里写**字面量 30**，不用 %-格式化、也不做运行时替换。
+#    原因：HELP_TEXT 是要被 help_check.py 在**打包后的 exe 里逐字节核对**的，
+#    而运行时拼出来的字符串在归档里只以「模板 + 参数」的形式存在
+#    （实测：写 `守 __GUARD__ 分钟` 再 replace，exe 里搜得到的是 `__GUARD__`，
+#    搜不到渲染后的句子 —— 报了一条假失败）。
+#    漂移风险改由 help_check.py 拿 GUARD_SECONDS 反算比对来兜：
+#    改常量忘了改文案，那边会立刻报 BAD。
+HELP_TEXT = (("校园网自动登录 —— 使用说明（v%s）\n" % VERSION) + r"""
 【第一次使用】
 
   1. 填上你的校园网账号和密码
@@ -1288,6 +1932,9 @@ HELP_TEXT = ("校园网自动登录 —— 使用说明（v%s）\n" % VERSION) +
   3. 勾选最下面的「开机时自动登录校园网」
 
   以后开机就会自动联网，不用再管。
+
+  联网之后它还会继续守 30 分钟：这段时间里要是掉线了，会自动重连。
+  30 分钟一到就自己退出，不会在后台常驻。
 
 
 【三个按钮】
@@ -1326,9 +1973,11 @@ HELP_TEXT = ("校园网自动登录 —— 使用说明（v%s）\n" % VERSION) +
 
 【顶部的网络状态】
 
-  绿点  已连接校园网     可以正常上网。
-  红点  未连接校园网     被校园网的登录页挡住了，需要登录。
-  灰点  网络状态未知     这次没检测出来，不代表没网，
+  绿点  已连接校园网       在校园网里，并且已经认证，可以正常上网。
+  红点  已连校园网，未认证  在校园网里，但被登录页挡住了，需要登录。
+  灰点  未连接校园网       现在连的不是校园网（比如家里或手机的 Wi-Fi）。
+                          这种状态下点登录是没用的。
+  灰点  网络状态未知       这次没检测出来，不代表没网，
                         点「切换到此账号」试一次。
 
 
@@ -1364,14 +2013,17 @@ HELP_TEXT = ("校园网自动登录 —— 使用说明（v%s）\n" % VERSION) +
 
   · 只适用于本校校园网。
   · 部分杀毒软件可能误报，加白名单即可。
+  · 开机联网后程序还会守 30 分钟，掉线了自动重连；到点自己退出。
+    这段时间里你要是主动点了「退出当前账号」，它不会把你登回去。
   · 主动退出账号后，校园网通常几十秒内会自动重新连上，
     这是学校那边的设置，不是故障。
   · 这个 exe 放在哪个文件夹都能正常用，文件夹名带中文、带空格也没关系；
     账号密码存在系统目录里，不跟着 exe 走。
   · 但如果把 exe 挪到别的位置，「开机自启」会失效 —— 自启快捷方式记的是原来的
     位置。这时界面会在「开机自启」下面提示你，把那个勾取消、再重新勾一次就好。
+    升级到新版本后如果提示「旧设置」，同样处理：取消再重新勾一次。
   · 出问题时看日志：C:\ProgramData\CampusLogin\campus-login.log
-"""
+""")
 
 
 # ==================== 密码框的显示与编辑规则 ====================
@@ -1941,12 +2593,22 @@ def run_gui(smoke=False):
     def refresh_auto_warning():
         try:
             stale = autostart_stale()
+            old_args = autostart_outdated()
         except Exception:
-            stale = False
+            stale = old_args = False
+        # 注意：这里是普通 Label，**不认 Markdown** —— 用「」而不是 ** 来强调，
+        # 否则用户看到的就是一串星号（老版本就是这么显示的）。
         if stale:
             warn_auto.configure(
-                text="⚠ 开机自启的快捷方式指向的是 exe 的**旧位置**，开机时实际不会生效。\n"
+                text="⚠ 开机自启的快捷方式指向的是 exe 的「旧位置」，开机时实际不会生效。\n"
                      "   把下面的勾取消、再重新勾选一次即可修好。")
+            warn_auto.pack(anchor="w", pady=(6, 0))
+        elif old_args:
+            # 0.2.0 装的 .lnk 参数是 `--auto`，没有 `--guard` —— 开机照常登录，
+            # 但掉线后不会自动重连。不提示的话用户会以为新版本没修好。
+            warn_auto.configure(
+                text="⚠ 开机自启还是「旧设置」：开机照常登录，但掉线后不会自动重连。\n"
+                     "   把下面的勾取消、再重新勾选一次即可升级。")
             warn_auto.pack(anchor="w", pady=(6, 0))
         else:
             warn_auto.pack_forget()
@@ -1987,14 +2649,14 @@ def run_gui(smoke=False):
 
     def refresh_status():
         def work():
-            on = test_internet()
+            st = network_state()
             # 程序刚起来时第一个网络请求赶上 DNS 冷启动（实测首次 7.4 秒），
             # 有可能「测不出来」。隔几秒再试一次，免得状态栏一直停在未知上
             # ——用户打开程序第一眼看到的就是这行状态。
-            if on is None:
+            if st == NET_UNKNOWN:
                 time.sleep(3)
-                on = test_internet()
-            state["queue"].put(("status", on))
+                st = network_state()
+            state["queue"].put(("status", st))
         threading.Thread(target=work, daemon=True).start()
 
     def render_accounts():
@@ -2091,16 +2753,9 @@ def run_gui(smoke=False):
         """处理一条队列消息。异常往上抛，由 drain_queue 记日志并继续下一条。"""
         kind, payload = msg
         if kind == "status":
-            on = payload
-            if on is True:
-                dot.itemconfigure(dot_id, fill="#28a745")
-                status_text.configure(text="已连接校园网")
-            elif on is False:
-                dot.itemconfigure(dot_id, fill="#dc3545")
-                status_text.configure(text="未连接校园网")
-            else:
-                dot.itemconfigure(dot_id, fill="#bbbbbb")
-                status_text.configure(text="网络状态未知")
+            st = payload
+            dot.itemconfigure(dot_id, fill=NET_COLOR.get(st, "#bbbbbb"))
+            status_text.configure(text=NET_TEXT.get(st, "网络状态未知"))
         elif kind == "job":
             code, text = payload
             try:
@@ -2560,6 +3215,10 @@ def main():
             n_acct = len(load_accounts()["accounts"])
         except Exception:
             n_acct = -1
+        try:
+            g_running, g_why = guard_running()
+        except Exception:
+            g_running, g_why = False, "读取失败"
         info = [
             "版本: %s" % VERSION,
             "打包: %s" % is_frozen(),
@@ -2570,10 +3229,20 @@ def main():
             "已保存账号数: %s" % n_acct,
             "启动文件夹: %s" % startup_dir(),
             "自启链接: %s" % autostart_links(),
+            # 这两行是排查「升级了、掉线却还是不重连」的第一手信息：
+            # 多半是 .lnk 还停在旧参数（--auto，没有 --guard）上。
+            "自启参数: %s" % (autostart_args() or "（读不出来）"),
+            "自启参数陈旧: %s" % autostart_outdated(),
+            "守护: %s" % ("在跑（%s）" % g_why if g_running else "没在跑"),
             "本机IP: %s" % local_ipv4(),
             "本机MAC: %s" % local_mac(),
             "联网: %s" % {True: "已联网", False: "未认证（被门户拦截）",
                           None: "无法判定（请求异常/超时）"}[test_internet()],
+            # ⚠️ 这两行必须**分开**报。合成一句就会重演那个 bug：
+            #    「能上网」被当成「在校园网」，在宿舍 Wi-Fi 上也显示已连接校园网。
+            "在校园网: %s" % {True: "是", False: "否（网段 %s，校园网段 %s）"
+                              % (local_ipv4(), campus_subnets()),
+                              None: "无法判定"}[on_campus_network(1.5)],
             # 更新入口。这两行是排查「检查更新失败」时的第一手信息 ——
             # 不用去猜程序里写的是哪个地址。
             # ⚠️ 只列地址，**不发网络请求**：--selftest 本来是快操作（3 秒），
@@ -2664,11 +3333,31 @@ def main():
             log("switch 异常:\n%s" % traceback.format_exc())
             exit_now(1)
     if "--auto" in args:
+        code = 1
         try:
-            exit_now(do_auto())
+            code = do_auto()
         except Exception:
             log("auto 异常:\n%s" % traceback.format_exc())
-            exit_now(1)
+        if "--guard" in args:
+            # ⚠️ **不能** exit_now(do_auto() 的返回值) —— 那会带着失败码退出，
+            #    守护根本没机会跑。而 do_auto 失败恰恰是最需要守护的时候
+            #    （开机那一下没连上，30 秒后网络就绪了，守护能补上）。
+            try:
+                code = run_guard()
+            except Exception:
+                log("guard 异常:\n%s" % traceback.format_exc())
+        exit_now(code)
+    if "--guard" in args:
+        # 单独给 --guard 也能跑：先试一次登录，再进守护。排障时用。
+        try:
+            do_auto(attempts=1)
+        except Exception:
+            log("auto 异常:\n%s" % traceback.format_exc())
+        try:
+            exit_now(run_guard())
+        except Exception:
+            log("guard 异常:\n%s" % traceback.format_exc())
+        exit_now(1)
     if "--logout" in args:
         try:
             exit_now(do_logout())

@@ -2,6 +2,7 @@
 """把 startup_dir 劫持到临时目录，完整测试自启的建/删/识别逻辑"""
 import os
 import shutil
+import sys
 import tempfile
 
 import paths
@@ -57,8 +58,12 @@ check("新快捷方式已生成", os.path.isfile(new))
 tgt, args, icon = read(new)
 # pylnk3 的解析器会把最后一段文件名丢掉，所以目标可能是 exe 本身或其所在目录
 check("目标指向 exe", tgt in (EXE, os.path.dirname(EXE)), tgt)
-check("参数 = --auto", args == "--auto", args)
+# ⚠️ 别写字面量：参数的唯一来源是 C.AUTOSTART_ARGS（--auto --guard）。
+#    以前这里写死 "--auto"，加了守护之后就会变成一条假的失败。
+check("参数 = %s" % C.AUTOSTART_ARGS, args == C.AUTOSTART_ARGS, args)
 check("图标 = exe 自身", (icon or "").replace("/", "\\").lower() == EXE.lower(), icon)
+# 刚开完的自启**不该**被判成「参数陈旧」，否则界面上会挂着一条假警告
+check("刚开启 -> 参数不陈旧", C.autostart_outdated() is False)
 
 print("[4] 重复开启：幂等")
 ok, why = C.set_autostart(True)
@@ -108,6 +113,18 @@ C.is_frozen = lambda: True
 # 读不出来 = 不知道，不能妄断成失效
 check("不存在的链接 -> None（不妄断）",
       C._lnk_points_to_me(os.path.join(TMP, "根本没有这个.lnk")) is None)
+
+print("[9] 0.2.0 装的旧参数（--auto）要能被认成「陈旧」")
+# 背景：0.3.0 把自启参数从 --auto 改成 --auto --guard。老用户的 .lnk 指向的
+# exe 完全正确，所以 autostart_stale() 返回 False、勾照样打着、开机也照样登录，
+# 只是**没有守护**（掉线不重连）。不单独判这一条，用户升级后会觉得「没修好」。
+C.set_autostart(True)
+old_link = os.path.join(TMP, C.AUTOSTART_LNK_NAME)
+C.make_lnk(old_link, EXE, arguments="--auto", icon=EXE, work_dir=os.path.dirname(EXE))
+check("旧参数 -> 参数陈旧 = True", C.autostart_outdated() is True)
+check("旧参数但目标没变 -> 不算失效（stale=False）", C.autostart_stale() is False)
+C.set_autostart(True)
+check("重新勾选后 -> 参数不陈旧", C.autostart_outdated() is False)
 C.set_autostart(False)
 
 print("\n结果:", "全部通过" if ok_all else "有失败")
@@ -115,3 +132,7 @@ if ok_all:
     shutil.rmtree(TMP, ignore_errors=True)
 else:
     print("临时目录保留待查:", TMP)
+# ⚠️ 必须带退出码。原来这里什么都不返回 —— 脚本永远以 0 退出，
+#    也就是说「检查通过」和「检查失败」在调用方看来一模一样，
+#    失败会被静默吞掉（这正是「检查通过 ≠ 检查真的在跑」那类坑）。
+sys.exit(0 if ok_all else 1)

@@ -15,6 +15,20 @@ import paths
 EXE = sys.argv[1] if len(sys.argv) > 1 else \
     paths.default_exe()
 
+# 守护分钟数**不写字面量**，从 GUARD_SECONDS 反算 —— 改常量忘了改文案时，
+# 这一条会立刻报 BAD。这正是「说明必须和实现一致」的落地方式。
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+_HAVE_SRC = True
+try:
+    import campus_login as _C
+    _GUARD_MIN = _C.GUARD_SECONDS // 60
+except Exception:                                    # 源码不在旁边就别拦
+    _HAVE_SRC = False
+    _GUARD_MIN = 30
+
+_GUARD_NOTE = ("守护时长（应与 GUARD_SECONDS=%d 秒一致）" % _C.GUARD_SECONDS
+               if _HAVE_SRC else "守护时长（没读到源码，按默认 30 分钟查）")
+
 CASES = [
     ("【密码框怎么用】", True, "新加的说明小节"),
     ("显示成一串小星号", True, "密码框说明正文"),
@@ -25,6 +39,20 @@ CASES = [
     # 失败时必须说「失败」，不能说成「已是最新」—— 用户最容易误解的地方。
     ("【检查更新】", True, "检查更新的说明小节"),
     ("不会含糊地显示「已是最新版本」", True, "更新说明里的三态承诺"),
+    # 网络状态那四档（2026-09-19 改）。原来是「已连接/未连接」两行，而
+    # 「已连接校园网」在宿舍 Wi-Fi 上也会出现 —— 现在拆成四档，文案必须跟着变。
+    # 这两句是新增档位独有的，只查它们就够区分新旧说明。
+    ("已连校园网，未认证", True, "在校园网但未认证那一档"),
+    ("现在连的不是校园网", True, "不在校园网的说明"),
+    # 守护（0.3.0 加）。
+    # ⚠️ 分钟数必须写成**字面量**才查得到：help_check 是在打包后的归档里
+    #    按字节搜明文，运行时用 replace/%-格式化拼出来的句子，归档里只存模板，
+    #    搜渲染结果必然落空（第一版就是这么报了一条假失败的）。
+    #    所以文案里写死 30，这里再拿 GUARD_SECONDS 反算比对来防漂移。
+    ("联网之后它还会继续守 %d 分钟" % _GUARD_MIN, True, _GUARD_NOTE),
+    ("这段时间里你要是主动点了「退出当前账号」，它不会把你登回去",
+     True, "守护不跟用户对着干的承诺"),
+    ("升级到新版本后如果提示「旧设置」", True, "自启参数升级的说明"),
     ("这段文字不存在ZZZ", False, "阴性对照：不该命中"),
 ]
 

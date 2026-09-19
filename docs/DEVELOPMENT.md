@@ -31,7 +31,10 @@ docs/                   README 用的界面截图与本文件
 | `pwd_gui_test.py` | 密码框真实窗口绑定 | 否（要真桌面） |
 | `geometry_test.py` | 9 种屏幕尺寸下窗口不超出屏幕 | 否 |
 | `proc_tree_test.py` | 进程树与看门狗，含「故意复现孤儿进程」 | 否 |
-| `autostart_test.py` | 开机自启的增删改查 | 否 |
+| `autostart_test.py` | 开机自启的增删改查、`.lnk` 参数读法、`autostart_stale` / `autostart_outdated` | 否 |
+| `guard_test.py` | 守护判断表、守护标记自愈、用户主动退出的避让、`do_auto` 重试、`.lnk` 参数读法 | 否 |
+| `network_state_test.py` | 校园网判定 / MAC 校验 / `network_state` 四态 / 门户 MAC 替换 | 否 |
+| `auto_timing_probe.py` | 把每次 `--auto` 的耗时按阶段拆开（定位「自启慢」慢在哪一段） | 否（诊断用） |
 | `ui_shot.py` / `layout_probe.py` | 截图 / 量布局（要真桌面） | 否 |
 | `png_zoom.py` | 裁切放大 PNG 局部、数字形个数（核对截图里画了什么） | 否 |
 | `savepoint.py` | 本地存档：改代码前打快照，搞砸了能整体回退 | 否（改代码前用） |
@@ -39,6 +42,8 @@ docs/                   README 用的界面截图与本文件
 | `stack_probe.py` | 跑到卡住时把**所有线程**的堆栈打出来（`faulthandler`） | 否（排障用） |
 
 跑测试要用**带 PyInstaller 的解释器**（`leak_check` / `help_check` / `portability_check` 依赖它）。
+`autostart_test.py` / `guard_test.py` 要写 `.lnk`，需要 **pylnk3**，只有 `envs/gui314` 里有 ——
+缺依赖时 `guard_test.py` 会明确报错退出（码 3），**不会静默跳过**那几条断言。
 
 构建门槛的细节：`build.py` 的第 2 步（冒烟测试）里，密码框接线自检失败会输出 `GUI_FAIL`
 标记，`build.py` 见到该标记即判失败；`wiring_gate_test.py` 专门验这条报警链路本身通不通。
