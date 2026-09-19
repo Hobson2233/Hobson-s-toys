@@ -275,8 +275,8 @@ def judge_fallback(release, current_version):
             rel["version"], current_version)
     if not newer:
         # ⚠️ 这里**绝对不能返回 STATE_CURRENT**。
-        # 兜底路径查的是 GitHub Releases，而主站（Cloudflare Pages）才是
-        # 权威来源。两者可能不一致 —— 比如发了新版只传主站、忘了发 Release，
+        # 兜底路径查的是 GitHub Releases，而主站（Worker `campus-login` 的静态资源）
+        # 才是权威来源。两者可能不一致 —— 比如发了新版只传主站、忘了发 Release，
         # 此时 GitHub 上还是旧版本，"相同"不等于"已是最新"。
         # 返回 CURRENT 就会让用户看到"已是最新版本"而实际有新版，典型的静默失败。
         # （2026-09-18 实测踩到：站点还没部署，主域名解析失败走兜底，
