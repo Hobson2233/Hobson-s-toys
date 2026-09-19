@@ -51,7 +51,7 @@ python build.py
 
 `build.py` 依次完成打包、冒烟测试、隐私检查与可移植性检查，任一步骤未通过则不出包。
 
-发布站点时，把构建产物交给工作区根目录的 `make_site.py` 放进 `site/`，再由 `make_manifest.py` 生成更新清单，最后把 `site/` 上传到 Cloudflare Pages。
+发布站点时，把构建产物交给工作区根目录的 `make_site.py` 放进 `site/`，再由 `make_manifest.py` 生成更新清单，最后用 `deploy/deploy.py` 把 `site/` 发布到 Cloudflare Worker 的静态资源上。发布是**整份替换**：新版本目录里没有的文件，线上会直接消失（所以旧版安装包不会留在服务器上）。
 
 开发脚本、测试清单与排障说明见 [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)。
 

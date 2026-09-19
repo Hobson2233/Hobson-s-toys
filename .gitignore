@@ -48,6 +48,11 @@ venv/
 Thumbs.db
 desktop.ini
 .DS_Store
+# NVIDIA 驱动会往**进程的工作目录**里写 umdlogs/ —— 在这个目录下跑 GUI
+# （exe、--guitest、ui_shot.py）就会冒出来一个「NVIDIA Corporation」目录。
+# 现在里面是空的（空目录 git 根本不跟踪，所以 status 看着干净），
+# 但只要驱动往里落一个日志文件，`git add -A` 就会把它带上。
+NVIDIA Corporation/
 
 # ---- 截图产物 ----
 # ui_shots/ 是本地看界面用的中间产物，不提交。

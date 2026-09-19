@@ -5,7 +5,7 @@
 ## 项目结构
 
 ```
-campus_login.py         主程序（单文件，无参=GUI，--auto/--logout/--purge/--selftest/--guitest）
+campus_login.py         主程序（单文件，无参=GUI；命令行开关见 `SWITCH_HELP`，或用 --help 打印）
 paths.py                统一的路径解析（不要在脚本里写死绝对路径）
 proc_tree.py            进程树管理：Job Object + 看门狗 + _MEI 残留清理
 build.py                构建入口，带四道门槛
@@ -109,6 +109,11 @@ python savepoint.py diff                       # 先看看现在跟存档差在�
 - **不会被 `git push --tags` 带出去**（它不是 tag），仓库要公开时这点很重要
 - 一直被引用着，所以永远不会被 gc 回收
 - 快照内容是那一刻工作区的完整状态（含未提交修改、新增、删除），但**遵守 .gitignore**
+- ⚠️ 但 `git push --mirror` **会**把它带出去（`--all` / `--tags` 都不会，只有 `--mirror` 会）。
+  而存档里可能存着「改代码之前」的旧版本 —— **包括当时还没清理掉的真实学号 / 密码**
+  （本仓库实测确实有这种 blob）。所以：永远不要对这个仓库用 `--mirror`，
+  也不要把 `refs/savepoints/*` 显式推上去。要确认某个存档里有没有凭据，
+  用 `secret_scan.py` 扫它的 blob，别靠猜。
 
 `restore` 之前会**自动再存一份**，所以「回退」这个动作本身也能再回退，脚本会把
 反悔命令直接打在屏幕上。
