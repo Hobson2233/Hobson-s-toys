@@ -427,35 +427,108 @@ def _unlink(path):
         pass
 
 
-def old_path_of(exe):
-    """退化为旧路径。exe 为 None（源码运行）时返回 None —— **不要拿它去拼字符串**。
+def _same_volume(a, b):
+    """两个路径是否在同一个卷上（决定 os.rename / os.replace 能不能原子工作）。
+
+    只看盘符。对本地盘够用；网络盘、挂载点会退化成「不假设同卷」——
+    那只是让我们保守一点（回退到 exe 同目录），不会做错事。
+    """
+    da = os.path.splitdrive(os.path.abspath(a))[0].lower()
+    db = os.path.splitdrive(os.path.abspath(b))[0].lower()
+    return bool(da) and da == db
+
+
+def work_dir_for(exe, work_dir=None):
+    """更新临时文件（`.new` / `.part` / `.old`）该放哪个目录。返回一个已存在的目录。
+
+    **为什么不能默认放 exe 同目录**（2026-09-20 用户反馈）：
+        用户常把 exe 直接放桌面。替换时会在桌面上留下 `.old`（几 MB 的旧程序本体，
+        要等下次启动才删），下载期间还有 `.new.part`。对不懂的人来说就是
+        「桌面上莫名多了个奇怪文件，又不敢删」—— 删错了程序就没了。
+
+    **为什么必须判同卷**：
+        `os.replace` / `os.rename` 在 Windows 上走 MoveFileEx，**不带 COPY_ALLOWED**，
+        跨卷会直接失败（ERROR_NOT_SAME_DEVICE）。而替换 exe 这步必须是原子的
+        （中途断电不能留下半个 exe）。所以跨卷时只能退回 exe 同目录。
+
+    exe 为 None（源码运行）时返回 None。
+    """
+    if not exe:
+        return None
+    exe_dir = os.path.dirname(os.path.abspath(exe)) or "."
+    if not work_dir:
+        return exe_dir
+    try:
+        wd = os.path.abspath(work_dir)
+        if not os.path.isdir(wd):
+            os.makedirs(wd, exist_ok=True)
+        if _same_volume(wd, exe):
+            return wd
+    except OSError:
+        pass
+    return exe_dir
+
+
+def old_path_of(exe, work_dir=None):
+    """旧版本备份的落点。exe 为 None（源码运行）时返回 None —— **不要拿它去拼字符串**。
 
     这里原本是 `return exe + OLD_SUFFIX`，传 None 直接 TypeError。
     留了个「反正调用方有 try/except 兜着」的隐患：源码运行时每次启动都会
     抛一个 TypeError 进日志，把**真正的**错误淹掉。
     （2026-09-18 实测踩到：日志尾部就是这条 TypeError。）
+
+    2026-09-20：落点从「exe 同目录」改成 `work_dir`（程序数据目录）——
+    见 work_dir_for。不传 work_dir 时仍是 exe 同目录，老调用方行为不变。
     """
     if not exe:
         return None
-    return exe + OLD_SUFFIX
+    d = work_dir_for(exe, work_dir)
+    return os.path.join(d, os.path.basename(exe) + OLD_SUFFIX)
 
 
-def cleanup_stale(exe):
-    """启动时调用：把上次更新留下的 .old 删掉。
+def cleanup_stale(exe, work_dir=None):
+    """启动时调用：把上次更新留下的临时文件删掉。返回删掉的文件名或 None。
 
-    为什么现在才删：那个文件在被替换的进程退出前一直是被占用的，
-    当时删不掉，只能留到下次启动。返回删掉的文件名或 None。
+    为什么现在才删：`.old` 在被替换的进程退出前一直是被占用的，当时删不掉，
+    只能留到下次启动。
+
+    ⚠️ **两个位置都要看**：0.3.2 及之前 `.old` 就丢在 exe 同目录（用户的桌面），
+       那些老残留升级后还躺在那儿 —— 只清新位置等于没修好。
+    ⚠️ 用**前缀匹配**，不是几个写死的文件名。apply_update 在 `.old` 被占着时
+       会退到带时间戳的备用名 `app.exe.old.<时间戳>` —— 写死名字就会漏掉它，
+       于是它永远躺在数据目录里、越积越多。
 
     exe 传 None（源码运行）时不做事，直接返回 None —— 那不是错误情况。
     """
-    old = old_path_of(exe)
-    if not old or not os.path.exists(old):
+    if not exe:
         return None
-    try:
-        os.remove(old)
-        return os.path.basename(old)
-    except OSError:
-        return None
+    base = os.path.basename(exe)
+    exe_dir = os.path.dirname(os.path.abspath(exe)) or "."
+    # `<exe名>.old` 连备用名一起覆盖；`<exe名>.new` 连 `.new.part` 一起覆盖。
+    prefixes = (base + OLD_SUFFIX, base + ".new")
+    cands = []
+    for d in (work_dir_for(exe, work_dir), exe_dir):
+        try:
+            names = os.listdir(d)
+        except OSError:
+            continue
+        for name in names:
+            # 老版本（≤0.3.2）的下载文件叫 `campus-login-<版本>.new`，不含 exe 名，
+            # 按前缀+后缀单独扫一遍，把这些历史残留也收掉。
+            if name.startswith(prefixes) or (
+                    name.startswith("campus-login-")
+                    and (name.endswith(".new") or name.endswith(".new.part"))):
+                p = os.path.join(d, name)
+                if p not in cands:
+                    cands.append(p)
+    removed = None
+    for p in cands:
+        try:
+            os.remove(p)
+            removed = removed or os.path.basename(p)
+        except OSError:
+            pass
+    return removed
 
 
 def can_self_update(exe=None):
@@ -478,7 +551,12 @@ def can_self_update(exe=None):
     return True, exe
 
 
-def apply_update(exe, new_file):
+def discard(path):
+    """删掉一个更新临时文件。失败不抛异常 —— 清不掉也不该拦住主流程。"""
+    _unlink(path)
+
+
+def apply_update(exe, new_file, work_dir=None):
     """用 new_file 替换正在运行的 exe。返回 (True, None) 或 (False, 原因)。
 
     **实测过的机制**（updtest_running_exe.py，2026-09-18）：
@@ -487,13 +565,32 @@ def apply_update(exe, new_file):
     于是流程是：把运行中的 exe 改名成 .old 腾出路径 → 把新文件搬到原路径。
     旧文件此刻删不掉（还被自己占着），交给下次启动的 cleanup_stale()。
     Chrome / Firefox 在 Windows 上就是这么做的。
+
+    `.old` 落到 work_dir（程序数据目录），不再丢在 exe 同目录 —— 见 work_dir_for。
+
+    ⚠️ `work_dir` 必须与 exe **同卷**，两条 rename 都吃这个条件：
+       ① `os.rename(exe, old)` 把 exe 搬进 work_dir；
+       ② `os.replace(new_file, exe)` 把新文件搬回 exe 的位置。
+       两步在 Windows 上都走 MoveFileEx、**不带 COPY_ALLOWED**，跨卷直接
+       ERROR_NOT_SAME_DEVICE。调用方用 work_dir_for() 决定位置（它会判卷）。
     """
-    old = old_path_of(exe)
+    old = old_path_of(exe, work_dir)
     _unlink(old)  # 清掉更早一次留下的残骸；删不掉就带着继续，下面的 rename 会告诉我们
     try:
         os.rename(exe, old)
     except OSError as e:
-        return False, "无法腾出原路径（改名失败）：%s" % e
+        # ⚠️ 有一种情况 rename 会失败、而上面那句 _unlink 又删不掉：
+        #    上一次替换留下的 `.old` 正被**当前进程**占着（当前进程就是从它跑起来的）。
+        #    删不掉、也覆盖不了 —— 于是「更新完没重启就又点一次更新」会直接报升级失败。
+        #    这时换个带时间戳的备用名，别让用户看到一句没头绪的「升级失败」。
+        #    ⚠️ 备用名必须仍以 `<exe名>.old` 开头：cleanup_stale 是按前缀扫的，
+        #       换个前缀（比如 `.old2`）它就再也清不掉了，会永久累积。
+        alt = "%s.%d" % (old, int(time.time()))
+        try:
+            os.rename(exe, alt)
+            old = alt
+        except OSError:
+            return False, "无法腾出原路径（改名失败）：%s" % e
     try:
         os.replace(new_file, exe)
     except OSError as e:
@@ -506,18 +603,21 @@ def apply_update(exe, new_file):
     return True, None
 
 
-def stage_update(exe, info, timeout=TIMEOUT, on_progress=None, on_retry=None):
+def stage_update(exe, info, work_dir=None, timeout=TIMEOUT, on_progress=None,
+                 on_retry=None):
     """下载 + 校验 + 替换，一条龙。返回 (True, None) 或 (False, 原因)。
 
-    临时文件放在 exe 同目录，保证最后一步 os.replace 是同卷操作。
+    临时文件放在 work_dir（默认 exe 同目录）—— 调用方应当传程序数据目录，
+    免得把 `.new.part` 丢在用户桌面上（见 work_dir_for）。
     """
-    dest = exe + ".new"
+    d = work_dir_for(exe, work_dir)
+    dest = os.path.join(d, os.path.basename(exe) + ".new")
     ok, reason = download(info["url"], dest, info.get("sha256"), info.get("size"),
                           timeout=timeout, on_progress=on_progress,
                           on_retry=on_retry)
     if not ok:
         return False, reason
-    ok, reason = apply_update(exe, dest)
+    ok, reason = apply_update(exe, dest, work_dir)
     if not ok:
         _unlink(dest)
         return False, reason
@@ -548,8 +648,11 @@ def describe(state, info):
 def _selftest():
     """不用联网的自检：版本比较、清单判定、哈希校验。"""
     fails = []
+    n = [0]          # 断言计数。以前是写死在最后那行 print 里的字面量，
+                     # 加一条断言就漂移一次 —— 和「版本号只有一个来源」同一个道理。
 
     def ck(name, got, want):
+        n[0] += 1
         if got != want:
             fails.append("%s：得到 %r，期望 %r" % (name, got, want))
 
@@ -637,11 +740,103 @@ def _selftest():
     # 灌一条 TypeError，把真错误淹掉（实测踩到过）。
     ck("old_path_of(None) 不炸", old_path_of(None), None)
     ck("old_path_of('') 不炸", old_path_of(""), None)
-    ck("old_path_of 正常拼接", old_path_of("C:/a/x.exe"), "C:/a/x.exe" + OLD_SUFFIX)
+    # 不传 work_dir 时仍在 exe 同目录（老调用方行为不变）。
+    # ⚠️ 用 normcase 比 —— work_dir_for 走 abspath，会把正斜杠规范成反斜杠，
+    #    直接比字符串会假红。
+    ck("old_path_of 默认仍在 exe 同目录",
+       os.path.normcase(old_path_of("C:/a/x.exe")),
+       os.path.normcase(os.path.join(os.path.dirname("C:/a/x.exe"), "x.exe.old")))
     ck("cleanup_stale(None) 返回 None", cleanup_stale(None), None)
     ck("cleanup_stale('') 返回 None", cleanup_stale(""), None)
 
-    print("  [%s] 自检 %d 项" % ("OK" if not fails else "失败", 20 + 18))
+    # --- 临时文件不许再丢在 exe 同目录（2026-09-20 用户反馈）---
+    # 用户常把 exe 放桌面；替换时桌面上会留下 .old（几 MB 的旧程序本体），
+    # 下载期间还有 .new.part。对不懂的人来说就是「莫名多了个怪文件，又不敢删」。
+    # 这一组锁的是「work_dir 与 exe 同卷 → 临时文件必须落在 work_dir」。
+    import tempfile
+    t = tempfile.mkdtemp(prefix="upd_workdir_")
+    try:
+        exe_dir = os.path.join(t, "fake_desktop")
+        work = os.path.join(t, "fake_data", "updates")
+        os.makedirs(exe_dir)
+        fake = os.path.join(exe_dir, "app.exe")
+        with open(fake, "wb") as f:
+            f.write(b"MZ")
+
+        ck("同卷时 work_dir_for 用 work_dir（并自动建出来）",
+           os.path.normcase(work_dir_for(fake, work)), os.path.normcase(work))
+        ck("同卷时 .old 落在 work_dir 里，不在 exe 同目录",
+           os.path.normcase(os.path.dirname(old_path_of(fake, work))),
+           os.path.normcase(work))
+        ck("不传 work_dir 时退回 exe 同目录（老行为不变）",
+           os.path.normcase(work_dir_for(fake)), os.path.normcase(exe_dir))
+
+        # 跨卷必须退回 exe 同目录：Windows 的 MoveFileEx 不带 COPY_ALLOWED，
+        # os.replace 跨卷会直接失败 —— 那样替换 exe 永远不成功。
+        other = "Y:\\" if os.path.splitdrive(exe_dir)[0].lower() != "y:" else "Z:\\"
+        ck("跨卷时退回 exe 同目录",
+           os.path.normcase(work_dir_for(fake, other)), os.path.normcase(exe_dir))
+
+        # 真跑一次替换，看 .old 到底落在哪边
+        new = os.path.join(work, "app.exe.new")
+        with open(new, "wb") as f:
+            f.write(b"MZNEW")
+        ok, why = apply_update(fake, new, work)
+        ck("apply_update 成功（%s）" % why, ok, True)
+        with open(fake, "rb") as f:
+            ck("替换后 exe 是新内容", f.read(), b"MZNEW")
+        ck("替换后 **exe 同目录没有** .old",
+           [x for x in os.listdir(exe_dir) if x.endswith(OLD_SUFFIX)], [])
+        ck("替换后 .old 在 work_dir 里",
+           [x for x in os.listdir(work) if x.endswith(OLD_SUFFIX)],
+           ["app.exe" + OLD_SUFFIX])
+        ck("cleanup_stale 能清掉它", cleanup_stale(fake, work), "app.exe" + OLD_SUFFIX)
+        ck("清完之后 work_dir 里没有 .old",
+           [x for x in os.listdir(work) if x.endswith(OLD_SUFFIX)], [])
+
+        # 备用名（apply_update 在 `.old` 被占着时用的带时间戳名字）也必须清得掉。
+        # 写死文件名就会漏掉它 —— 那种残骸会永远躺在数据目录里、越积越多。
+        alt = os.path.join(work, "app.exe" + OLD_SUFFIX + ".1758336000")
+        with open(alt, "wb") as f:
+            f.write(b"x")
+        ck("cleanup_stale 认带时间戳的备用名（.old.<ts>）",
+           cleanup_stale(fake, work), "app.exe" + OLD_SUFFIX + ".1758336000")
+        ck("  备用名清掉了",
+           [x for x in os.listdir(work) if x.startswith("app.exe" + OLD_SUFFIX)], [])
+
+        # .new / .new.part 残骸：下载中途被强杀、或替换失败没清，都会留下它们。
+        for nm in ("app.exe.new", "app.exe.new.part"):
+            with open(os.path.join(work, nm), "wb") as f:
+                f.write(b"x")
+        ck("cleanup_stale 顺手清掉 .new / .new.part 残骸",
+           cleanup_stale(fake, work), "app.exe.new")
+        ck("  .new / .new.part 都没了",
+           [x for x in os.listdir(work) if ".new" in x], [])
+
+        # 老版本（≤0.3.2）的下载文件名不含 exe 名，落在 exe 同目录 ——
+        # 那些用户升级后还躺在桌面上，必须一并收掉，否则等于没修。
+        with open(os.path.join(exe_dir, "campus-login-0.3.2.new"), "wb") as f:
+            f.write(b"x")
+        ck("cleanup_stale 收得掉老命名的历史残留",
+           cleanup_stale(fake, work), "campus-login-0.3.2.new")
+    finally:
+        for r_, ds_, fs_ in os.walk(t, topdown=False):
+            for x in fs_:
+                try:
+                    os.remove(os.path.join(r_, x))
+                except OSError:
+                    pass
+            for x in ds_:
+                try:
+                    os.rmdir(os.path.join(r_, x))
+                except OSError:
+                    pass
+        try:
+            os.rmdir(t)
+        except OSError:
+            pass
+
+    print("  [%s] 自检 %d 项" % ("OK" if not fails else "失败", n[0]))
     for f in fails:
         print("     !! %s" % f)
     return not fails

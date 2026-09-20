@@ -54,7 +54,7 @@ APP_TITLE = "校园网自动登录"
 # ⚠️ 这里是**唯一来源**。界面标题、使用说明、--version、--selftest、
 #    以及 exe 文件属性里的版本，全部由它推导 —— 不要在别处另写一份，
 #    否则迟早漂移（改了一处忘了另一处，用户看到的版本号就是错的）。
-VERSION = "0.3.2"
+VERSION = "0.3.3"
 
 # 学校 portal 默认参数（拷到同校其他电脑上可直接用）
 DEFAULTS = {
@@ -1447,6 +1447,8 @@ def run_guard(seconds=GUARD_SECONDS, poll=GUARD_POLL):
        —— Windows 把运行中的映像映射成 FILE_SHARE_DELETE，所以**有几个进程
        正跑着它都不影响改名**（updtest_running_exe.py 实测过）。
        守护会继续从改名后的 .old 跑完剩余时间，然后正常退出。
+       （0.3.3 起那个 .old 落在**数据目录**而不是 exe 同目录，所以桌面上不会
+         出现它；跨卷时才退回 exe 同目录 —— 见 updater.work_dir_for。）
     """
     running, why = guard_running()
     if running:
@@ -2429,6 +2431,10 @@ HELP_TEXT = (("校园网自动登录 —— 使用说明（v%s）\n" % VERSION) 
   点「是」之后：下载 → 校验 → 替换 → 自动重新打开，整个过程不用你动手。
   升级只换程序本身，保存在 C:\ProgramData\CampusLogin 里的账号不动。
 
+  升级过程中产生的临时文件（下载中的安装包、旧版本备份）也放在那个目录，
+  不会写到你放 exe 的地方 —— 升级完 exe 所在文件夹里还是只有 exe 一个文件。
+  （0.3.2 及之前不是这样：那会儿会往 exe 同目录丢一个 .old 文件。）
+
   为什么升级前要「校验」：下载下来的文件会跟发布方公布的哈希值对一遍，
   对不上就直接丢掉，不会装一个来路不明的文件。
 
@@ -2810,6 +2816,27 @@ def drain_queue(q, handle, empty_exc=queue.Empty):
 
 
 # ==================== 界面 ====================
+def update_dest_path(exe=None):
+    """更新下载文件（`.new` / `.new.part`）该落到哪。源码运行时返回 None。
+
+    **为什么抽成模块级函数**（而不是像原来那样写在 start_upgrade 的闭包里）：
+        闭包只有点界面才跑得到，脚本断言不了 —— 于是「临时文件到底落在哪」
+        这件事**一直没被验证过**，0.3.2 之前就因此把 `.old` 丢在了用户桌面上。
+        现在 `--selftest` 直接报这个路径，verify_exe.py 拿真 exe 跑一遍就能断言。
+        （和 `_self_update_desc()` 同一个理由。）
+
+    exe=None → 用当前进程（打包时是 exe 自己，源码运行时是 None）。
+    """
+    if exe is None:
+        exe = sys.executable if is_frozen() else None
+    if not exe:
+        return None
+    # work_dir_for 会判同卷：数据目录若在别的盘，os.replace 跨卷会直接失败，
+    # 此时它自己退回 exe 同目录 —— 宁可脏一点，也不能更新不了。
+    return os.path.join(updater.work_dir_for(exe, data_dir()),
+                        os.path.basename(exe) + ".new")
+
+
 def _self_update_desc():
     """给 --selftest 用的一句话：能不能自我替换，不能的话为什么。
 
@@ -3345,15 +3372,22 @@ def run_gui(smoke=False):
         """下载 + 校验 + 替换自己。全在后台线程里做，界面只收进度。"""
         def work():
             exe = None
+            dest = None
             try:
-                # 目标目录必须与当前 exe 同目录 —— os.rename 同卷才是原子的。
                 exe = sys.executable if getattr(sys, "frozen", False) else None
                 if exe is None:
                     state["queue"].put(("upd_result", (
                         updater.STATE_MANUAL, "当前是源码运行，无法自我替换，请手动下载")))
                     return
-                dest = os.path.join(os.path.dirname(exe),
-                                    "campus-login-%s.new" % info["version"])
+                # 更新临时文件（.new.part / .new / .old）统一放**程序数据目录**，
+                # 不放 exe 同目录。理由（2026-09-20 用户反馈）：用户常把 exe 直接
+                # 放桌面 —— 下载期间桌面上会多出一个 12 MB 的 `.new.part`，
+                # 替换后还会留下几 MB 的 `.old`（要等下次启动才删）。
+                # 对不懂的人来说就是「桌面莫名多了个怪文件，又不敢删，删错了程序还没了」。
+                # 路径只算一处（update_dest_path）—— --selftest 报的也是它，
+                # 免得「界面往东、自检报西」。
+                dest = update_dest_path(exe)
+                work_dir = os.path.dirname(dest)
                 state["queue"].put(("upd_progress", "下载中 0%"))
 
                 def on_prog(got, total):
@@ -3376,13 +3410,19 @@ def run_gui(smoke=False):
                     info["url"], dest, sha256=info.get("sha256"),
                     size=info.get("size"), on_progress=on_prog, on_retry=on_retry)
                 if not ok:
+                    # 下载失败时 download() 自己会清掉 `.part`，但 `.new` 可能
+                    # 是上一轮留下的（下载成功、替换失败）。12 MB 的东西别留在盘上。
+                    updater.discard(dest)
                     state["queue"].put(("upd_result", (
                         updater.STATE_UNKNOWN, "下载失败：%s" % reason)))
                     return
 
                 state["queue"].put(("upd_progress", "正在替换…"))
-                ok, reason = updater.apply_update(exe, dest)
+                # work_dir 必须一路传下去：`.old` 落在哪由它决定，
+                # 漏传就退回 exe 同目录（桌面），等于这次修复没生效。
+                ok, reason = updater.apply_update(exe, dest, work_dir)
                 if not ok:
+                    updater.discard(dest)
                     state["queue"].put(("upd_result", (
                         updater.STATE_UNKNOWN, "升级失败：%s" % reason)))
                     return
@@ -3391,6 +3431,11 @@ def run_gui(smoke=False):
                     "done", "升级完成，正在重新启动…")))
             except Exception:
                 log("升级异常:\n%s" % traceback.format_exc())
+                # 异常路径同样别留残骸（`.part` 可能下到一半）。清不掉也无所谓，
+                # 下次启动的 cleanup_stale() 还会再扫一遍。
+                if dest:
+                    updater.discard(dest + ".part")
+                    updater.discard(dest)
                 state["queue"].put(("upd_result", (
                     updater.STATE_UNKNOWN, "升级过程出错，请查看日志")))
         threading.Thread(target=work, daemon=True).start()
@@ -3414,6 +3459,9 @@ def run_gui(smoke=False):
         为什么必须「先起新的、再退旧的」：
         `updater.apply_update` 已经把旧 exe 改名成 `.old`、新 exe 写到原路径。
         这里只是启动同一个路径，拿到的是新版本。
+        ⚠️ `.old` 现在落在**程序数据目录**（不是 exe 同目录，见 updater.work_dir_for）。
+        所以万一它这次删不掉（旧进程刚 TerminateProcess、句柄还没放干净），
+        也只是在数据目录里躺到下次启动 —— 用户看不到，桌面不会被污染。
         ⚠️ 退出走 exit_now()（内部是 TerminateProcess）—— 不能用 os._exit()，
         那会在 Tcl/Tk 的 DLL_PROCESS_DETACH 上卡 11~12 秒甚至永久卡死。
         """
@@ -3795,11 +3843,16 @@ def main():
     except Exception:
         log("自启升级检查失败（不影响启动）:\n%s" % traceback.format_exc())
 
-    # 清理上一次自我更新留下的 .old。**必须放在这里**（每次启动都跑）：
-    # 替换时旧 exe 正被当前进程占用，删不掉；只能等它退出后、下次启动时清。
-    # 失败不影响使用 —— 留一个几 MB 的残留文件而已。
+    # 清理上一次自我更新留下的 .old / .new / .new.part。**必须放在这里**
+    # （每次启动都跑）：替换时旧 exe 正被当前进程占用，删不掉；只能等它退出后、
+    # 下次启动时清。失败不影响使用 —— 留一个几 MB 的残留文件而已。
+    #
+    # ⚠️ **必须传 data_dir()**：0.3.3 起更新临时文件落在数据目录，漏传就会退回
+    #    exe 同目录（用户的桌面），新位置的 `.old` 永远没人清、一直累积。
+    #    cleanup_stale 两个位置都扫，所以老版本（≤0.3.2）留在桌面的历史残留
+    #    也能一并收掉 —— 只清新位置等于没修好。
     try:
-        updater.cleanup_stale(sys.executable if is_frozen() else None)
+        updater.cleanup_stale(sys.executable if is_frozen() else None, data_dir())
     except Exception:
         log("清理旧版本残留失败:\n%s" % traceback.format_exc())
 
@@ -3858,6 +3911,12 @@ def main():
             "更新清单: %s" % updater.MANIFEST_URL,
             "更新兜底: %s" % updater.FALLBACK_MANIFEST_URL,
             "可自我更新: %s" % _self_update_desc(),
+            # 更新临时文件（.new/.new.part）和旧版本备份（.old）落在哪个目录。
+            # **这行是「更新不再污染桌面」这条修复唯一的验证通道** —— GUI 里那段
+            # 路径计算脚本点不到，只能靠它报出来做断言（见 verify_exe.py）。
+            # 期望值 = 上面的「数据目录」；**绝不是「程序路径」所在的那个目录**。
+            "更新临时目录: %s" % (os.path.dirname(update_dest_path() or "")
+                                  or "（源码运行，不更新）"),
         ]
         try:
             import psutil

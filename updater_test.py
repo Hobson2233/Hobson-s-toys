@@ -606,6 +606,103 @@ def part4_real_replace():
             proc.kill()
 
 
+def part4b_work_dir_real():
+    """替换一个**正在运行**的 exe，且**指定 work_dir**。
+
+    为什么非要有这一节（4 节已经有了）：4 节走的是**老签名** `apply_update(app, staged)`，
+    临时文件仍旧落在 exe 同目录 —— 也就是说 4 节**覆盖不到 0.3.3 的这次改动**，
+    它照样全绿。这正是本项目那条铁律：「测试全绿 ≠ 没 bug」。
+
+    锁的是用户 2026-09-20 反馈的那件事：更新完，exe 同目录（= 用户的桌面）
+    不许留下任何 `.old` / `.new` / `.part`。
+    """
+    print("\n=== 4b. 替换运行中的 exe（指定 work_dir：临时文件不许落桌面）===")
+    exe_dir = os.path.join(TMP, "desktop")
+    work = os.path.join(TMP, "data", "CampusLogin")
+    os.makedirs(exe_dir)
+    os.makedirs(work, exist_ok=True)
+    # ⚠️ 故意用**中文名**：真机上 exe 就叫「校园网自动登录.exe」，而
+    #    `.new` / `.old` 是拼在它后面的 —— 中文名的路径拼接必须真跑一遍。
+    base = "校园网自动登录.exe"
+    app = os.path.join(exe_dir, base)
+    shutil.copy2(PYW, app)
+    old_sha = U.sha256_file(app)
+
+    proc = subprocess.Popen([app, "-c", "import time; time.sleep(120)"])
+    time.sleep(2.5)
+    if proc.poll() is not None:
+        ck("4b 被测进程成功启动", False, True)
+        return
+    print("  进程运行中，PID=%d" % proc.pid)
+
+    new_bytes = b"FAKE NEW VERSION " * 5000
+    new_sha = hashlib.sha256(new_bytes).hexdigest()
+    staged = os.path.join(work, base + ".new")
+    open(staged, "wb").write(new_bytes)
+
+    try:
+        ok, reason = U.apply_update(app, staged, work)
+        ck("apply_update(exe, new, work_dir) 成功", ok, True)
+        if not ok:
+            print("       原因：%s" % reason)
+        ck("  原路径已是新版本", U.sha256_file(app), new_sha)
+        ck("  运行中的进程不受影响", proc.poll() is None, True)
+
+        # ★ 这一条就是用户反馈本身：exe 同目录必须**干干净净**，
+        #   只剩 exe 自己。多出任何一个文件都算污染了用户的桌面。
+        ck("  ★ exe 同目录（= 用户桌面）只剩 exe 一个文件",
+           sorted(os.listdir(exe_dir)), [base])
+        ck("  ★ .old 落在 work_dir 里，不在 exe 同目录",
+           sorted(x for x in os.listdir(work) if x.endswith(U.OLD_SUFFIX)),
+           [base + U.OLD_SUFFIX])
+        ck("  .old 里确实是旧版本",
+           U.sha256_file(os.path.join(work, base + U.OLD_SUFFIX)), old_sha)
+
+        # --- 「更新完没重启，又点了一次更新」---
+        # 此刻 `.old` 正被上面那个进程占着（它就是从那跑起来的）：删不掉、
+        # 也覆盖不了。0.3.2 的老代码会在这一步直接报「升级失败」，而用户能做的
+        # 只有手动重启 —— 他明明只是想再点一次。
+        new2 = b"FAKE NEWER VERSION " * 5000
+        open(os.path.join(work, base + ".new"), "wb").write(new2)
+        ok2, why2 = U.apply_update(app, os.path.join(work, base + ".new"), work)
+        ck("  ★ 没重启就连点两次更新也能成功（0.3.2 会直接报升级失败）", ok2, True)
+        if not ok2:
+            print("       原因：%s" % why2)
+        ck("  原路径已是第二版", U.sha256_file(app), hashlib.sha256(new2).hexdigest())
+        ck("  exe 同目录仍然只有 exe 一个文件",
+           sorted(os.listdir(exe_dir)), [base])
+        # ⚠️ 只断言「成功了」是不够的：万一是 os.rename 直接把占用中的 .old 顶掉了，
+        #    那 apply_update 里那段备用名逻辑就是**死代码**，而测试照样全绿。
+        #    数一下文件数：2 个 = 正式名（被占着，删不掉）+ 备用名 → 分支真的走到了。
+        olds = [x for x in os.listdir(work) if x.startswith(base + U.OLD_SUFFIX)]
+        ck("  ★ 备用名分支真的走到了（.old 家族文件 = 2 个）", len(olds), 2)
+        ck("  两个都以 `<exe名>.old` 开头（否则永远清不掉）",
+           all(x.startswith(base + U.OLD_SUFFIX) for x in olds), True)
+
+        proc.terminate()
+        try:
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=10)
+        time.sleep(0.5)
+        # cleanup_stale 必须**带上 work_dir** 才能清掉新位置的 .old ——
+        # 漏传就会退回 exe 同目录去找，于是这些 .old 永远没人清、一直累积。
+        # ⚠️ 断言用「清完之后一个不剩」而不是「返回值等于某个名字」：
+        #    这里有两个 .old 家族文件（正式名 + 备用名），
+        #    返回值取哪个取决于 os.listdir 的顺序 —— 比名字会随机红。
+        ck("  cleanup_stale(exe, work_dir) 清到了东西",
+           U.cleanup_stale(app, work) is not None, True)
+        ck("  work_dir 里一个 .old 残骸都不剩",
+           [x for x in os.listdir(work) if x.startswith(base + U.OLD_SUFFIX)], [])
+        ck("  ★ exe 同目录（= 用户桌面）自始至终干干净净",
+           sorted(os.listdir(exe_dir)), [base])
+        ck("  新版文件仍在", os.path.exists(app), True)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+
+
 def part5_self_guard():
     print("\n=== 5. 源码运行时的自我保护 ===")
     ok, why = U.can_self_update()
@@ -644,6 +741,7 @@ def main():
         ref = part3_download()
         part3c_retry(ref)
         part4_real_replace()
+        part4b_work_dir_real()
         part5_self_guard()
         part6_negative_control()
     finally:
