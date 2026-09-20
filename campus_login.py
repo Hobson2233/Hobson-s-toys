@@ -54,7 +54,7 @@ APP_TITLE = "校园网自动登录"
 # ⚠️ 这里是**唯一来源**。界面标题、使用说明、--version、--selftest、
 #    以及 exe 文件属性里的版本，全部由它推导 —— 不要在别处另写一份，
 #    否则迟早漂移（改了一处忘了另一处，用户看到的版本号就是错的）。
-VERSION = "0.3.3"
+VERSION = "0.3.4"
 
 # 学校 portal 默认参数（拷到同校其他电脑上可直接用）
 DEFAULTS = {
@@ -2433,6 +2433,8 @@ HELP_TEXT = (("校园网自动登录 —— 使用说明（v%s）\n" % VERSION) 
 
   升级过程中产生的临时文件（下载中的安装包、旧版本备份）也放在那个目录，
   不会写到你放 exe 的地方 —— 升级完 exe 所在文件夹里还是只有 exe 一个文件。
+  旧版本备份会在下次启动时自动删掉；万一那会儿删不掉（比如程序还开着），
+  它过一会儿会自己再试几次，不用你管。
   （0.3.2 及之前不是这样：那会儿会往 exe 同目录丢一个 .old 文件。）
 
   为什么升级前要「校验」：下载下来的文件会跟发布方公布的哈希值对一遍，
@@ -2848,6 +2850,56 @@ def _self_update_desc():
     except Exception:
         return "判定失败（见日志）"
     return "能（%s）" % detail if ok else "不能（%s）" % detail
+
+
+# 更新残留清理的重试节奏（秒）。为什么需要重试 —— 2026-09-20 实测（_repro_lock.py）：
+#   替换完成后，旧 exe 改名成的 `.old` 往往**还被人占着**。最典型的是守护进程：
+#   更新发生时它正跑着那个 exe，改名后它继续从 `.old` 跑完剩下的时间（最长 30 分钟），
+#   这期间 Windows 拒绝删除该文件。而启动清理原本**只跑一次、失败就算了** ——
+#   于是 `.old` 会一直留在原地，用户看到的就是「更新完 .old 还在」。
+#   所以：清不掉就按下面的节奏重试，窗口必须盖过守护的 30 分钟。
+STALE_SWEEP_DELAYS = (20, 60, 180, 300, 600, 900, 1200, 1800)
+
+
+def sweep_stale_once():
+    """清一次更新残留。返回 `(删掉的文件名列表, 没删掉的文件名列表)`。
+
+    清不掉**不是错误**（有实例正占着），所以要把「还剩什么」报出来给重试逻辑用。
+    传 data_dir() 是必须的：0.3.3 起临时文件落在数据目录，漏传就会退回 exe 同目录
+    （用户的桌面），新位置的 `.old` 永远没人清、一直累积。
+    """
+    exe = sys.executable if is_frozen() else None
+    if not exe:
+        return [], []
+    removed, left = updater.cleanup_stale_all(exe, data_dir())
+    return ([os.path.basename(p) for p in removed],
+            [os.path.basename(p) for p in left])
+
+
+def sweep_stale_retry():
+    """后台重试清残留，直到清干净或用完重试窗口。只在还有残留时才起。"""
+    left = []
+    for delay in STALE_SWEEP_DELAYS:
+        time.sleep(delay)
+        removed, left = sweep_stale_once()
+        if removed:
+            log("重试清理更新残留成功：%s" % "、".join(removed))
+        if not left:
+            return
+    log("更新残留始终删不掉（有实例长期占用？）：%s" % "、".join(left))
+
+
+def stale_leftover_desc():
+    """`--selftest` 用：现在还剩哪些更新残留。没有就报「无」。
+
+    为什么值得占一行：用户报「更新完还有 .old」时，第一件事就是看这一行 ——
+    不用再去翻目录、也不用猜。清不掉的原因（被守护占着）也在这里显形。
+    """
+    try:
+        _removed, left = sweep_stale_once()
+    except Exception:
+        return "查询失败（见日志）"
+    return "、".join(left) if left else "无"
 
 
 def update_wiring_check(btn_ver):
@@ -3388,6 +3440,11 @@ def run_gui(smoke=False):
                 # 免得「界面往东、自检报西」。
                 dest = update_dest_path(exe)
                 work_dir = os.path.dirname(dest)
+                # 记下这次更新的落点。排查「更新完 .old 落在哪」「更新为什么失败」时，
+                # 这是唯一能事后看到的事实 —— 这条路径以前**一行日志都没有**，
+                # 用户报「更新没生效」时只能靠猜。
+                log("开始下载更新 %s：%s（临时目录 %s）"
+                    % (info.get("version"), dest, work_dir))
                 state["queue"].put(("upd_progress", "下载中 0%"))
 
                 def on_prog(got, total):
@@ -3413,9 +3470,11 @@ def run_gui(smoke=False):
                     # 下载失败时 download() 自己会清掉 `.part`，但 `.new` 可能
                     # 是上一轮留下的（下载成功、替换失败）。12 MB 的东西别留在盘上。
                     updater.discard(dest)
+                    log("更新下载失败：%s" % reason)
                     state["queue"].put(("upd_result", (
                         updater.STATE_UNKNOWN, "下载失败：%s" % reason)))
                     return
+                log("更新包下载完成并校验通过：%s" % dest)
 
                 state["queue"].put(("upd_progress", "正在替换…"))
                 # work_dir 必须一路传下去：`.old` 落在哪由它决定，
@@ -3423,12 +3482,20 @@ def run_gui(smoke=False):
                 ok, reason = updater.apply_update(exe, dest, work_dir)
                 if not ok:
                     updater.discard(dest)
+                    log("更新替换失败：%s" % reason)
                     state["queue"].put(("upd_result", (
                         updater.STATE_UNKNOWN, "升级失败：%s" % reason)))
                     return
                 # 替换成功 → 重启新版本。**先放消息再退出**，让界面把提示显示出来。
+                # ⚠️ 提示里要带版本号：只说「升级完成」的话，用户回头看桌面发现
+                #    文件名没变（本来就是换成同名文件），会以为根本没更新 ——
+                #    2026-09-20 那次「桌面没有出现新版本」就是这么误判的。
+                #    顺带说清旧版本去哪了，免得他去桌面上找那个 .old。
+                log("更新替换成功：旧版本备份在 %s（下次启动自动清理）"
+                    % (os.path.dirname(updater.old_path_of(exe, work_dir) or "")
+                       or "数据目录"))
                 state["queue"].put(("upd_result", (
-                    "done", "升级完成，正在重新启动…")))
+                    "done", "已升级到 v%s，正在重新启动…" % info.get("version"))))
             except Exception:
                 log("升级异常:\n%s" % traceback.format_exc())
                 # 异常路径同样别留残骸（`.part` 可能下到一半）。清不掉也无所谓，
@@ -3843,16 +3910,27 @@ def main():
     except Exception:
         log("自启升级检查失败（不影响启动）:\n%s" % traceback.format_exc())
 
-    # 清理上一次自我更新留下的 .old / .new / .new.part。**必须放在这里**
-    # （每次启动都跑）：替换时旧 exe 正被当前进程占用，删不掉；只能等它退出后、
-    # 下次启动时清。失败不影响使用 —— 留一个几 MB 的残留文件而已。
+    # 清理上一次自我更新留下的 .old / .new / .new.part。**必须放在这里**（每次启动都跑）：
+    # 替换时旧 exe 正被当前进程占用，删不掉；只能等它退出后、下次启动时清。
     #
-    # ⚠️ **必须传 data_dir()**：0.3.3 起更新临时文件落在数据目录，漏传就会退回
-    #    exe 同目录（用户的桌面），新位置的 `.old` 永远没人清、一直累积。
-    #    cleanup_stale 两个位置都扫，所以老版本（≤0.3.2）留在桌面的历史残留
-    #    也能一并收掉 —— 只清新位置等于没修好。
+    # ⚠️ **不能只清一次**。`.old` 常被别的实例占着 —— 最典型的是守护进程：更新发生时
+    #    它正跑着那个 exe，改名后它继续从 `.old` 跑完剩下的时间（最长 30 分钟），
+    #    这期间 Windows 拒绝删除。清一次失败就**永远留着**，用户看到的就是
+    #    「更新完 .old 还在」（2026-09-20 反馈，实测复现见 _repro_lock.py）。
+    #    所以：清一次，还有剩的就转后台按 STALE_SWEEP_DELAYS 重试。
+    # ⚠️ 结果**必须写日志**。这里以前静默吞掉一切：清干净了和清不掉在日志里长得一样，
+    #    用户报问题时无从下手 —— 项目的老毛病，「搜不到 ≠ 干净」。
+    # ⚠️ 传 data_dir() 不能漏：0.3.3 起临时文件落在数据目录，漏传就退回 exe 同目录
+    #    （用户的桌面），新位置的 `.old` 永远没人清。cleanup_stale_all 两个位置都扫，
+    #    所以老版本（≤0.3.2）留在桌面的历史残留也能一并收掉。
     try:
-        updater.cleanup_stale(sys.executable if is_frozen() else None, data_dir())
+        swept, still = sweep_stale_once()
+        if swept:
+            log("已清理上次更新残留：%s" % "、".join(swept))
+        if still:
+            log("更新残留暂时删不掉（多半有实例正占着）：%s —— 转后台重试"
+                % "、".join(still))
+            threading.Thread(target=sweep_stale_retry, daemon=True).start()
     except Exception:
         log("清理旧版本残留失败:\n%s" % traceback.format_exc())
 
@@ -3917,6 +3995,10 @@ def main():
             # 期望值 = 上面的「数据目录」；**绝不是「程序路径」所在的那个目录**。
             "更新临时目录: %s" % (os.path.dirname(update_dest_path() or "")
                                   or "（源码运行，不更新）"),
+            # 现在还剩哪些更新残留（.old / .new / .new.part）。
+            # 用户报「更新完 .old 还在」时，这一行就是第一手答案：是清干净了，
+            # 还是被某个实例占着删不掉。以前这个信息**完全没有出口**。
+            "更新残留: %s" % stale_leftover_desc(),
         ]
         try:
             import psutil

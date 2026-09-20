@@ -59,6 +59,24 @@ MAX_SIZE = 60 * 1024 * 1024
 
 OLD_SUFFIX = ".old"
 
+# 更新残留「多老才算废料」。比它新的 `.new` / `.new.part` **一律不许动**。
+#
+# 🔴 这条是 2026-09-20 实测踩出来的，不是保守估计：
+#    启动清理原本无条件删 `<exe名>.new` / `.new.part`。于是只要在**一次更新进行中**
+#    有第二个实例启动（守护进程、用户又双击了一次图标、开机自启任务），
+#    它的启动清理就会把第一个实例**刚下好的 12 MB 安装包删掉** ——
+#    接着 apply_update 的 os.replace 报 `WinError 2 系统找不到指定的文件`，
+#    更新整个失败（用户看到「升级失败」/「桌面没有出现新版本」）。
+#    复现记录：_repro_real_path.py，日志里能直接看到那句 WinError 2。
+#
+# 为什么是 10 分钟：12 MB 的包正常几十秒就下完，连上重试 3 次也远用不到 10 分钟。
+# 所以「比 10 分钟还新」几乎必然是**正在下载**，不是残骸。
+#
+# ⚠️ 只对 `.new` / `.part` 生效。`.old` 不设门槛：它只可能是「替换已经完成」留下的
+#    废料（替换前 apply_update 自己会先 _unlink 一遍），而且替换进行中它是被
+#    当前进程占用的、本来也删不掉。
+STALE_MIN_AGE = 10 * 60
+
 # 下载最多尝试几次。为什么必须有重试（2026-09-19 实测）：
 #   这条路径要下 12 MB，而它原先**一次重试都没有**。同一台机器上 8 次下载失败 1 次，
 #   失败形态是 `TimeoutError: The read operation timed out` —— 连接级停顿。
@@ -486,8 +504,69 @@ def old_path_of(exe, work_dir=None):
     return os.path.join(d, os.path.basename(exe) + OLD_SUFFIX)
 
 
+def _age(path):
+    """文件有多旧（秒）。读不到属性返回 None（当「不知道」处理）。"""
+    try:
+        return time.time() - os.path.getmtime(path)
+    except OSError:
+        return None
+
+
+def cleanup_stale_all(exe, work_dir=None, min_age=STALE_MIN_AGE):
+    """删掉更新残留。返回 `(删掉的路径列表, 没删掉的路径列表)`。
+
+    为什么要拆出这个：老签名 cleanup_stale 只报「删掉的第一个名字」，
+    调用方没法知道**还剩什么** —— 而后台重试恰恰需要这个信息。
+    （同类的坑：把「没报错」当成「清干净了」。）
+
+    🔴 `.new` / `.new.part` 加**年龄门槛**：比 `min_age` 新的不动。
+       理由见 STALE_MIN_AGE —— 那可能是另一个实例正在下载的文件，
+       删掉它会让那次更新直接失败（2026-09-20 实测）。
+    ⚠️ `.old` 不设门槛：它只可能是替换完成后的废料，见 STALE_MIN_AGE。
+
+    删不掉**不是异常**：有别的实例正从那个文件跑着（典型：守护进程还活着），
+    Windows 会拒绝删除。这种要交给调用方重试，所以这里把 left 一并返回。
+    """
+    if not exe:
+        return [], []
+    base = os.path.basename(exe)
+    exe_dir = os.path.dirname(os.path.abspath(exe)) or "."
+    cands = []
+    for d in (work_dir_for(exe, work_dir), exe_dir):
+        try:
+            names = os.listdir(d)
+        except OSError:
+            continue
+        for name in names:
+            is_old = name.startswith(base + OLD_SUFFIX)
+            # 老版本（≤0.3.2）的下载文件叫 `campus-login-<版本>.new`，不含 exe 名，
+            # 单独扫一遍，把这些历史残留也收掉。
+            is_download = name.startswith(base + ".new") or (
+                name.startswith("campus-login-")
+                and (name.endswith(".new") or name.endswith(".new.part")))
+            if not (is_old or is_download):
+                continue
+            p = os.path.join(d, name)
+            if p in cands:
+                continue
+            if is_download:
+                a = _age(p)
+                if a is not None and a < min_age:
+                    # 太新 = 很可能正在下载 → 碰它会毁掉那次更新
+                    continue
+            cands.append(p)
+    removed, left = [], []
+    for p in cands:
+        try:
+            os.remove(p)
+            removed.append(p)
+        except OSError:
+            left.append(p)
+    return removed, left
+
+
 def cleanup_stale(exe, work_dir=None):
-    """启动时调用：把上次更新留下的临时文件删掉。返回删掉的文件名或 None。
+    """启动时调用：把上次更新留下的临时文件删掉。返回删掉的第一个文件名或 None。
 
     为什么现在才删：`.old` 在被替换的进程退出前一直是被占用的，当时删不掉，
     只能留到下次启动。
@@ -497,38 +576,13 @@ def cleanup_stale(exe, work_dir=None):
     ⚠️ 用**前缀匹配**，不是几个写死的文件名。apply_update 在 `.old` 被占着时
        会退到带时间戳的备用名 `app.exe.old.<时间戳>` —— 写死名字就会漏掉它，
        于是它永远躺在数据目录里、越积越多。
-
-    exe 传 None（源码运行）时不做事，直接返回 None —— 那不是错误情况。
+    ⚠️ **清不掉是常态，不是错误**：有别的实例（守护进程）正从那个文件跑着。
+       所以这个函数只报「删掉了什么」，**不报「还剩什么」** —— 需要那个信息
+       用 cleanup_stale_all。调用方（campus_login）会在后台重试，
+       别把这里的一次性结果当成「清干净了」。
     """
-    if not exe:
-        return None
-    base = os.path.basename(exe)
-    exe_dir = os.path.dirname(os.path.abspath(exe)) or "."
-    # `<exe名>.old` 连备用名一起覆盖；`<exe名>.new` 连 `.new.part` 一起覆盖。
-    prefixes = (base + OLD_SUFFIX, base + ".new")
-    cands = []
-    for d in (work_dir_for(exe, work_dir), exe_dir):
-        try:
-            names = os.listdir(d)
-        except OSError:
-            continue
-        for name in names:
-            # 老版本（≤0.3.2）的下载文件叫 `campus-login-<版本>.new`，不含 exe 名，
-            # 按前缀+后缀单独扫一遍，把这些历史残留也收掉。
-            if name.startswith(prefixes) or (
-                    name.startswith("campus-login-")
-                    and (name.endswith(".new") or name.endswith(".new.part"))):
-                p = os.path.join(d, name)
-                if p not in cands:
-                    cands.append(p)
-    removed = None
-    for p in cands:
-        try:
-            os.remove(p)
-            removed = removed or os.path.basename(p)
-        except OSError:
-            pass
-    return removed
+    removed, _left = cleanup_stale_all(exe, work_dir)
+    return os.path.basename(removed[0]) if removed else None
 
 
 def can_self_update(exe=None):
@@ -804,21 +858,57 @@ def _selftest():
         ck("  备用名清掉了",
            [x for x in os.listdir(work) if x.startswith("app.exe" + OLD_SUFFIX)], [])
 
-        # .new / .new.part 残骸：下载中途被强杀、或替换失败没清，都会留下它们。
+        # --- 正在下载的文件不许被清掉（2026-09-20 实测踩到）---
+        # 场景：一次更新正在下 12 MB，此时第二个实例启动（守护进程 / 用户又双击了
+        # 图标 / 开机自启任务），它的启动清理把第一个实例刚下好的 `.new` 删掉 ——
+        # 接着 os.replace 报 WinError 2「系统找不到指定的文件」，更新整个失败，
+        # 用户看到的是「升级失败 / 桌面没有出现新版本」。所以新的下载文件必须留着。
+        fresh = os.path.join(work, "app.exe.new")
+        with open(fresh, "wb") as f:
+            f.write(b"x")
+        ck("★ 刚下好的 .new 不许被清掉（可能正在下载）",
+           cleanup_stale(fake, work), None)
+        ck("  它确实还在", os.path.isfile(fresh), True)
+
+        # 反过来：明显过期的 `.new` / `.new.part` 是残骸，必须收掉。
+        # 用改 mtime 的方式把它变旧 —— 比 sleep 快，也不依赖时钟精度。
+        def _backdate(p, secs=STALE_MIN_AGE + 60):
+            t_old = time.time() - secs
+            os.utime(p, (t_old, t_old))
+
         for nm in ("app.exe.new", "app.exe.new.part"):
-            with open(os.path.join(work, nm), "wb") as f:
+            p = os.path.join(work, nm)
+            with open(p, "wb") as f:
                 f.write(b"x")
-        ck("cleanup_stale 顺手清掉 .new / .new.part 残骸",
-           cleanup_stale(fake, work), "app.exe.new")
+            _backdate(p)
+        # ⚠️ 断言用**集合**，不用「第一个删掉的名字」：候选是按 os.listdir 顺序扫的，
+        #    顺序不保证，拿第一个名字做断言会随机假红。
+        rem, _left = cleanup_stale_all(fake, work)
+        ck("cleanup_stale 收掉过期的 .new / .new.part 残骸",
+           sorted(os.path.basename(x) for x in rem),
+           ["app.exe.new", "app.exe.new.part"])
         ck("  .new / .new.part 都没了",
            [x for x in os.listdir(work) if ".new" in x], [])
 
         # 老版本（≤0.3.2）的下载文件名不含 exe 名，落在 exe 同目录 ——
         # 那些用户升级后还躺在桌面上，必须一并收掉，否则等于没修。
-        with open(os.path.join(exe_dir, "campus-login-0.3.2.new"), "wb") as f:
+        legacy = os.path.join(exe_dir, "campus-login-0.3.2.new")
+        with open(legacy, "wb") as f:
             f.write(b"x")
+        _backdate(legacy)
         ck("cleanup_stale 收得掉老命名的历史残留",
            cleanup_stale(fake, work), "campus-login-0.3.2.new")
+
+        # cleanup_stale_all 必须把「没删掉的」也报出来 —— 后台重试靠它决定要不要再试。
+        # 造一个删不掉的：建个同名目录，os.remove 对目录会抛 OSError。
+        stuck = os.path.join(work, "app.exe.old")
+        os.makedirs(stuck)
+        rem2, left2 = cleanup_stale_all(fake, work)
+        ck("cleanup_stale_all 报出删不掉的（重试的依据）",
+           [os.path.basename(x) for x in left2], ["app.exe.old"])
+        ck("  没删掉的不会同时出现在「删掉了」里",
+           [x for x in rem2 if os.path.basename(x) == "app.exe.old"], [])
+        os.rmdir(stuck)
     finally:
         for r_, ds_, fs_ in os.walk(t, topdown=False):
             for x in fs_:

@@ -77,6 +77,41 @@ def check_update_temp_dir(data):
     return 1
 
 
+def check_stale_leftover(data):
+    """`--selftest` 报的「更新残留」必须是「无」。
+
+    为什么值得单独一条：用户报「更新完 .old 还在」时，这一行就是第一手答案 ——
+    是清干净了，还是被某个实例占着删不掉。以前这个信息**完全没有出口**，
+    只能靠猜（2026-09-20 就是这么绕了一大圈）。
+
+    ⚠️ 先确认那一行**真的存在**，再看内容。老 exe 里没有这行 ——
+       如果只判断「有没有残留」，拿不到标记会被当成「无残留」= 静默通过。
+       这是项目踩过的老坑：搜不到 ≠ 干净。所以「没有这一行」判失败，
+       顺便也就成了这条检查的阳性对照（拿 0.3.3 的 exe 跑必然失败）。
+    """
+    sel = os.path.join(data, "selftest.txt")
+    text = ""
+    if os.path.isfile(sel):
+        with open(sel, "r", encoding="utf-8", errors="replace") as fh:
+            text = fh.read()
+    line = ""
+    for ln in text.splitlines():
+        if ln.startswith("更新残留:"):
+            line = ln.split(":", 1)[1].strip()
+            break
+    if not line:
+        print("更新残留 -> **标记里没有这一行**（老版本 exe？）")
+        print("  期望: 「无」")
+        return 1
+    if line == "无":
+        print("更新残留 -> 无 / OK")
+        return 0
+    print("更新残留 -> %s / **失败：还有残留没清掉**" % line)
+    print("  多半有实例正占着那个文件（守护进程）。程序会在后台重试；"
+          "若长期清不掉，把这行原样发出来。")
+    return 1
+
+
 def main():
     if not os.path.isfile(EXE):
         print("找不到 exe:", EXE)
@@ -119,6 +154,7 @@ def main():
                 bad += 1
 
     bad += check_update_temp_dir(data)
+    bad += check_stale_leftover(data)
 
     print()
     print("结论:", "通过" if bad == 0 else "%d 项失败" % bad)
