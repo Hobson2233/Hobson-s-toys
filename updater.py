@@ -5,7 +5,7 @@
     这部分逻辑要能**脱离 GUI 单独测**（起个本地 HTTP 服务就能跑完整流程），
     塞进 campus_login.py 就只能靠点界面验证了。项目里 local_secrets.py 也是同样做法。
 
-对外只暴露 4 个函数，全部**纯标准库**（urllib / hashlib / json / os），
+对外暴露的函数全部**纯标准库**（urllib / hashlib / json / os），
 不引入任何新依赖 —— 打包体积的三条手段（不用 requests、精简 EXCLUDES、裁 Tcl 数据）
 一条都不破坏。
 

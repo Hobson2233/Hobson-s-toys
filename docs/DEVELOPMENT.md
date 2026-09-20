@@ -25,7 +25,7 @@ docs/                   README 用的界面截图与本文件
 | `secret_scan.py` | **提交前**扫凭据 / 本机绝对路径 | 提交前跑（`--staged`） |
 | `help_check.py` | 内置使用说明确实进了 exe | 否（可以加进 build.py） |
 | `wiring_gate_test.py` | 验「接线自检」这道门槛的报警链路本身通不通 | 否 |
-| `verify_exe.py` | 只验不打包 | 否 |
+| `verify_exe.py` | 只验不打包；可传 exe 路径，用来拿旧版本做阳性对照 | 否 |
 | `pwd_test.py` | 密码框显示规则（纯函数） | 否 |
 | `poll_test.py` | 界面轮询队列：出错要不要记日志、会不会中断整批 | 否 |
 | `pwd_gui_test.py` | 密码框真实窗口绑定 | 否（要真桌面） |
