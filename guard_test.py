@@ -91,15 +91,25 @@ def test_lnk_arguments():
     section("A. 自启快捷方式的参数读取")
     tmp = tempfile.mkdtemp(prefix="campus_lnk_")
     try:
-        # A1 真实的那份 .lnk（0.2.0 建的，参数只有 --auto）
-        links = C.autostart_links()
-        if links:
-            got = C._lnk_arguments(links[0])
-            ck("A1 真实 .lnk 只读出 --auto", got, "--auto")
-            if got != "--auto":
-                print("     ⚠️ 完整值: %r" % got)
+        # A1 本机**真实**的自启项。0.3.2 起自启优先走计划任务（见
+        #    AUTOSTART_TASK_NAME 那段），.lnk 只是退路 —— 所以两条都看：
+        #    有任务就看任务，没有才看 .lnk。这一条是「看一眼真机」的检查，
+        #    不是回归用例；本机没开自启就跳过。
+        st = C.task_state()
+        if st["exists"]:
+            ck("A1 真实计划任务读得出参数", bool(st["arguments"]), True)
+            print("     计划任务参数 = %r" % st["arguments"])
+        elif C.autostart_links():
+            got = C._lnk_arguments(C.autostart_links()[0])
+            # ⚠️ 只断言「读得出、且认得 --auto」，**不要写死完整值** ——
+            #    这台机器上 .lnk 的参数会随版本升级而变（0.2.0 是 --auto，
+            #    0.3.0 起是 --auto --guard）。钉死完整值的话，每次参数一变
+            #    这条检查就假失败一次（2026-09-20 就是这么红的）。
+            ck("A1 真实 .lnk 读得出参数且含 --auto",
+               bool(got.startswith("--auto")), True)
+            print("     .lnk 参数 = %r" % got)
         else:
-            print("  [--] 本机没有自启链接，跳过 A1")
+            print("  [--] 本机没开自启，跳过 A1")
 
         # A2/A3 是**回归用例**：参数串在 .lnk 里跟后面的字符串之间没有可靠
         # 分隔符，紧跟的那一个字符是二进制残留（实测见过 `?` 和 `A`）。
@@ -134,7 +144,7 @@ def test_lnk_arguments():
 def test_autostart_outdated():
     section("B. 「自启参数陈旧」的判定")
     tmp = tempfile.mkdtemp(prefix="campus_lnk_")
-    saved = (C.is_frozen, C.autostart_links, C.app_path)
+    saved = (C.is_frozen, C.autostart_links, C.app_path, C.task_state)
     try:
         exe = os.path.join(tmp, "校园网自动登录.exe")
         open(exe, "wb").close()
@@ -143,6 +153,12 @@ def test_autostart_outdated():
         C.is_frozen = lambda: True
         C.app_path = lambda: exe
         C.autostart_links = lambda: [p]
+        # ⚠️ 必须把计划任务按成「不存在」：autostart_outdated() 现在会先问
+        #    task_outdated()，而那读的是**这台机器上真实的任务**。
+        #    不隔离的话，这几条用例的结果会随「本机开没开自启」而变 ——
+        #    在自己机器上永远绿、在别人机器上红（或者反过来）。
+        C.task_state = lambda: {"exists": False, "command": "",
+                                "arguments": "", "logon": False}
 
         C.make_lnk(p, exe, arguments="--auto", icon=exe, work_dir=tmp)
         ck("B1 旧参数（--auto）→ 判定为陈旧", C.autostart_outdated(), True)
@@ -155,7 +171,7 @@ def test_autostart_outdated():
         C.make_lnk(p, other, arguments="--auto", icon=other, work_dir=tmp)
         ck("B3 指向别的 exe → 不算陈旧", C.autostart_outdated(), False)
     finally:
-        C.is_frozen, C.autostart_links, C.app_path = saved
+        C.is_frozen, C.autostart_links, C.app_path, C.task_state = saved
         shutil.rmtree(tmp, ignore_errors=True)
 
 

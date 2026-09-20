@@ -12,6 +12,9 @@
   - --version (-v)  : 只打印版本号就退出（打包后没有 stdout，改为弹窗）
 
 开机自启用的是 `--auto --guard`（见 AUTOSTART_ARGS）。
+自启入口是系统「任务计划程序」里一个叫 CampusLogin 的**登录触发**任务
+（见 AUTOSTART_TASK_NAME 那段：为什么不用启动文件夹 —— 差约 60 秒）。
+建不了任务时才退回启动文件夹里的 .lnk。
 
 数据目录：C:\\ProgramData\\CampusLogin
           （该目录写不进去时自动退回 %APPDATA%\\CampusLogin）
@@ -27,6 +30,7 @@ import socket
 import queue
 import threading
 import subprocess
+import tempfile
 import traceback
 import http.cookiejar
 import urllib.error
@@ -50,7 +54,7 @@ APP_TITLE = "校园网自动登录"
 # ⚠️ 这里是**唯一来源**。界面标题、使用说明、--version、--selftest、
 #    以及 exe 文件属性里的版本，全部由它推导 —— 不要在别处另写一份，
 #    否则迟早漂移（改了一处忘了另一处，用户看到的版本号就是错的）。
-VERSION = "0.3.1"
+VERSION = "0.3.2"
 
 # 学校 portal 默认参数（拷到同校其他电脑上可直接用）
 DEFAULTS = {
@@ -1733,7 +1737,12 @@ def autostart_links():
 
 
 def is_autostart_on():
-    return len(autostart_links()) > 0
+    """开机自启开着没有。**计划任务和启动文件夹任一条在，就算开着。**
+
+    两条路都要认：老用户升级过来时自启还在启动文件夹里（见 autostart_upgrade），
+    只认计划任务的话界面上那个勾会突然变空 —— 用户会以为自启被关了。
+    """
+    return task_exists() or len(autostart_links()) > 0
 
 
 def _lnk_points_to_me(path):
@@ -1772,10 +1781,12 @@ def autostart_stale():
     移到桌面根目录，`.lnk` 还指着旧路径）。
 
     源码运行时恒返回 False：那时 `app_path()` 是脚本路径，本来就不该有指向它的自启
-    链接，而且 `set_autostart()` 也会拒绝。
+    项，而且 `set_autostart()` 也会拒绝。
     """
     if not is_frozen():
         return False
+    if task_stale():
+        return True
     links = autostart_links()
     if not links:
         return False
@@ -1833,7 +1844,14 @@ def _lnk_arguments(path):
 
 
 def autostart_args():
-    """当前自启快捷方式实际带的参数（给 --selftest 展示用）。没有就返回 ""。"""
+    """当前自启项实际带的参数（给 --selftest 展示用）。没有就返回 ""。
+
+    计划任务优先：升级刚做完时两条路可能短暂并存（任务建好了、.lnk 还没删掉），
+    这时该报出来的是真正会生效的那条。
+    """
+    st = task_state()
+    if st["exists"]:
+        return st["arguments"]
     for p in autostart_links():
         a = _lnk_arguments(p)
         if a:
@@ -1842,23 +1860,336 @@ def autostart_args():
 
 
 def autostart_outdated():
-    """自启链接指向的 exe 是对的，但**参数是旧版本的**（少了 --guard）。
+    """自启项指向的 exe 是对的，但**参数是旧版本的**（少了 --guard）。
 
     为什么必须单独判（2026-09-19 加）：
         `autostart_stale()` 只看**目标路径**。0.3.0 把参数从 `--auto` 改成
-        `--auto --guard` —— 老用户的 .lnk 指向的 exe 完全正确，所以
+        `--auto --guard` —— 老用户的自启项指向的 exe 完全正确，所以
         `autostart_stale()` 返回 False、勾照样打着、开机也照样登录，
         只是**没有守护**：掉线后不会自动重连。
         不提示的话，用户升级到 0.3.0 却发现「掉线还是不重连」，
-        会以为是没修好 —— 而真正的原因是那份开机快捷方式还停在旧参数上。
+        会以为是没修好 —— 而真正的原因是那份开机自启还停在旧参数上。
     """
     if not is_frozen():
         return False
+    if task_outdated():
+        return True
     links = autostart_links()
     if not links:
         return False
-    return all(_lnk_points_to_me(p) is True and "--guard" not in _lnk_arguments(p)
+    # 参数该带哪些，唯一来源是 AUTOSTART_ARGS —— 别再写 "--guard" 这种字面量，
+    # 否则以后给 AUTOSTART_ARGS 加开关时这里会漏判。
+    want = AUTOSTART_ARGS.split()
+    return all(_lnk_points_to_me(p) is True
+               and not all(a in _lnk_arguments(p).split() for a in want)
                for p in links)
+
+
+# ==================== 开机自启 · 计划任务（首选机制）====================
+# 为什么不再用启动文件夹（2026-09-20 实测，证据在本机事件日志里）：
+#   同一次开机，OS 启动 = 09:32:33，用户登录 = 09:32:52：
+#     09:32:57.322  GHelper.exe    <- 计划任务 \GHelper（登录时触发）
+#     09:32:59.274  PowerToys.exe  <- 计划任务 \PowerToys\Autorun for Hobson
+#     09:33:13.294  Shell 发出 DesktopStartupApps 信号（桌面就绪）
+#     09:33:38.021  HKCU\...\Run 的第一项才开始执行 —— 中间白等了 24.7 秒
+#     09:33:58.2    我们（启动文件夹里的 .lnk）—— 排在 Run 键 6 项之后
+#   ⇒ 登录触发的计划任务在**开机后 25 秒**就跑起来了，启动文件夹要等到 **85 秒**。
+#     而程序自己被拉起之后只花 0.3 秒（认证逻辑）+ 约 2 秒（onefile 解压）。
+#     慢的从来不是认证，是「什么时候轮到我们」。换成计划任务能提前约 60 秒。
+#
+# 任务名必须**纯 ASCII**：它要进 PowerShell 命令行，也是任务定义的文件名。
+AUTOSTART_TASK_NAME = "CampusLogin"
+
+# 任务定义 XML。几条**不能删**的设置：
+#   MultipleInstancesPolicy=IgnoreNew  同会话重复触发时不要起第二份（两份守护互相不知道对方）
+#   DisallowStartIfOnBatteries=false   笔记本用电池时也要跑（默认是「用电池就不启动」）
+#   ExecutionTimeLimit=PT0S            不限时长。默认 72 小时；守护只跑 30 分钟，
+#                                      但写死「不限」，免得以后改守护时长被它砍掉
+TASK_XML = """<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>%s</Description>
+  </RegistrationInfo>
+  <Triggers>
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+      <UserId>%s</UserId>
+    </LogonTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <UserId>%s</UserId>
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>false</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <WakeToRun>false</WakeToRun>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Priority>7</Priority>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>%s</Command>
+      <Arguments>%s</Arguments>
+      <WorkingDirectory>%s</WorkingDirectory>
+    </Exec>
+  </Actions>
+</Task>
+"""
+
+
+def _tasks_dir():
+    """计划任务的定义目录。
+
+    ⚠️ 这个目录**不能列**（普通用户 listdir 会被拒绝访问），但按名字打开文件
+    没问题 —— 所以下面只做 isfile / open，别写 os.listdir。
+    """
+    return os.path.join(os.environ.get("SystemRoot") or r"C:\Windows",
+                        "System32", "Tasks")
+
+
+def task_def_path():
+    return os.path.join(_tasks_dir(), AUTOSTART_TASK_NAME)
+
+
+def _task_text():
+    """读计划任务的定义文件（UTF-16LE + BOM）。读不到返回 ""。
+
+    为什么读文件、不问 PowerShell：勾选状态和失效提示每次开界面都要看，
+    拉一次 PowerShell 要 ~1 秒，白等。任务定义就是个 UTF-16 的 XML 文件，
+    实测普通用户直接读得到（见 _tasks_dir 的说明）。
+    """
+    try:
+        with open(task_def_path(), "rb") as f:
+            return f.read().decode("utf-16-le", "ignore")
+    except Exception:
+        return ""
+
+
+def _tag(text, name):
+    m = re.search(r"<%s>(.*?)</%s>" % (name, name), text, re.S)
+    return m.group(1).strip() if m else ""
+
+
+def _norm_path(p):
+    return os.path.normcase((p or "").strip().replace("/", "\\"))
+
+
+def task_state():
+    """计划任务当前的形状：存在 / 跑什么 / 带什么参数 / 是不是登录触发。只读文件。"""
+    text = _task_text()
+    if not text:
+        return {"exists": False, "command": "", "arguments": "", "logon": False}
+    return {"exists": True,
+            "command": _tag(text, "Command"),
+            "arguments": _tag(text, "Arguments"),
+            "logon": "<LogonTrigger>" in text}
+
+
+def task_exists():
+    return task_state()["exists"]
+
+
+def task_installed():
+    """任务在、登录触发、而且跑的就是**当前这个 exe**。"""
+    st = task_state()
+    return bool(st["exists"] and st["logon"]
+                and _norm_path(st["command"]) == _norm_path(app_path()))
+
+
+def task_stale():
+    """任务在，但指向的是别的 exe（用户把 exe 挪了位置）。"""
+    st = task_state()
+    return bool(st["exists"] and st["command"]
+                and _norm_path(st["command"]) != _norm_path(app_path()))
+
+
+def task_outdated():
+    """任务在、目标也对，但参数是旧版本的（少了 --guard）。
+
+    和 autostart_outdated() 是同一件事的两条路：以前用 .lnk 时老参数少了 --guard，
+    现在换成任务 —— 将来要是再改 AUTOSTART_ARGS，老任务也得能被认出来。
+    """
+    st = task_state()
+    if not (st["exists"] and st["logon"]):
+        return False
+    if _norm_path(st["command"]) != _norm_path(app_path()):
+        return False
+    have = set(st["arguments"].split())
+    return not all(a in have for a in AUTOSTART_ARGS.split())
+
+
+def _powershell():
+    return os.path.join(os.environ.get("SystemRoot") or r"C:\Windows",
+                        "System32", "WindowsPowerShell", "v1.0", "powershell.exe")
+
+
+def _ps(script, timeout=60):
+    """跑一段 PowerShell，返回 (returncode, 输出文本)。
+
+    ⚠️ 输出只用来记日志 / 排障，**不要拿它做判断**：中文 Windows 上管道 stdout
+    是 cp936，我们的路径里有中文，读回来必然乱码。要回读结果就落盘再读
+    （项目里 --selftest 已经吃过一次这个亏，见那边的注释）。
+    """
+    exe = _powershell()
+    if not os.path.isfile(exe):
+        return -1, "找不到 powershell.exe"
+    try:
+        p = subprocess.run([exe, "-NoProfile", "-NonInteractive",
+                            "-ExecutionPolicy", "Bypass", "-Command", script],
+                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                           timeout=timeout, creationflags=CREATE_NO_WINDOW)
+        return p.returncode, (p.stdout or b"").decode("utf-8", "replace")
+    except Exception:
+        return -1, traceback.format_exc()
+
+
+def current_sid():
+    """当前用户的 SID 字符串（S-1-5-...）。拿不到返回 ""。
+
+    为什么要自己算：建任务的 XML 里要写它，而用 whoami / PowerShell 去问
+    要额外拉一个子进程（~1 秒），而且中文输出还得再解一次码。这里直接问内核。
+
+    ⚠️ 下面几个 API **必须显式声明 argtypes / restype**（2026-09-20 踩过）：
+       ctypes 对没声明参数类型的函数，会把 Python 整数按 **32 位** 传。
+       SID 指针是 64 位的，被截掉高 32 位之后 ConvertSidToStringSidW 必然失败，
+       函数就静默返回 ""（现象是 task_create 只会说「取不到当前用户 SID」）。
+       实测：声明前返回空，声明后立刻拿到 S-1-5-21-...。
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes
+        advapi32 = ctypes.windll.advapi32
+        kernel32 = ctypes.windll.kernel32
+        TOKEN_QUERY, TokenUser = 0x0008, 1
+
+        kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+        advapi32.OpenProcessToken.argtypes = [wintypes.HANDLE, wintypes.DWORD,
+                                              ctypes.POINTER(wintypes.HANDLE)]
+        advapi32.OpenProcessToken.restype = wintypes.BOOL
+        advapi32.GetTokenInformation.argtypes = [
+            wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD,
+            ctypes.POINTER(wintypes.DWORD)]
+        advapi32.GetTokenInformation.restype = wintypes.BOOL
+        advapi32.ConvertSidToStringSidW.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(ctypes.c_wchar_p)]
+        advapi32.ConvertSidToStringSidW.restype = wintypes.BOOL
+
+        h = wintypes.HANDLE()
+        if not advapi32.OpenProcessToken(kernel32.GetCurrentProcess(),
+                                         TOKEN_QUERY, ctypes.byref(h)):
+            return ""
+        try:
+            need = wintypes.DWORD(0)
+            # 第一次调用只问长度，必然返回 0（ERROR_INSUFFICIENT_BUFFER = 122），
+            # 这不是错误 —— 只要 need 被填上了就继续。
+            advapi32.GetTokenInformation(h, TokenUser, None, 0, ctypes.byref(need))
+            if not need.value:
+                return ""
+            buf = ctypes.create_string_buffer(need.value)
+            if not advapi32.GetTokenInformation(h, TokenUser, buf, need.value,
+                                                ctypes.byref(need)):
+                return ""
+            # TOKEN_USER 的第一个成员是 SID_AND_ATTRIBUTES{ PSID Sid; DWORD Attributes }
+            sid_ptr = ctypes.cast(buf, ctypes.POINTER(ctypes.c_void_p))[0]
+            if not sid_ptr:
+                return ""
+            out = ctypes.c_wchar_p()
+            if not advapi32.ConvertSidToStringSidW(ctypes.c_void_p(sid_ptr),
+                                                   ctypes.byref(out)):
+                return ""
+            try:
+                return out.value or ""
+            finally:
+                kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+                kernel32.LocalFree(ctypes.cast(out, ctypes.c_void_p))
+        finally:
+            kernel32.CloseHandle(h)
+    except Exception:
+        return ""
+
+
+def _xml_esc(s):
+    return (s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+
+
+def task_create():
+    """建/更新「登录时触发」的计划任务。返回 (ok, 说明)。
+
+    为什么走 PowerShell + 完整任务 XML，而不是 schtasks.exe 的命令行：
+      · schtasks 的 `/sc onlogon` 在**非提权**下到底能不能用，本机没法验证
+        （schtasks.exe 在沙箱里被黑名单拦着），不敢当主路径；
+        PowerShell 的 Register-ScheduledTask 已实测非提权可用。
+      · 任务里要嵌中文 exe 路径。塞命令行要过好几层引号 + 代码页；
+        走 XML 文件（UTF-16 落盘、Get-Content -Encoding Unicode 读回）
+        实测回读一字不差。
+    """
+    sid = current_sid()
+    if not sid:
+        return False, "取不到当前用户 SID"
+    exe = app_path()
+    xml = TASK_XML % (_xml_esc("%s：开机后自动登录校园网，并守护 30 分钟" % APP_TITLE),
+                      _xml_esc(sid), _xml_esc(sid), _xml_esc(exe),
+                      _xml_esc(AUTOSTART_ARGS), _xml_esc(os.path.dirname(exe)))
+    tmp = ""
+    try:
+        fd, tmp = tempfile.mkstemp(suffix=".xml", prefix="campuslogin-task-")
+        os.close(fd)
+        # UTF-16LE + BOM，跟 XML 声明里的 encoding="UTF-16" 对上
+        with open(tmp, "wb") as f:
+            f.write(b"\xff\xfe")
+            f.write(xml.encode("utf-16-le"))
+        rc, out = _ps("Register-ScheduledTask -TaskName '%s' -Xml "
+                      "(Get-Content -LiteralPath '%s' -Raw -Encoding Unicode) -Force "
+                      "| Out-Null; 'OK'" % (AUTOSTART_TASK_NAME, tmp))
+        if rc != 0:
+            return False, "注册失败：%s" % out.strip()[-200:]
+    except Exception as e:
+        return False, "建任务时出错：%s" % e
+    finally:
+        if tmp:
+            try:
+                os.remove(tmp)
+            except OSError:
+                # 删不掉就留在 %TEMP% 里。只是一份任务定义 XML，不含账号密码，
+                # 但留个痕 —— 免得以后有人在 %TEMP% 里看到它一头雾水。
+                log("临时的任务定义 XML 没删掉: %s" % tmp)
+    # ⚠️ 必须回读。Register-ScheduledTask 返回 0 只说明「这次调用没报错」，
+    #    不代表任务真的长成了我们要的样子（指向谁 / 参数 / 触发类型都要核）。
+    st = task_state()
+    if not task_installed():
+        return False, "任务建好了但回读不对（目标=%r 参数=%r 登录触发=%s）" % (
+            st["command"], st["arguments"], st["logon"])
+    return True, ""
+
+
+def task_delete():
+    """删掉计划任务。返回 (ok, 说明)。本来就没有也算成功。"""
+    if not task_exists():
+        return True, ""
+    rc, out = _ps("Unregister-ScheduledTask -TaskName '%s' -Confirm:$false; 'OK'"
+                  % AUTOSTART_TASK_NAME)
+    if rc != 0:
+        return False, "删除失败：%s" % out.strip()[-200:]
+    return (True, "") if not task_exists() else (False, "删了但任务文件还在")
+
+
+def autostart_mode():
+    """当前自启走的是哪条路：`task`（计划任务）/ `lnk`（启动文件夹）/ `""`（没开）。"""
+    if task_exists():
+        return "task"
+    return "lnk" if autostart_links() else ""
 
 
 def make_lnk(lnk_path, target, arguments="", icon=None, work_dir=None):
@@ -1875,39 +2206,135 @@ def make_lnk(lnk_path, target, arguments="", icon=None, work_dir=None):
     lnk.save(lnk_path)
 
 
-def set_autostart(on):
-    """开/关开机自启。返回 (ok, 说明)"""
+def _remove_links(links):
+    """删掉启动文件夹里的自启快捷方式。返回删不掉的列表。
+
+    删不掉也必须留痕：残留的旧链接（比如指向 .bat 的）和新建的自启项会
+    **同时触发**，等于开机登录两遍。
+    """
+    left = []
+    for p in links:
+        try:
+            os.remove(p)
+        except Exception:
+            left.append(p)
+            log("自启快捷方式删不掉，可能残留:\n%s\n%s" % (p, traceback.format_exc()))
+    return left
+
+
+def set_autostart_lnk(on):
+    """老机制：在启动文件夹里放 / 删 .lnk。返回 (ok, 说明)。"""
     d = startup_dir()
     if not os.path.isdir(d):
         return False, "找不到启动文件夹"
     try:
-        links = autostart_links()
-        if on:
-            exe = app_path()
-            if not is_frozen():
-                return False, "源码运行时无法设置自启"
-            # 清掉旧的（可能指向 .bat），统一换成指向 exe 的
-            for p in links:
-                try:
-                    os.remove(p)
-                except Exception:
-                    # 删不掉就留着，但必须留痕：旧链接（比如指向 .bat 的）还在的话，
-                    # 开机时它和新建的 .lnk 会**同时触发**，等于登录两遍。
-                    log("旧自启链接删不掉，可能残留:\n%s\n%s"
-                        % (p, traceback.format_exc()))
-            lnk_path = os.path.join(d, AUTOSTART_LNK_NAME)
-            # ⚠️ 参数里必须带 --guard。`--auto` 登录成功就退出了，
-            #    掉线之后没人重连（见 run_guard 的说明）。
-            #    改这里要同步改 autostart_outdated() 里认的参数，
-            #    否则老用户的 .lnk 不会被判成「要更新」。
-            make_lnk(lnk_path, exe, arguments=AUTOSTART_ARGS, icon=exe,
-                     work_dir=os.path.dirname(exe))
-            return (True, "") if os.path.isfile(lnk_path) else (False, "快捷方式未生成")
-        for p in links:
-            os.remove(p)
-        return (True, "") if not is_autostart_on() else (False, "快捷方式未能删除")
+        if not on:
+            _remove_links(autostart_links())
+            return (True, "") if not autostart_links() else (False, "快捷方式未能删除")
+        # 清掉旧的（可能指向 .bat），统一换成指向 exe 的
+        _remove_links(autostart_links())
+        exe = app_path()
+        lnk_path = os.path.join(d, AUTOSTART_LNK_NAME)
+        # ⚠️ 参数里必须带 --guard。`--auto` 登录成功就退出了，
+        #    掉线之后没人重连（见 run_guard 的说明）。
+        #    改这里要同步改 autostart_outdated() 里认的参数，
+        #    否则老用户的 .lnk 不会被判成「要更新」。
+        make_lnk(lnk_path, exe, arguments=AUTOSTART_ARGS, icon=exe,
+                 work_dir=os.path.dirname(exe))
+        return (True, "") if os.path.isfile(lnk_path) else (False, "快捷方式未生成")
     except Exception as e:
         return False, str(e)
+
+
+def set_autostart(on):
+    """开 / 关开机自启。返回 (ok, 说明)。
+
+    首选**计划任务**（登录时触发），建不了才退回启动文件夹的 .lnk ——
+    两条路差约 60 秒，理由见 AUTOSTART_TASK_NAME 那段。
+    ⚠️ 两条路**不能同时留着**：任务和 .lnk 都会在开机时触发，等于同时起两份
+       `--auto --guard`，两个守护互相不知道对方（一个以为掉线了去重连，
+       另一个也在动），白多一次认证、甚至互踢。所以开的时候建了任务就把 .lnk 清掉。
+    """
+    if not is_frozen():
+        return False, "源码运行时无法设置自启"
+    if on:
+        ok, why = task_create()
+        if not ok:
+            # 建不了任务（组策略禁用、任务计划服务停了、PowerShell 被拦……）
+            # 也必须能用，只是慢一些。界面上照样显示「已开启」，
+            # 退回这件事留在日志里，--selftest 也会报。
+            log("建计划任务失败，退回启动文件夹自启：%s" % why)
+            return set_autostart_lnk(True)
+        _remove_links(autostart_links())
+        return True, ""
+    # 关：两条路都要清，留哪条都会让「已关闭」变成假话
+    _ok_task, why_task = task_delete()
+    _remove_links(autostart_links())
+    if not is_autostart_on():
+        return True, ""
+    return False, why_task or "自启项未能删除"
+
+
+# 升级标记：老版本的自启全在启动文件夹里，升级后要自动换成计划任务。
+# 记一次就够 —— 建任务要拉一次 PowerShell（~1 秒），每次启动都试会拖慢开界面。
+AUTOSTART_UPGRADE_MARK = os.path.join(data_dir(), "autostart-upgrade.json")
+
+
+def autostart_upgrade():
+    """把老版本留在启动文件夹里的自启，升级成登录计划任务。返回 (换了没, 说明)。
+
+    为什么要**自动**做，而不是让用户「取消再勾一次」（2026-09-20 加）：
+        这次修复的全部价值就是「开机后早约 60 秒」。用户升级之后如果自启还挂在
+        启动文件夹上，他明天开机还是等 85 秒 —— 等于没修。
+        升级后第一次运行顺手换掉，才算真的修好。
+
+    源码运行不做：那时 `app_path()` 是脚本路径，建出来的任务会指向 python.exe。
+    """
+    if not is_frozen():
+        return False, ""
+    try:
+        mark = read_json(AUTOSTART_UPGRADE_MARK) or {}
+    except Exception:
+        mark = {}
+    if mark.get("done"):
+        return False, ""
+    links = autostart_links()
+    if not links and not task_exists():
+        # 用户本来就没开自启 —— 别自作主张给他建任务
+        write_json(AUTOSTART_UPGRADE_MARK, {"done": True, "ok": True, "why": "没开自启"})
+        return False, ""
+    # ⚠️ 只有「当前跑的这份 exe 就是用户装的那份」才允许动自启（2026-09-20 踩到，
+    #    真事）：构建脚本的冒烟测试会拿 dist21 里的新 exe 跑一次 --selftest，
+    #    那次运行如果也去迁移，就会把自启指到**构建产物**上、还顺手删掉用户的
+    #    .lnk —— 一次构建就把用户的机器搞坏。判据用 .lnk 自己：它记着用户装在哪。
+    #    ⚠️ 跳过时**绝不能写升级标记** —— 标记在 ProgramData 里是全机共享的，
+    #       写了的话真正装的那份下次启动就被跳过了，修复对用户等于没发生。
+    if links and not all(_lnk_points_to_me(p) is True for p in links):
+        log("自启升级跳过：当前 exe（%s）不是启动文件夹里自启项指向的那份" % app_path())
+        return False, ""
+    st = task_state()
+    if st["exists"] and not task_installed() and not links:
+        # 任务在、但指向别处，又没有 .lnk 可以当参照 —— 不知道用户装的到底是哪份，
+        # 那就不猜。界面会把这种「已失效」显式提示出来，用户取消再勾一次即可。
+        log("自启升级跳过：已有任务指向 %s，当前 exe 是 %s，不确定该用哪个"
+            % (st["command"], app_path()))
+        return False, ""
+    if task_installed():
+        if links:
+            # 任务已经在跑了，.lnk 是残留 —— 留着会和任务同时触发
+            _remove_links(links)
+            log("自启已经是计划任务，清掉了启动文件夹里的残留")
+        write_json(AUTOSTART_UPGRADE_MARK, {"done": True, "ok": True})
+        return False, ""
+    ok, why = task_create()
+    if ok:
+        _remove_links(links)
+        write_json(AUTOSTART_UPGRADE_MARK, {"done": True, "ok": True})
+        log("开机自启已从「启动文件夹」升级为「登录计划任务」（开机后能提前约 60 秒）")
+        return True, ""
+    write_json(AUTOSTART_UPGRADE_MARK, {"done": True, "ok": False, "why": why})
+    log("自启升级成计划任务失败，继续用启动文件夹（会慢约 60 秒）：%s" % why)
+    return False, why
 
 
 # ==================== 使用说明 ====================
@@ -2020,9 +2447,12 @@ HELP_TEXT = (("校园网自动登录 —— 使用说明（v%s）\n" % VERSION) 
     这是学校那边的设置，不是故障。
   · 这个 exe 放在哪个文件夹都能正常用，文件夹名带中文、带空格也没关系；
     账号密码存在系统目录里，不跟着 exe 走。
-  · 但如果把 exe 挪到别的位置，「开机自启」会失效 —— 自启快捷方式记的是原来的
+  · 但如果把 exe 挪到别的位置，「开机自启」会失效 —— 开机自启项记的是原来的
     位置。这时界面会在「开机自启」下面提示你，把那个勾取消、再重新勾一次就好。
     升级到新版本后如果提示「旧设置」，同样处理：取消再重新勾一次。
+  · 「开机自启」是靠系统「任务计划程序」里一个叫 CampusLogin 的任务实现的
+    （开机登录后自动跑一次）。所以任务管理器里的「启动应用」列表看不到它，
+    要去任务计划程序里看。在界面里把勾取消，这个任务会被删掉。
   · 出问题时看日志：C:\ProgramData\CampusLogin\campus-login.log
 """)
 
@@ -2700,7 +3130,7 @@ def run_gui(smoke=False):
         # 否则用户看到的就是一串星号（老版本就是这么显示的）。
         if stale:
             warn_auto.configure(
-                text="⚠ 开机自启的快捷方式指向的是 exe 的「旧位置」，开机时实际不会生效。\n"
+                text="⚠ 开机自启项指向的是 exe 的「旧位置」，开机时实际不会生效。\n"
                      "   把下面的勾取消、再重新勾选一次即可修好。")
             warn_auto.pack(anchor="w", pady=(6, 0))
         elif old_args:
@@ -3122,7 +3552,16 @@ def run_gui(smoke=False):
             show("设置失败：%s" % why, "err")
             return
         refresh_auto_warning()      # 重新勾选之后，警告要跟着消失
-        show("已开启开机自启" if want else "已关闭开机自启", "ok")
+        if not want:
+            show("已关闭开机自启", "ok")
+            return
+        # 说清楚走的是哪条路。只有建不了计划任务时才会退回启动文件夹，
+        # 而那条路要等到开机后约 85 秒（计划任务约 25 秒）—— 不告诉用户的话，
+        # 他下次开机还是会觉得「怎么又这么慢」。
+        if autostart_mode() == "task":
+            show("已开启开机自启", "ok")
+        else:
+            show("已开启开机自启（本机退回用「启动文件夹」，开机会慢约 1 分钟）", "ok")
 
     # --- 启动 ---
     # queue 已在模块顶层导入（poll() 要按名字捕获 queue.Empty）
@@ -3348,6 +3787,14 @@ def main():
         # 用户只看到一张空表单，分不清是"本来就没有旧数据"还是"继承时炸了"。
         log("继承旧数据失败（不影响启动）:\n%s" % traceback.format_exc())
 
+    # 老版本的自启挂在启动文件夹上，开机后要等 85 秒才轮到它（见 AUTOSTART_TASK_NAME
+    # 那段实测）。升级后第一次运行就换成登录计划任务 —— 用户不该为了这次修复
+    # 自己去「取消再勾一次」。
+    try:
+        autostart_upgrade()
+    except Exception:
+        log("自启升级检查失败（不影响启动）:\n%s" % traceback.format_exc())
+
     # 清理上一次自我更新留下的 .old。**必须放在这里**（每次启动都跑）：
     # 替换时旧 exe 正被当前进程占用，删不掉；只能等它退出后、下次启动时清。
     # 失败不影响使用 —— 留一个几 MB 的残留文件而已。
@@ -3381,10 +3828,19 @@ def main():
             "已保存账号数: %s" % n_acct,
             "启动文件夹: %s" % startup_dir(),
             "自启链接: %s" % autostart_links(),
+            # 自启走的是哪条路 —— 这是排查「开机启动慢」的第一手信息。
+            # 计划任务（登录时触发）在开机后约 25 秒跑起来，启动文件夹要等到约 85 秒
+            # （实测见 AUTOSTART_TASK_NAME 那段）。
+            "自启方式: %s" % {"task": "计划任务（登录时触发）",
+                              "lnk": "启动文件夹（比计划任务晚约 60 秒）",
+                              "": "未开启"}[autostart_mode()],
+            "计划任务: %s" % task_def_path(),
+            "计划任务存在: %s" % task_exists(),
             # 这两行是排查「升级了、掉线却还是不重连」的第一手信息：
-            # 多半是 .lnk 还停在旧参数（--auto，没有 --guard）上。
+            # 多半是自启项还停在旧参数（--auto，没有 --guard）上。
             "自启参数: %s" % (autostart_args() or "（读不出来）"),
             "自启参数陈旧: %s" % autostart_outdated(),
+            "自启已失效: %s" % autostart_stale(),
             "守护: %s" % ("在跑（%s）" % g_why if g_running else "没在跑"),
             "本机IP: %s" % local_ipv4(),
             "本机MAC: %s" % local_mac(),

@@ -14,6 +14,16 @@ C.startup_dir = lambda: TMP
 C.is_frozen = lambda: True
 C.app_path = lambda: EXE
 
+# ⚠️ 计划任务那套东西在测试里必须**挡住**：0.3.2 起 set_autostart() 会优先去建
+#    一个真的计划任务，跑一次这个脚本就会在用户机器上留下一个指向真 exe 的
+#    CampusLogin 任务（而且它会在下次登录时真跑起来）。
+#    task_state() 是所有 task_* 判断的唯一入口，把它按成「没这个任务」就够了；
+#    task_create 再按成「建不了」，于是下面的用例走的正是「退回启动文件夹」那条路。
+#    计划任务那条路的逻辑在 [10] 里用假实现单独验。
+C.task_state = lambda: {"exists": False, "command": "", "arguments": "", "logon": False}
+C.task_create = lambda: (False, "测试里不建计划任务")
+C.task_delete = lambda: (True, "")
+
 from pylnk3 import parse  # noqa: E402
 
 
@@ -126,6 +136,91 @@ check("旧参数但目标没变 -> 不算失效（stale=False）", C.autostart_s
 C.set_autostart(True)
 check("重新勾选后 -> 参数不陈旧", C.autostart_outdated() is False)
 C.set_autostart(False)
+
+print("[10] 计划任务优先，建不了才退回启动文件夹")
+# 背景（2026-09-20）：实测同一台机器上，登录触发的计划任务（GHelper / PowerToys）
+# 在开机后 25~27 秒就跑起来了，而启动文件夹里的 .lnk 要等到 85 秒
+# （Windows 先把 HKCU\Run 的 6 项跑完）。所以自启改成优先建计划任务。
+# 真建任务会污染用户机器，这里用假实现验「选路」逻辑本身。
+fake = {"exists": False}
+
+
+def fake_create():
+    fake["exists"] = True
+    return True, ""
+
+
+def fake_delete():
+    fake["exists"] = False
+    return True, ""
+
+
+C.task_state = lambda: {"exists": fake["exists"], "command": EXE,
+                        "arguments": C.AUTOSTART_ARGS, "logon": True}
+C.task_create = fake_create
+C.task_delete = fake_delete
+
+ok, why = C.set_autostart(True)
+check("建了任务 -> ok", ok, why)
+check("任务在 -> is_autostart_on = True", C.is_autostart_on() is True)
+check("任务在 -> autostart_mode = task", C.autostart_mode() == "task")
+# 这条最要紧：任务和 .lnk 同时留着 = 开机时起两份 --auto --guard
+check("任务在时不留 .lnk（否则双触发）", len(C.autostart_links()) == 0, names())
+check("任务在 -> 不算失效", C.autostart_stale() is False)
+check("任务在 -> 参数不陈旧", C.autostart_outdated() is False)
+ok, why = C.set_autostart(False)
+check("关闭 -> ok", ok, why)
+check("关闭 -> 任务没了", fake["exists"] is False)
+check("关闭 -> is_autostart_on = False", C.is_autostart_on() is False)
+check("关闭 -> autostart_mode = ''", C.autostart_mode() == "")
+
+print("[11] 计划任务建不了时，退回启动文件夹也要能用")
+C.task_create = lambda: (False, "模拟：组策略禁用")
+ok, why = C.set_autostart(True)
+check("仍然返回 ok（退回 .lnk）", ok, why)
+check("退回后 .lnk 在", len(C.autostart_links()) == 1, names())
+check("退回后 autostart_mode = lnk", C.autostart_mode() == "lnk")
+C.set_autostart(False)
+check("关闭后清干净", C.is_autostart_on() is False and len(C.autostart_links()) == 0,
+      names())
+
+print("[12] 从别的位置跑时，自启迁移必须**什么都不动**")
+# 背景（2026-09-20 真踩到，一次构建就把用户机器搞坏了）：
+#   build.py 的冒烟测试会拿 dist21 里的新 exe 跑一次 --selftest。那次运行如果
+#   也去做「.lnk 换计划任务」的迁移，就会把自启指向**构建产物**
+#   （...\campus-login-app\dist21\CampusLogin.exe），还顺手删掉用户的 .lnk。
+#   判据：.lnk 记着用户装在哪 —— 当前 exe 不是那一份，就一律别动。
+saved_mark = C.AUTOSTART_UPGRADE_MARK
+C.AUTOSTART_UPGRADE_MARK = os.path.join(TMP, "autostart-upgrade.json")
+fake["exists"] = False
+C.task_state = lambda: {"exists": False, "command": "", "arguments": "", "logon": False}
+C.task_create = fake_create
+C.task_delete = fake_delete
+C.set_autostart_lnk(True)
+check("前置：.lnk 已就位", len(C.autostart_links()) == 1, names())
+
+C.app_path = lambda: os.path.join(TMP, "别处", "校园网自动登录.exe")
+changed, why = C.autostart_upgrade()
+check("从别的位置跑 -> 不迁移", changed is False, why)
+check("从别的位置跑 -> 没建任务", fake["exists"] is False)
+check("从别的位置跑 -> .lnk 还在", len(C.autostart_links()) == 1, names())
+check("从别的位置跑 -> **不写升级标记**（否则真装的那份被跳过）",
+      not os.path.isfile(C.AUTOSTART_UPGRADE_MARK))
+
+C.app_path = lambda: EXE
+changed, why = C.autostart_upgrade()
+check("回到用户装的那份 -> 迁移", changed is True, why)
+check("迁移后任务在", fake["exists"] is True)
+check("迁移后 .lnk 被清掉（留着会双触发）", len(C.autostart_links()) == 0, names())
+check("迁移后写了升级标记", os.path.isfile(C.AUTOSTART_UPGRADE_MARK))
+changed, why = C.autostart_upgrade()
+check("再跑一次 -> 不重复迁移", changed is False, why)
+
+# 收尾：把桩恢复成「没任务、没自启」，别影响后面的判定
+C.AUTOSTART_UPGRADE_MARK = saved_mark
+C.task_state = lambda: {"exists": False, "command": "", "arguments": "", "logon": False}
+fake["exists"] = False
+C.set_autostart_lnk(False)
 
 print("\n结果:", "全部通过" if ok_all else "有失败")
 if ok_all:

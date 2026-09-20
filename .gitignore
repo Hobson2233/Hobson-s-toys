@@ -33,6 +33,11 @@ version_info.txt
 #    （= 没匹配任何规则），而 `git status` 里它是 `??`。当时 secret_scan 报的
 #    就是它 —— 那次报警是**对的**，只是没人去看里面到底是什么。
 build_out*.txt
+# 2026-09-20 补：上面那条只挡 `build_out` 开头的。实际构建时我起过
+# `build_031.txt` / `build_032b.txt` 这种名字 —— 它们**不匹配**那条规则，
+# `git status` 里是 `??`，`git add -A` 照样会把本机绝对路径推上公开仓库。
+# 日志文件名会随手起，所以按「build_*.txt」整类挡掉，别再依赖具体前缀。
+build_*.txt
 
 # ---- Python ----
 __pycache__/

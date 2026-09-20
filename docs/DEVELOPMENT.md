@@ -31,7 +31,7 @@ docs/                   README 用的界面截图与本文件
 | `pwd_gui_test.py` | 密码框真实窗口绑定 | 否（要真桌面） |
 | `geometry_test.py` | 9 种屏幕尺寸下窗口不超出屏幕 | 否 |
 | `proc_tree_test.py` | 进程树与看门狗，含「故意复现孤儿进程」 | 否 |
-| `autostart_test.py` | 开机自启的增删改查、`.lnk` 参数读法、`autostart_stale` / `autostart_outdated` | 否 |
+| `autostart_test.py` | 开机自启的增删改查（**计划任务 + `.lnk` 两条路**）、`.lnk` 参数读法、`autostart_stale` / `autostart_outdated`、**升级迁移不被构建产物污染** | 否 |
 | `guard_test.py` | 守护判断表、守护标记自愈、用户主动退出的避让、`do_auto` 重试、`.lnk` 参数读法 | 否 |
 | `network_state_test.py` | 校园网判定 / MAC 校验 / `network_state` 四态 / 门户 MAC 替换 | 否 |
 | `auto_timing_probe.py` | 把每次 `--auto` 的耗时按阶段拆开（定位「自启慢」慢在哪一段） | 否（诊断用） |
@@ -44,6 +44,8 @@ docs/                   README 用的界面截图与本文件
 跑测试要用**带 PyInstaller 的解释器**（`leak_check` / `help_check` / `portability_check` 依赖它）。
 `autostart_test.py` / `guard_test.py` 要写 `.lnk`，需要 **pylnk3**，只有 `envs/gui314` 里有 ——
 缺依赖时 `guard_test.py` 会明确报错退出（码 3），**不会静默跳过**那几条断言。
+`autostart_test.py` 会把 `task_state` / `task_create` / `task_delete` 换成桩（**不碰真实的计划任务**），
+但它**真的会读写启动文件夹里的 `.lnk`** —— 跑完记得核一眼自启状态。
 
 构建门槛的细节：`build.py` 的第 2 步（冒烟测试）里，密码框接线自检失败会输出 `GUI_FAIL`
 标记，`build.py` 见到该标记即判失败；`wiring_gate_test.py` 专门验这条报警链路本身通不通。
@@ -122,6 +124,47 @@ python savepoint.py diff                       # 先看看现在跟存档差在�
 > `git prune`（任何形式，连默认两周宽限期的普通版也会）会把整个对象库清空，
 > `git status` 报 `fatal: bad object HEAD`，连初始提交都没了。
 > 清快照用 `tidy`（只删引用，不碰对象）。
+
+## 开机自启：为什么用计划任务，而不是启动文件夹
+
+2026-09-20 用本机事件日志逐帧量出来的同一次开机：
+
+| 时刻 | 事件 | 来源 |
+|---|---|---|
+| 09:32:33.5 | OS 启动 | `Kernel-General` id=12 |
+| 09:32:52.7 | 用户登录 | `Winlogon` id=1 |
+| 09:32:57.3 | `GHelper.exe` | 计划任务（登录时触发） |
+| 09:32:59.3 | `PowerToys.exe` | 计划任务（登录时触发） |
+| 09:33:13.3 | 桌面就绪 | `Shell-Core` id=9648 |
+| 09:33:38.0 | `HKCU\...\Run` 第一项才开始跑 | `Shell-Core` id=9705 |
+| 09:33:58.2 | **我们**（启动文件夹的 `.lnk`） | 同上 |
+
+登录触发的计划任务在开机后 **25 秒** 就跑起来了，启动文件夹要等到 **85 秒**，差 **约 60 秒**。
+而程序自己跑完认证只要 **0.3 秒**（onefile 解压另算约 2 秒）——
+**慢的从来不是认证逻辑，是「什么时候轮到我们」。**
+
+所以自启改成：优先在任务计划程序里建一个叫 `CampusLogin` 的**登录触发**任务，
+建不了（策略限制等）才退回启动文件夹的 `.lnk`。两条路**互斥** ——
+建了任务就删掉 `.lnk`，否则会同时触发两份。
+
+几个实现要点：
+
+- 任务定义文件 `C:\Windows\System32\Tasks\CampusLogin` **普通用户能按名字直接 `open()` 读**
+  （UTF-16LE，含明文 command / arguments），但 `os.listdir` 那个目录会被拒绝访问 ——
+  所以判断自启状态**不用拉 PowerShell**（省约 1 秒）。见 `task_state()`。
+- 建任务走 `Register-ScheduledTask -Xml`，XML 必须是 **UTF-16LE + BOM**。
+  `MultipleInstancesPolicy=IgnoreNew`、`DisallowStartIfOnBatteries=false`、
+  `ExecutionTimeLimit=PT0S` 都要显式写 —— 默认值分别是「再起一份」「拔电就不跑」「72 小时」。
+- 注册成功**不代表任务长对了** → `task_create()` 建完立刻回读核对 command / arguments / trigger。
+- 老用户升级迁移在 `autostart_upgrade()`：第一次跑 0.3.2 时把 `.lnk` 换成任务，
+  用 `C:\ProgramData\CampusLogin\autostart-upgrade.json` 记「做过了」。
+
+> 🔴 **别让构建的冒烟测试污染用户的自启。** `build.py` 会拿 `distN/CampusLogin.exe` 跑一次
+> `--selftest`，那次运行如果也去迁移，就会把自启指到**构建产物**上、还顺手删掉用户的 `.lnk`，
+> 一次构建就把用户的机器搞坏（2026-09-20 真踩到）。所以 `autostart_upgrade()` 有两道守卫：
+> ① `.lnk` 存在但不是全部指向当前 exe → 跳过；② 任务存在、指向别处、又没有 `.lnk` 可参照 → 跳过。
+> **跳过时绝不能写升级标记** —— 标记是全机共享的，写了真正装的那份下次就被跳过，
+> 修复对用户等于没发生。回归用例见 `autostart_test.py [12]`。
 
 ## 发布
 
