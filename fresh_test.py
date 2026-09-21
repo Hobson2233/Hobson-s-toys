@@ -41,6 +41,10 @@ C.ACCOUNTS_FILE = os.path.join(TMP, "accounts.json")
 C.LOG_FILE = os.path.join(TMP, "campus-login.log")
 C.RESULT_FILE = os.path.join(TMP, "last-result.json")
 C.LEGACY_DIR = NOPE
+# 「清过凭据」标记（0.3.5 加）也要指到临时目录：它是模块级常量，不拦住的话
+# migrate_legacy_data() 会去看**真实**数据目录里有没有它 —— 那台机器上清过
+# 一次凭据，这个测试的行为就跟着变了，等于测试依赖了运行环境。
+C.PURGED_FLAG = os.path.join(TMP, "purged.flag")
 # 关键：把「所有老位置」都指到不存在的地方。只改 LEGACY_DIR 已经不够了 ——
 # 迁移还会去读 %APPDATA%\CampusLogin，本机那儿是有数据的。
 C.legacy_data_dirs = lambda: [NOPE]

@@ -54,7 +54,7 @@ APP_TITLE = "校园网自动登录"
 # ⚠️ 这里是**唯一来源**。界面标题、使用说明、--version、--selftest、
 #    以及 exe 文件属性里的版本，全部由它推导 —— 不要在别处另写一份，
 #    否则迟早漂移（改了一处忘了另一处，用户看到的版本号就是错的）。
-VERSION = "0.3.4"
+VERSION = "0.3.5"
 
 # 学校 portal 默认参数（拷到同校其他电脑上可直接用）
 DEFAULTS = {
@@ -261,6 +261,12 @@ LEGACY_DIR = r"C:\tools"          # 最老的 PowerShell 版部署位置，首�
 # 本机保存过的隐私文件清单（--purge 用；显式列举，不用通配符）
 PRIVATE_FILES = ("config.json", "accounts.json", "last-result.json",
                  "campus-login.log", "selftest.txt", "guitest.txt")
+
+# 「用户清过凭据」的标记。
+# ⚠️ **故意不放进 PRIVATE_FILES** —— purge 自己不能删它，否则下次启动
+#    migrate_legacy_data() 又会把旧位置的账号继承回来，等于白清。
+#    它本身不含任何账号信息，就是个带时间戳的小文件。
+PURGED_FLAG = os.path.join(data_dir(), "purged.flag")
 
 
 def legacy_data_dirs():
@@ -478,6 +484,13 @@ def migrate_legacy_data():
     """
     if os.path.isfile(CONFIG_FILE):
         return False
+    # 用户明确清过凭据 → 不再自动继承。
+    # 没有这一条的话，界面上的「清除本机保存的账号密码」就是假的：清完重启，
+    # 账号会从旧位置原样继承回来（2026-09-21 用 probes/_purge_reinherit.py
+    # 实测复现过，连密码都一起回来了）。
+    if os.path.isfile(PURGED_FLAG):
+        log("本机凭据被用户清除过，跳过旧数据继承")
+        return False
     dst = os.path.abspath(data_dir())
     for src in legacy_data_dirs():
         if not src or os.path.abspath(src) == dst:
@@ -500,24 +513,89 @@ def migrate_legacy_data():
     return False
 
 
-def purge_local_data():
-    """清除本机保存的账号密码等隐私数据。返回 (数据目录, 实际删掉的文件名)。
+def purge_local_data(legacy=True):
+    """清除本机保存的账号密码等隐私数据。返回 (数据目录, 实际删掉的名字, 删不掉的)。
 
     只删 PRIVATE_FILES 里明确列出的文件 —— 不用通配符、不递归删目录，
     免得误伤。数据目录本身留着（里面已经空了，下次运行会照常重建）。
+
+    legacy=True 时**连旧位置一起清**（%APPDATA%\\CampusLogin、C:\\tools）。
+    为什么必须带上它们（2026-09-21 实测复现）：旧位置那份 config.json 是上一版
+    exe 写的，migrate_legacy_data() 一直在拿它做继承；只清新位置的话，用户重启
+    程序就会看到「账号又自己回来了」—— 因为 migrate 的判据正是「新位置没有
+    config.json」，而清凭据恰好制造了这个条件。清不干净等于没清。
     """
     d = data_dir()
     removed, failed = [], []
-    for n in PRIVATE_FILES:
-        p = os.path.join(d, n)
+    targets = [(d, n) for n in PRIVATE_FILES]
+    if legacy:
+        cur = os.path.abspath(d)
+        for src in legacy_data_dirs():
+            if not src or os.path.abspath(src) == cur:
+                continue
+            targets += [(src, n) for n in PRIVATE_FILES]
+    for base, n in targets:
+        p = os.path.join(base, n)
         if not os.path.isfile(p):
             continue
+        # 旧位置的文件名和主目录重名，得标上目录才分得清是哪一个被删了 ——
+        # 否则界面上只会看到两个「config.json」，用户没法判断清干净没有。
+        label = (n if os.path.abspath(base) == os.path.abspath(d)
+                 else os.path.join(base, n))
         try:
             os.remove(p)
-            removed.append(n)
+            removed.append(label)
         except Exception as e:
-            failed.append("%s(%s)" % (n, e))
+            failed.append("%s(%s)" % (label, e))
     return d, removed, failed
+
+
+def purge_local_data_with_marker():
+    """清凭据的完整动作：先盖「用户主动退出」标记，再删文件。
+
+    返回值和 purge_local_data() 一样 (数据目录, 删掉的, 删不掉的)。
+
+    ⚠️ **顺序不能反**，所以把它抽成一个函数 —— 界面和命令行都只调这里，
+    全项目就只有这一处需要保证顺序。
+    （2026-09-21 记一笔：反过来的话，purge 刚删掉的 accounts.json 又会被
+      note_logout 重建出来 —— 用户看到「已清除」，磁盘上却还留着一个文件。）
+
+    标记在这里的作用是**盖住那最多 30 秒的窗口**：守护每 poll 秒才醒一次，
+    醒来的第一件事虽然是查凭据还在不在（guard_should_exit_for_purge），
+    但万一它这一拍先走到了重连判定，「刚主动退出过」就能拦住它拿着内存里
+    那份密码再登一次 —— 用户刚点完清除，不该看到它又登回去。
+    """
+    note_logout()
+    d, removed, failed = purge_local_data()
+    # 最后留一个「用户清过凭据」的标记。删旧位置是尽力而为（权限、占用都可能
+    # 让它失败），万一有文件没删掉，这个标记就是第二道闸 —— migrate_legacy_data()
+    # 看到它就不会再把账号继承回来。写不进去也不影响本次清除的结果。
+    try:
+        with open(PURGED_FLAG, "w", encoding="utf-8") as f:
+            f.write(datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    except Exception:
+        log("写清除标记失败（不影响本次清除）:\n%s" % traceback.format_exc())
+    return d, removed, failed
+
+
+def guard_should_exit_for_purge():
+    """守护要不要因为「本机凭据已被用户清除」而退出。
+
+    为什么需要它（2026-09-21 加）：界面上的「清除本机保存的账号密码」删的是
+    **磁盘上的文件**，而守护是**另一个进程** —— 它在启动时就把账号密码读进了
+    内存（run_guard 里的 uid / pwd 是循环外的局部变量，整个 30 分钟都不重读）。
+    光删文件的话，那个进程内存里还留着一份密码，还要再跑最多半小时。
+    用户点的是「清除」，程序里却还有一份，这不能算清干净。
+
+    判据**只认「凭据文件不存在」这一个事实**：
+      · 不用 load_config() 的结果 —— 它读失败、解析失败时同样返回空密码，
+        磁盘抖动一下就会让守护误退，而后果是「掉线再也没人重连」。
+      · 文件真被删掉，才是明确的「用户清了凭据」。
+
+    ⚠️ 这是**长命进程里才跑得到**的判定：--selftest 走不到守护循环，
+       所以它必须有独立的测试（见 updtest_purge.py），否则等于零覆盖。
+    """
+    return not os.path.isfile(CONFIG_FILE)
 
 
 # ==================== 网络 ====================
@@ -1468,12 +1546,22 @@ def run_guard(seconds=GUARD_SECONDS, poll=GUARD_POLL):
     streak = 0        # 连续「测不出是否联网」的次数
     fails = 0         # 连续重连失败次数
     next_beat = time.time() + 300
+    # 退出原因。最后那行日志要**如实**说 —— 写死「已跑满 N 秒」的话，因为
+    # 凭据被清除而提前退出时日志会撒谎，排查的人会被这行带偏。
+    why_exit = "已跑满 %d 秒" % seconds
     while True:
         left = deadline - time.time()
         if left <= 0:
             break
         time.sleep(min(poll, left))
         if time.time() >= deadline:
+            break
+        # 用户可能在守护运行期间清了本机凭据（设置页最下面那个入口）。凭据没了，
+        # 这个进程既没有账号可用、也没理由继续把内存里那份密码留着 —— 自己退掉。
+        # 放在循环体最前面（在 try 之外）：它不该被下面那个「异常也不能让循环挂掉」
+        # 的兜底吞掉，而且要先于任何联网动作生效。
+        if guard_should_exit_for_purge():
+            why_exit = "本机凭据已被清除"
             break
         try:
             if time.time() >= next_beat:
@@ -1517,7 +1605,7 @@ def run_guard(seconds=GUARD_SECONDS, poll=GUARD_POLL):
             # 守护里任何异常都不能让循环挂掉 —— 挂了就再也没人重连了，
             # 而且用户只会看到「又掉线了」，日志里什么线索都没有。
             log("守护循环异常（已忽略，继续）:\n%s" % traceback.format_exc())
-    log("=== 守护结束（已跑满 %d 秒）===" % seconds)
+    log("=== 守护结束（%s）===" % why_exit)
     try:
         os.remove(GUARD_FLAG)
     except OSError:
@@ -2418,8 +2506,10 @@ HELP_TEXT = (("校园网自动登录 —— 使用说明（v%s）\n" % VERSION) 
   所以把「校园网自动登录.exe」这一个文件拷给别人，
   不会带出你的账号、密码和登录记录。
 
-  想在本机彻底清掉账号密码，在命令行执行：
-      校园网自动登录.exe --purge
+  想在本机彻底清掉账号密码，点界面最下面那个
+  「清除本机保存的账号密码」（命令行也可以：--purge）。
+  清掉之后要重新输入账号密码才能登录；如果开机自启还开着，
+  建议把那个勾也取消掉 —— 否则开机时会跑一次但登不上（没账号了）。
 
 
 【检查更新】
@@ -2439,6 +2529,10 @@ HELP_TEXT = (("校园网自动登录 —— 使用说明（v%s）\n" % VERSION) 
 
   为什么升级前要「校验」：下载下来的文件会跟发布方公布的哈希值对一遍，
   对不上就直接丢掉，不会装一个来路不明的文件。
+
+  更新包从哪来：hobson2233.dpdns.org（就是本程序的发布站）。
+  主站查不到版本号时会回退到 GitHub 查一次，但**下载始终只走主站** ——
+  不会从别的地方拉文件下来装进你的电脑。
 
   如果显示「检查更新失败」，多半是当时网络不通，稍后再点一次就行。
   注意：**失败时会明确说「失败」，不会含糊地显示「已是最新版本」。**
@@ -2485,6 +2579,7 @@ SWITCH_HELP = r"""
   --version / -v      显示版本号，然后退出
                       （打包版没有终端，会弹一个窗口显示）
   --purge             清掉本机保存的账号密码；退出码 0=清干净了，1=有文件删不掉
+                      （界面最下面的「清除本机保存的账号密码」是同一个操作）
   --selftest          打一份环境自检：版本、数据目录、自启参数、本机 IP、
                       联没联网、在不在校园网、更新地址……
                       结果同时写到数据目录下的 selftest.txt
@@ -3222,6 +3317,27 @@ def run_gui(smoke=False):
         else:
             warn_auto.pack_forget()
 
+    # --- 隐私 / 清除本机凭据 ---
+    # 为什么要有这个入口（2026-09-21）：以前清凭据只有命令行 `--purge`，
+    # 对普通用户等于没有 —— 他要的是「别让这台电脑再留着我的密码」，
+    # 不该逼他先学会开终端。
+    # 做成和「检查更新」同款的小链接，**不新增第四个主按钮**（主按钮固定三个
+    # 是界面铁律；这里也不进 set_busy 的控件元组 —— 忙碌拦截由 on_purge 自己做）。
+    tk.Frame(inner, bg="#eef0f3", height=1).pack(fill="x", pady=(20, 14))
+    lbl(inner, "隐私", SMALL, True, SUB).pack(anchor="w", pady=(0, 6))
+    lbl(inner, "账号密码只存在这台电脑上，不会上传到任何服务器。",
+        SMALL, fg="#666").pack(anchor="w")
+    btn_purge = tk.Label(inner, text="清除本机保存的账号密码",
+                         font=(fam, SMALL, "underline"),
+                         fg="#c0392b", bg="#fdeceb", cursor="hand2",
+                         padx=7, pady=1)
+    btn_purge.pack(anchor="w", pady=(8, 0))
+    # 和版本号那行同一个道理：光绑 cursor 是没用的 —— 截图里它跟普通灰字
+    # 一模一样，用户根本不会去点。下划线 + 浅红底 + hover 加深，才看得出能点。
+    btn_purge.bind("<Enter>", lambda e: btn_purge.configure(bg="#fbdcd9"))
+    btn_purge.bind("<Leave>", lambda e: btn_purge.configure(bg="#fdeceb"))
+    btn_purge.bind("<Button-1>", lambda e: on_purge())
+
     # --- 状态 ---
     state = {"busy": False, "queue": None, "buttons": None,
              # 升级用的临时状态。都要走界面线程，所以放在这里而不是局部变量。
@@ -3394,9 +3510,10 @@ def run_gui(smoke=False):
                     v = info["version"]
                     ok = messagebox.askyesno(
                         APP_TITLE,
-                        "发现新版本 v%s。\n\n%s\n\n是否现在下载并升级？\n"
+                        "发现新版本 v%s。\n\n%s\n\n%s\n\n是否现在下载并升级？\n"
                         "（升级过程会关闭当前窗口，稍后自动重开）" % (
-                            v, info.get("notes") or "无更新说明"))
+                            v, info.get("notes") or "无更新说明",
+                            updater.source_hint()))
                     if not ok:
                         show("已跳过升级，当前仍是 v%s" % VERSION, "info")
                         set_busy(False)
@@ -3411,7 +3528,9 @@ def run_gui(smoke=False):
                     root.update_idletasks()
                     restart_self()
                 else:
-                    show(updater.describe(st, info),
+                    # 结果里带上更新源：用户是自己点「检查更新」才看到这行的，
+                    # 不存在打扰；而他有权知道这程序在跟哪个地址说话。
+                    show(updater.describe(st, info) + "\n" + updater.source_hint(),
                          "ok" if st in (updater.STATE_CURRENT,) else "info")
                     set_busy(False)
             except Exception:
@@ -3583,6 +3702,58 @@ def run_gui(smoke=False):
         upsert(f[0], f[1], True)
         load_all()
         show("已保存", "ok")
+
+    def on_purge():
+        """清除本机保存的账号密码（设置页最下面那个入口）。
+
+        ⚠️ 顺序**不能反**：先 note_logout()、再 purge_local_data()。
+           · note_logout() 写的是 accounts.json —— 而 purge 会把这个文件删掉。
+             反过来的话，purge 刚删完又被 note_logout 重建出来，等于没清干净。
+           · 它在这里的作用是**盖住那 30 秒窗口**：守护最多每 30 秒才醒一次，
+             醒来的第一件事虽然是查凭据还在不在（guard_should_exit_for_purge），
+             但万一它这一拍先走到了重连判定，「刚主动退出过」这个标记能拦住它
+             拿着内存里那份密码再登一次 —— 用户刚点完清除，不该看到它又登回去。
+        """
+        if state["busy"]:
+            show("正在处理上一个操作，请稍候", "info")
+            return
+        d = data_dir()
+        try:
+            running, _why = guard_running()
+        except Exception:
+            running = False
+        # 守护在跑要单独说一句：它是**另一个进程**，删文件删不掉它内存里那份，
+        # 得等它自己退（最多 30 秒）。不说明的话，用户以为点完就立刻干净了。
+        extra = ("\n\n现在有守护进程正在运行：凭据会被删掉，它最多 30 秒后自己退出，"
+                 "不会拿着内存里的密码再去登录。") if running else ""
+        if not messagebox.askyesno(
+                APP_TITLE,
+                "确定要清除本机保存的账号密码吗？\n\n"
+                "会删掉这个目录里的账号、密码、登录记录和日志：\n%s\n\n"
+                "删掉之后要重新输入账号密码才能登录。\n"
+                "开机自启如果还开着，开机时会跑一次但登不上（没账号了），"
+                "建议把那个勾也取消掉。\n\n"
+                "只影响这台电脑，不影响你的校园网账号本身。%s" % (d, extra)):
+            return
+        try:
+            _d, removed, failed = purge_local_data_with_marker()
+        except Exception:
+            log("清除本机账号数据失败:\n%s" % traceback.format_exc())
+            show("清除失败，请查看日志", "err")
+            return
+        # 界面上别留残影：输入框里的账号密码、列表里的账号都得跟着消失，
+        # 否则用户看到「清除成功」但屏幕上还写着他的学号，会怀疑根本没清。
+        var_uid.set("")
+        pwd_field.set("")
+        render_accounts()
+        if failed:
+            show("有文件没删掉：%s\n（可能被别的程序占着，过一会儿再试一次）"
+                 % "、".join(failed), "err")
+            return
+        show("已清除本机保存的账号密码%s。\n"
+             "守护进程如果正在运行，它会在 30 秒内自己退出。"
+             % ("（删掉了 %s）" % "、".join(removed) if removed else "（本来就没有）"),
+             "ok")
 
     def action_runner(fn):
         """跑一个 do_* 动作，把 (退出码, 给用户看的一句话) 交回主线程"""
@@ -3888,7 +4059,7 @@ def main():
     # 必须在继承旧数据**之前**处理：否则刚继承进来的账号又被这里删掉，
     # 顺序反了会让人以为清除失败（或者以为继承成功）。
     if "--purge" in args:
-        d, removed, failed = purge_local_data()
+        d, removed, failed = purge_local_data_with_marker()
         print("已清除本机保存的账号数据：%s" % ("、".join(removed) if removed else "（本来就没有）"))
         if failed:
             print("以下文件删除失败：%s" % "、".join(failed))
@@ -4023,12 +4194,16 @@ def main():
     if "--checkupdate" in args:
         st, info = updater.check(VERSION)
         text = "检查更新: %s" % updater.describe(st, info)
+        # 更新源也打出来 / 落盘：这个开关本来就是给排障和脚本用的，
+        # 「到底在跟哪个地址说话」是排查「检查更新失败」时的第一个问题。
+        hint = updater.source_hint()
         print(text)
+        print(hint)
         try:
             with open(os.path.join(data_dir(), "checkupdate.txt"), "w",
                       encoding="utf-8") as f:
-                f.write("%s\n状态: %s\n清单地址: %s\n" % (
-                    text, st, updater.MANIFEST_URL))
+                f.write("%s\n%s\n状态: %s\n清单地址: %s\n" % (
+                    text, hint, st, updater.MANIFEST_URL))
         except Exception:
             log("checkupdate.txt 写入失败:\n%s" % traceback.format_exc())
         exit_now(0 if st in (updater.STATE_CURRENT, updater.STATE_NEWER) else 1)
