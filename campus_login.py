@@ -54,7 +54,7 @@ APP_TITLE = "校园网自动登录"
 # ⚠️ 这里是**唯一来源**。界面标题、使用说明、--version、--selftest、
 #    以及 exe 文件属性里的版本，全部由它推导 —— 不要在别处另写一份，
 #    否则迟早漂移（改了一处忘了另一处，用户看到的版本号就是错的）。
-VERSION = "0.3.5"
+VERSION = "0.3.6"
 
 # 学校 portal 默认参数（拷到同校其他电脑上可直接用）
 DEFAULTS = {
@@ -2841,10 +2841,23 @@ def pwd_wiring_check(field, loaded=None):
 # 抽成纯函数是为了能测：这段算错在受控会话里很难复现（要改屏幕分辨率），
 # 而它恰恰是「小屏幕上底部控件够不到」这类问题的根源。
 
-OUTER_PAD = 18      # 最外层留白
-INNER_PAD = 20      # 卡片内留白
-EXTRA_H = 40        # 给标题栏/边框留的余量
+OUTER_PAD = 14      # 最外层留白
+INNER_PAD = 14      # 卡片内留白
+# 0.3.6 起改成 0。它原本记的是「给标题栏/边框留的余量」，但 Tk 的
+# `geometry("WxH")` 里的 H **就是客户区高度、不含标题栏**（实测：
+# 传 851 → winfo_height()=851、holder 实际也拿到 851-28=823）。
+# 也就是说这 40px 从来不是被标题栏吃掉的，而是一路变成卡片底部的空白 ——
+# 实测 holder 需要 783、实际给到 783，客户区 851 里有 68px（28 外层留白
+# + 40 这个 EXTRA_H）全是富余。窗口不吃紧时无所谓，在 16:10 上就是白高 40px。
+# 留着这个常量是为了不改调用点的签名，值归零即「不再额外加高」。
+EXTRA_H = 0
 SCREEN_MARGIN_H = 80    # 给任务栏 + 标题栏留的余量
+# 窗口高度最多占屏幕的比例。0.85 —— 留出上方标题栏和下方任务栏，也让窗口
+# 四周有点桌面透出来，不至于「贴满上下沿」。**这个比例就是「16:10 屏上显得
+# 太长」的正解**：16:10 的高本来就只有宽的 62.5%，如果高度再按内容硬撑，
+# 就会一路顶到屏幕边。按下限和上限同时收口，窗口才是「跟着屏幕走」的。
+SCREEN_H_RATIO = 0.85
+MIN_H = 560         # 再矮也不小于这个（低于它就一定挂滚动条了）
 
 
 def window_geometry(sw, sh, reqh):
@@ -2859,12 +2872,25 @@ def window_geometry(sw, sh, reqh):
     在 1366x768、或者 1080p 开了 150% 缩放（虚拟化后只剩 720 高）这类屏幕上，
     窗口会比屏幕还高。要是界面又没滚动条，底部的「开机自启」就永远够不到，
     那是**真的没法开自启**，不只是难看。
+
+    **高度上限还要按屏幕比例收。** 0.3.5 的写法上限是个死数 1000：在 16:10 的
+    笔记本屏上（2560x1600 @150% → Tk 只看到 1707x1067），内容需要 887px，
+    算出来 963px 窗口，占掉屏高的 90% —— 上下几乎没有余量，看着又高又挤。
+    改成 `sh * SCREEN_H_RATIO` 之后，窗口高度跟着屏幕走：大屏不再顶满，
+    小屏仍然被 `sh - SCREEN_MARGIN_H` 兜住。**上限取两者更严的那个**，
+    所以「绝不超出屏幕」这条原有保证一点没松。
+
+    **高度不再额外加 EXTRA_H。** 见上面常量的说明：`geometry` 的高就是客户区，
+    再 +40 只会变成卡片底部的空白。现在 `h` 直接等于内容需要的高度
+    （或上限，谁小听谁的）—— 实测客户区 851 里那 68px 富余全部消失。
     """
     max_w = max(360, sw - 40)
     max_h = max(320, sh - SCREEN_MARGIN_H)
+    # 比例上限和绝对上限取更严的：大屏上比例生效，小屏上 sh-80 生效。
+    ratio_h = int(sh * SCREEN_H_RATIO) if sh > 0 else max_h
 
     w = max(820, min(1180, int(sw * 0.44)))
-    h = max(560, min(1000, reqh + EXTRA_H))
+    h = max(MIN_H, min(ratio_h, max_h, reqh + EXTRA_H))
     w = min(w, max_w)
     h = min(h, max_h)          # 屏幕装不下就按屏幕来，宁可小也不要跑出屏幕
 
@@ -3199,8 +3225,10 @@ def run_gui(smoke=False):
     root.bind("<MouseWheel>", on_wheel)
 
     # 标题行：「使用说明」放最右边，紧挨着窗口右上角的最小化按钮下方
+    # ⚠️ 这里的间距值在 0.3.6 统一收紧过（14→10 这类），原因见 window_geometry
+    # 的说明：16:10 屏上窗口本来就吃紧，每一段 pady 都在叠加成「太高」。
     head = tk.Frame(inner, bg=CARD)
-    head.pack(fill="x", pady=(0, 14))
+    head.pack(fill="x", pady=(0, 10))
     lbl(head, "%s · 设置" % APP_TITLE, TITLE, True).pack(side="left")
     # 版本号紧跟在标题右边，小字弱色。用户要报问题时第一眼就能看到它。
     # **同时它也是「检查更新」的入口**（做成链接样式的小字，不新增第四个按钮 ——
@@ -3226,32 +3254,32 @@ def run_gui(smoke=False):
 
     # --- 状态条 ---
     status = tk.Frame(inner, bg="#eef4fb")
-    status.pack(fill="x", pady=(0, 16))
+    status.pack(fill="x", pady=(0, 12))
     dot = tk.Canvas(status, width=12, height=12, bg="#eef4fb", highlightthickness=0)
-    dot.pack(side="left", padx=(14, 10), pady=11)
+    dot.pack(side="left", padx=(14, 10), pady=8)
     dot_id = dot.create_oval(0, 0, 11, 11, fill="#bbbbbb", outline="")
     status_text = lbl(status, "正在检测网络状态…", BASE, bg="#eef4fb", fg="#0c5460")
-    status_text.pack(side="left", pady=11)
+    status_text.pack(side="left", pady=8)
 
     # --- 账号列表 ---
-    lbl(inner, "已保存的账号", SMALL, True, SUB).pack(anchor="w", pady=(0, 6))
+    lbl(inner, "已保存的账号", SMALL, True, SUB).pack(anchor="w", pady=(0, 4))
     list_box = tk.Frame(inner, bg=CARD, highlightbackground="#e3e6ea", highlightthickness=1)
     list_box.pack(fill="x")
     list_inner = tk.Frame(list_box, bg=CARD)
     list_inner.pack(fill="x")
 
     # --- 表单 ---
-    lbl(inner, "账号信息", SMALL, True, SUB).pack(anchor="w", pady=(16, 2))
-    lbl(inner, "学号 / 账号", BASE, fg="#444").pack(anchor="w", pady=(8, 0))
+    lbl(inner, "账号信息", SMALL, True, SUB).pack(anchor="w", pady=(12, 2))
+    lbl(inner, "学号 / 账号", BASE, fg="#444").pack(anchor="w", pady=(6, 0))
     var_uid = tk.StringVar()
     ent_uid = tk.Entry(inner, textvariable=var_uid, font=(fam, BASE), relief="solid", bd=1)
-    ent_uid.pack(fill="x", ipady=6, pady=(4, 0))
-    lbl(inner, "密码", BASE, fg="#444").pack(anchor="w", pady=(10, 0))
+    ent_uid.pack(fill="x", ipady=5, pady=(3, 0))
+    lbl(inner, "密码", BASE, fg="#444").pack(anchor="w", pady=(8, 0))
 
     # --- 密码框（带隐私保护）---
     # 规则都在 PasswordField 里（那样才能单独建窗口测交互），这里只负责摆放。
     pwd_field = PasswordField(inner, tk, (fam, BASE), (fam, SMALL), FG)
-    pwd_field.box.pack(fill="x", pady=(4, 0))
+    pwd_field.box.pack(fill="x", pady=(3, 0))
 
     # --- 按钮（从上到下排列，每个占一整行）---
     def mkbtn(parent, text, cmd, kind="ghost"):
@@ -3264,11 +3292,11 @@ def run_gui(smoke=False):
                       bg=style[0], fg=style[1], activebackground=style[2],
                       activeforeground=style[1], relief="flat", bd=0, cursor="hand2",
                       disabledforeground="#9aa0a6")
-        b.pack(fill="x", pady=(0, 8), ipady=9)
+        b.pack(fill="x", pady=(0, 6), ipady=7)
         return b
 
     btns = tk.Frame(inner, bg=CARD)
-    btns.pack(fill="x", pady=(18, 0))
+    btns.pack(fill="x", pady=(14, 0))
     btn_switch = mkbtn(btns, "切换到此账号", lambda: on_switch(), "primary")
     btn_save = mkbtn(btns, "仅保存", lambda: on_save())
     btn_out = mkbtn(btns, "退出当前账号", lambda: on_logout(), "danger")
@@ -3276,12 +3304,13 @@ def run_gui(smoke=False):
     # --- 消息 ---
     msg = lbl(inner, "", BASE, bg="#e8f2fb", fg="#0c5460", anchor="w", justify="left",
               wraplength=760)
-    msg.pack(fill="x", ipady=10, pady=(16, 0))
+    msg.pack(fill="x", ipady=8, pady=(10, 0))
     msg.pack_forget()
 
     # --- 开机自启 ---
-    tk.Frame(inner, bg="#eef0f3", height=1).pack(fill="x", pady=(20, 14))
-    lbl(inner, "开机自启", SMALL, True, SUB).pack(anchor="w", pady=(0, 6))
+    # 分隔带从 (20,14) 收到 (12,10)：0.3.6 统一收紧竖向间距
+    tk.Frame(inner, bg="#eef0f3", height=1).pack(fill="x", pady=(12, 10))
+    lbl(inner, "开机自启", SMALL, True, SUB).pack(anchor="w", pady=(0, 4))
     var_auto = tk.BooleanVar()
     chk = tk.Checkbutton(inner, text="开机时自动登录校园网", variable=var_auto,
                          command=lambda: on_toggle_autostart(), bg=CARD, fg="#333",
@@ -3323,15 +3352,15 @@ def run_gui(smoke=False):
     # 不该逼他先学会开终端。
     # 做成和「检查更新」同款的小链接，**不新增第四个主按钮**（主按钮固定三个
     # 是界面铁律；这里也不进 set_busy 的控件元组 —— 忙碌拦截由 on_purge 自己做）。
-    tk.Frame(inner, bg="#eef0f3", height=1).pack(fill="x", pady=(20, 14))
-    lbl(inner, "隐私", SMALL, True, SUB).pack(anchor="w", pady=(0, 6))
+    tk.Frame(inner, bg="#eef0f3", height=1).pack(fill="x", pady=(12, 10))
+    lbl(inner, "隐私", SMALL, True, SUB).pack(anchor="w", pady=(0, 4))
     lbl(inner, "账号密码只存在这台电脑上，不会上传到任何服务器。",
         SMALL, fg="#666").pack(anchor="w")
     btn_purge = tk.Label(inner, text="清除本机保存的账号密码",
                          font=(fam, SMALL, "underline"),
                          fg="#c0392b", bg="#fdeceb", cursor="hand2",
                          padx=7, pady=1)
-    btn_purge.pack(anchor="w", pady=(8, 0))
+    btn_purge.pack(anchor="w", pady=(6, 0))
     # 和版本号那行同一个道理：光绑 cursor 是没用的 —— 截图里它跟普通灰字
     # 一模一样，用户根本不会去点。下划线 + 浅红底 + hover 加深，才看得出能点。
     btn_purge.bind("<Enter>", lambda e: btn_purge.configure(bg="#fbdcd9"))
@@ -3394,7 +3423,7 @@ def run_gui(smoke=False):
         ids.sort(key=lambda k: (store["accounts"][k].get("lastSuccess") or "", k), reverse=True)
 
         if not ids:
-            lbl(list_inner, "暂无保存的账号", SMALL, fg="#999").pack(anchor="w", padx=14, pady=12)
+            lbl(list_inner, "暂无保存的账号", SMALL, fg="#999").pack(anchor="w", padx=14, pady=9)
             return
         for i, uid in enumerate(ids):
             a = store["accounts"][uid]
@@ -3403,7 +3432,7 @@ def run_gui(smoke=False):
             if i:
                 tk.Frame(list_inner, bg="#eef0f3", height=1).pack(fill="x")
             left = tk.Frame(row, bg=CARD)
-            left.pack(side="left", fill="x", expand=True, padx=14, pady=9)
+            left.pack(side="left", fill="x", expand=True, padx=14, pady=6)
             line = tk.Frame(left, bg=CARD)
             line.pack(anchor="w")
             lbl(line, uid, BASE, True).pack(side="left")
@@ -3861,7 +3890,8 @@ def run_gui(smoke=False):
     root.update_idletasks()
     sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
     # 内容需要多高：holder 是滚动区里那层（含卡片内留白），再加上最外层留白。
-    # **不要在这里加 EXTRA_H** —— window_geometry 自己会加，加两次就白高 40px。
+    # **不要在这里加 EXTRA_H** —— 它由 window_geometry 统一处理（0.3.6 起已归零），
+    # 这里再加一次就白高 40px。
     # 也别用 root.winfo_reqheight()：内容进了 canvas 之后它就不再反映内容高度了。
     reqh = holder.winfo_reqheight() + 2 * OUTER_PAD
     w, h, x, y = window_geometry(sw, sh, reqh)

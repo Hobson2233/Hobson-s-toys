@@ -18,11 +18,13 @@ import campus_login as C
 
 FAILS = []
 
-# 实测出来的「内容需要高度」（本机 1707x1067 屏幕：holder 772 + 两侧留白 36）。
-# 注意这是**传给 window_geometry 的输入**，不含 EXTRA_H —— 那个由函数自己加。
-CONTENT_H = 808
-# 于是在装得下的屏幕上，最终窗口高度应该是 CONTENT_H + EXTRA_H(40)
-EXPECTED_H = 848
+# 实测出来的「内容需要高度」。0.3.6 收紧了竖向间距，从 808 降到约 812 附近
+# （holder 783 + 两侧外留白 28 = 811）。
+# 注意这是**传给 window_geometry 的输入**，0.3.6 起 EXTRA_H 已归零 ——
+# 所以最终窗口高度**就等于**这个值（在没有被屏幕上限收口时）。
+CONTENT_H = 811
+# 于是装得下的屏幕上，最终窗口高度应该是 CONTENT_H + EXTRA_H(0)
+EXPECTED_H = CONTENT_H
 
 # 常见的屏幕尺寸。虚拟化后的坐标 —— DPI 缩放会把它变小，
 # 所以 1080p@150% 实际只有 1280x720。
@@ -79,7 +81,13 @@ def main():
     print("=== 4. 屏幕太矮时必须压到屏幕内，而不是硬撑 ===")
     w, h, x, y = C.window_geometry(1280, 720, CONTENT_H)
     check("720 高的屏幕：窗口高 <= 720", h <= 720, True)
-    check("720 高的屏幕：具体值 = 720-80", h, 640)
+    # 0.3.6 起有两个上限：比例 sh*0.85 和绝对 sh-80，取更严的。
+    # 720 高时 0.85*720=612 < 720-80=640，所以是**比例**在生效（612）。
+    # 断言改成「等于两者中更严的那个」，而不是钉死在 sh-80 上 ——
+    # 否则以后调 SCREEN_H_RATIO 又要来改这一行，而它其实没测到什么。
+    check("720 高的屏幕：具体值 = min(sh*0.85, sh-80)", h, min(int(720 * C.SCREEN_H_RATIO), 720 - C.SCREEN_MARGIN_H))
+    # 反向确认：确实比旧行为更矮（旧版是 640，比例上限把它压到 612）
+    check("720 高的屏幕：比旧的 sh-80(640) 更矮", h < 720 - C.SCREEN_MARGIN_H, True)
 
     print()
     print("=== 5. 最小尺寸也要按屏幕收口 ===")
@@ -100,6 +108,32 @@ def main():
         if w <= 0 or h <= 0 or x < 0 or y < 0:
             bad.append((sw, sh, w, h, x, y))
     check("小屏也算得出正的尺寸和位置", bad, [])
+
+    print()
+    print("=== 7. 16:10 屏幕：窗口不能占满屏高（0.3.6 的改进点）===")
+    # 霍布森的本机是 2560x1600（16:10）。程序 DPI 不感知，150% 缩放下
+    # Tk 只看到 1707x1067。旧版这里会算出 963px 窗口（占屏高 90%），
+    # 上下几乎没余量。改成比例上限后应该明显收下来。
+    w, h, x, y = C.window_geometry(1707, 1067, CONTENT_H)
+    ratio = h / 1067.0
+    print("     本机 2560x1600@150%% -> Tk 看得 1707x1067 -> 窗口高 %d，占屏高 %.1f%%"
+          % (h, ratio * 100))
+    check("占屏高 <= SCREEN_H_RATIO", ratio <= C.SCREEN_H_RATIO + 1e-9, True)
+    check("占屏高 <= 85%（旧版是 90%）", ratio <= 0.85, True)
+    # 上下必须留得出标题栏 + 任务栏
+    check("上方留给标题栏 >= 20px", y >= 20, True)
+    check("下方留白 >= 20px", 1067 - (y + h) >= 20, True)
+
+    print()
+    print("=== 8. EXTRA_H 归零后，窗口高正好等于内容需要的高度 ===")
+    # 这是「那 40px 是不是白送的」的回归测试。Tk 的 geometry 高度就是客户区，
+    # 再 +40 只会变成卡片底部空白 —— 实测客户区 851 里有 68px 富余全是这个。
+    for hh in (600, 700, 811, 900):
+        w, h, x, y = C.window_geometry(2000, 2000, hh)   # 屏幕足够大，不受上限影响
+        if h != hh:
+            FAILS.append("EXTRA_H 归零 %d" % hh)
+            print("  [失败] 内容 %d -> 窗口高 %d（应当相等）" % (hh, h))
+    check("大屏上窗口高 == 传入的 reqh（EXTRA_H 已归零）", C.EXTRA_H, 0)
 
     print()
     if FAILS:
