@@ -137,6 +137,58 @@ def main():
           ('"' + C.WIRING_FAIL_PHRASE + '"') in build_src, False)
 
     print()
+    print("=== 4b. 每一个硬拦标识都必须被 build.py 认 ===")
+    # 背景（2026-10-04 实测踩到）：`--guitest` 在 build.py 里是**软门槛**
+    # （must=False，理由是受控会话建 Tk 会飘），只有命中标识串才硬拦。
+    # 新加的界面自检一开始**没有**自己的串，于是它抛的 GUI_FAIL 被当成
+    # 「环境抖动」打印一行就放过了 —— 门槛看着接上了，实际一次也没拦过。
+    # 所以这里逐个核对：campus_login 里声明的每个硬拦标识，build.py 都得认。
+    check("UI_FAIL_PHRASE 这个常量存在", hasattr(C, "UI_FAIL_PHRASE"), True)
+    check("build.py 里没有硬编码界面自检的字面量",
+          ('"' + C.UI_FAIL_PHRASE + '"') in build_src, False)
+    # ⚠️ 这里**直接 import build 问它**，而不是 grep 源码找字符串：
+    #    build.py 里写的是常量**名**（`HARD_FAIL_PHRASES = (WIRING_FAIL_PHRASE, ...)`），
+    #    字面量值根本不在源码里 —— 第一版就是这么写错的，断言全红。
+    #    而且「元组里到底有没有这一项」只有真拿到那个对象才答得准。
+    #    build.py 顶层被 `if __name__ == "__main__"` 包住，import 不会触发构建。
+    import build as B
+    check("build.py 定义了 HARD_FAIL_PHRASES",
+          hasattr(B, "HARD_FAIL_PHRASES"), True)
+    check("  其中含 WIRING_FAIL_PHRASE",
+          C.WIRING_FAIL_PHRASE in B.HARD_FAIL_PHRASES, True)
+    check("  其中含 UI_FAIL_PHRASE",
+          C.UI_FAIL_PHRASE in B.HARD_FAIL_PHRASES, True)
+    check("两个标识互不包含（否则会互相误判）",
+          (C.UI_FAIL_PHRASE in C.WIRING_FAIL_PHRASE)
+          or (C.WIRING_FAIL_PHRASE in C.UI_FAIL_PHRASE), False)
+    check("两个标识确实不同",
+          C.UI_FAIL_PHRASE != C.WIRING_FAIL_PHRASE, True)
+
+    print()
+    print("=== 4c. 界面自检失败也要能变成硬拦 ===")
+    # 直接拿 ui_contrast_check 的失败消息走一遍判定 —— 不建 Tk，
+    # 用一棵「按钮隐形」的假控件树即可（详见 ui_contrast_test.py）。
+    class _Btn(object):
+        def __init__(self):
+            self._rb_text = "隐形按钮"
+            self._rb_bg = C.BG
+            self._rb_parent_bg = C.BG
+            self._rb_disabled_bg = "#dfe5ee"
+
+        def winfo_children(self):
+            return []
+
+    try:
+        C.ui_contrast_check(_Btn())
+        msg = ""
+        bad = False
+    except AssertionError as e:
+        msg, bad = str(e), True
+    check("隐形按钮 -> 抛 AssertionError", bad, True)
+    check("消息以 UI_FAIL_PHRASE 打头（build.py 搜的就是它）",
+          msg.startswith(C.UI_FAIL_PHRASE), True)
+
+    print()
     print("=== 5. --guitest 那条链路：异常要变成 GUI_FAIL + 原因 ===")
     def boom(smoke=False):
         C.pwd_wiring_check(FakeField(broken="get_returns_shown"))

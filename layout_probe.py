@@ -8,6 +8,12 @@
 
 做法和 ui_shot.py 一样：在 Tk 自己的事件循环里量（另起进程拿不到桌面）。
 
+🔴 数据安全（2026-10-04 加）：
+    这个脚本跑的是**真实**的 `run_gui()`，而 run_gui 启动时会走
+    `load_all() → mutate_accounts() → save_accounts()` —— **它会写真实 accounts.json**。
+    原来这里没有沙箱，属于「意图只读、行为写盘」。现在先 `datasafe.sandbox()`
+    （`copy_real=True`：量到的仍然是真实状态的界面，但真身一个字节都不动）。
+
 用法：
     python layout_probe.py
 """
@@ -18,6 +24,7 @@ import tkinter as tk
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import campus_login as C
+import datasafe
 import proc_tree
 
 _orig_mainloop = tk.Tk.mainloop
@@ -40,6 +47,27 @@ def walk(w):
 PROBLEMS = []
 
 
+def _label_of(w):
+    """取控件的「文字」，取不到就返回空串。
+
+    ⚠️ 为什么不能只认 `tk.Button`/`Label`/`Checkbutton`（2026-10-04 修）：
+        界面美化后主按钮和账号行的「选用 / 删除」都换成了 **Canvas 手绘的
+        圆角按钮**（见 campus_login.round_button）。它们 `winfo_class()` 是
+        "Canvas"，走不到 `cget("text")` 那条分支 —— 于是下面「最靠下的 6 个控件」
+        那张表里，它们会显示成 `Canvas ''`。
+        这个退化是**静默的**：表照样打得出来，只是最该被认出来的那个控件
+        （被裁掉的往往正是最底下那排按钮）成了无名氏，排查时白看。
+        Canvas 的 `create_text` 内容查不出来，所以按钮把文字挂在 `_rb_text` 上。
+    ⚠️ 同理，圆角复选框（`round_check`）把文字挂在 `_ck_text` 上 —— 也要认。
+    """
+    try:
+        if w.winfo_class() in ("Button", "Label", "Checkbutton"):
+            return w.cget("text")
+    except Exception:
+        pass
+    return getattr(w, "_rb_text", "") or getattr(w, "_ck_text", "")
+
+
 def describe(root):
     print("=" * 62)
     print("屏幕: %dx%d" % (root.winfo_screenwidth(), root.winfo_screenheight()))
@@ -53,22 +81,36 @@ def describe(root):
     root_y = root.winfo_rooty()
     print("-" * 62)
 
-    # 找出所有 Checkbutton（开机自启那个）和密码框按钮
+    # 找出复选框（开机自启那个）和密码框按钮
+    #
+    # ⚠️ 2026-10-04 起复选框**不再是 `tk.Checkbutton`**：换成了 Canvas 自绘的
+    #    圆角复选框（`campus_login.round_check`，返回一个挂了 `_ck_text` 的 Frame）。
+    #    只认类名的话这一整节会**一条都不打印** —— 而「什么都没打印」和
+    #    「本来就没有复选框」在输出上一模一样，正是最该避免的那种假绿灯。
+    #    所以这里两个条件都认，并且**找不到就记进 PROBLEMS**。
+    found_chk = 0
     for w in walk(root):
         try:
             cls = w.winfo_class()
         except Exception:
             continue
-        if cls in ("Checkbutton",):
-            top = w.winfo_rooty() - root_y
-            bottom = top + w.winfo_height()
-            ok = bottom <= client_h
-            if not ok:
-                PROBLEMS.append("Checkbutton %r 被裁掉 %d px" % (w.cget("text"), bottom - client_h))
-            print("Checkbutton 文字=%r" % w.cget("text"))
-            print("    y=%d..%d  客户区高=%d  -> %s"
-                  % (top, bottom, client_h,
-                     "可见" if ok else "**被裁掉 %d px**" % (bottom - client_h)))
+        ck = getattr(w, "_ck_text", None)
+        if cls != "Checkbutton" and not ck:
+            continue
+        found_chk += 1
+        text = ck if ck else w.cget("text")
+        top = w.winfo_rooty() - root_y
+        bottom = top + w.winfo_height()
+        ok = bottom <= client_h
+        if not ok:
+            PROBLEMS.append("复选框 %r 被裁掉 %d px" % (text, bottom - client_h))
+        print("复选框 文字=%r（%s）" % (text, cls))
+        print("    y=%d..%d  客户区高=%d  -> %s"
+              % (top, bottom, client_h,
+                 "可见" if ok else "**被裁掉 %d px**" % (bottom - client_h)))
+    if not found_chk:
+        PROBLEMS.append("一个复选框都没找到 —— 要么界面没建起来，"
+                        "要么它不再挂 _ck_text 了，这一节正在空转")
 
     # 密码框：输入区 + 「显示」按钮，检查是否重叠
     if fields:
@@ -100,8 +142,7 @@ def describe(root):
                 continue
             top = w.winfo_rooty() - root_y
             rows.append((top + w.winfo_height(), top, w.winfo_class(),
-                         (w.cget("text") if w.winfo_class() in
-                          ("Button", "Label", "Checkbutton") else "")))
+                         _label_of(w)))
         except Exception:
             pass
     rows.sort(reverse=True)
@@ -132,17 +173,29 @@ def main():
     C.PasswordField.__init__ = _init
     tk.Tk.mainloop = _mainloop
     try:
+        # 必须在 run_gui 之前：把真实数据复制进临时目录，之后所有写入都落在那里
+        datasafe.sandbox(copy_real=True, tag="layout_probe")
         C.run_gui()
     except Exception as e:
         print("run_gui 异常: %s: %s" % (type(e).__name__, e))
     finally:
         C.PasswordField.__init__ = _orig_init
         tk.Tk.mainloop = _orig_mainloop
+    # ⚠️ 这句必须在 describe() **之后**才打印得出来，而 describe() 是在
+    #    2600ms 的事件里跑完的 —— 所以它影响不了那份「结论」（那份已经印完了），
+    #    只能影响退出码。别把它 append 进 PROBLEMS 假装结论里会有，
+    #    那是个假的补救（结论早印完了，没人会再读一次）。
+    dirty = None
+    try:
+        print(datasafe.assert_untouched())
+    except RuntimeError as e:
+        print(e)
+        dirty = e
     # **不要 disarm()** —— exit_hard() 就在下一句，os._exit() 会带走守护线程。
     # 提前解除等于把唯一的救命绳解开了：真挂住时就没人救。
     # 有结论就给出退出码，方便脚本化判断（注意：这个脚本要建 Tk 窗口，
     # 在受控会话里可能挂住，所以别拿它当构建门槛，只当诊断工具）
-    proc_tree.exit_hard(1 if PROBLEMS else 0)
+    proc_tree.exit_hard(1 if (PROBLEMS or dirty) else 0)
 
 
 if __name__ == "__main__":

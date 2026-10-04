@@ -22,11 +22,22 @@ NAME = "CampusLogin"
 # 因为启动文件夹里的 .lnk 存的是绝对路径。改这里就要重新设置一次自启。
 DESKTOP_DIR = os.path.join(os.path.expanduser("~"), "Desktop")
 
-# 接线自检的失败标识：从主程序导入，**不在这里再写一份字面量**。
+# 自检的失败标识：从主程序导入，**不在这里再写一份字面量**。
 # 两处硬编码同一个字符串迟早会漂移，那时构建门槛就永远搜不到、静默失效。
 # campus_login 顶层不 import tkinter（都是延迟导入），所以这里导入是安全的。
 sys.path.insert(0, HERE)
-from campus_login import APP_TITLE, WIRING_FAIL_PHRASE, VERSION  # noqa: E402
+from campus_login import (APP_TITLE, UI_FAIL_PHRASE,  # noqa: E402
+                          WIRING_FAIL_PHRASE, VERSION)
+
+# 这些串一旦出现在 --guitest 的标记文件里，构建就**硬拦**（不看 must）。
+#
+# 为什么是一组而不是一个（2026-10-04）：`--guitest` 本身是软门槛 —— 受控会话里
+# 建 Tk 会飘，所以「界面没建起来」只当参考。但**自检发现的问题**和「Tk 卡住」
+# 完全是两回事：前者是确定性的代码错误，重跑一百次都是同样的失败。
+# 把它们和「环境抖动」混在一起放过，等于门槛没接上（实测踩到：配色自检抛了
+# GUI_FAIL，build.py 只打印一行就继续出包了）。所以凡是自检类的失败标识，
+# 都要加进这个元组。
+HARD_FAIL_PHRASES = (WIRING_FAIL_PHRASE, UI_FAIL_PHRASE)
 import proc_tree  # noqa: E402  —— 收进程树（onefile 是父子两个进程，别只杀父）
 
 # 从包里剔掉的模块。每一项都有具体理由，别凭感觉往里加。
@@ -460,12 +471,14 @@ def main():
             with open(f, "r", encoding="utf-8", errors="replace") as fh:
                 text = fh.read()
         ok = fresh and (want in text)
-        # 接线自检失败是**确定性**的代码错误，和环境性的 Tk 卡住不是一回事：
+        # 自检失败是**确定性**的代码错误，和环境性的 Tk 卡住不是一回事：
         # 它表现为干净退出 + GUI_FAIL，而不是超时。所以单独拎出来硬性拦截 ——
-        # 这条缝一旦漏过去，用户看到的是「密码框里字看着对、点登录却失败」。
+        # 这条缝一旦漏过去，用户看到的是「密码框里字看着对、点登录却失败」，
+        # 或者「界面上有个按钮其实是隐形的」。
         # 标识串从 campus_login 导入，不在这里再写一遍：两处硬编码同一个字符串
         # 迟早会漂移，那时这里就永远搜不到、门槛静默失效。
-        wiring_bad = WIRING_FAIL_PHRASE in text
+        hit = [p for p in HARD_FAIL_PHRASES if p in text]
+        wiring_bad = bool(hit)
         # 超时也要读标记文件！实测 --guitest 会先把 GUI_OK 写进 guitest.txt，
         # 然后才卡在退出上 —— 只看「超时」会把「界面其实建成功了」误判成失败。
         if timed_out:
@@ -476,7 +489,7 @@ def main():
             if must or wiring_bad:
                 if wiring_bad:
                     print(text[:500])
-                    print("!! 密码框接线自检失败 —— 构建判为失败")
+                    print("!! %s —— 构建判为失败" % "、".join(hit))
                 return 1
             continue
         print("%s -> 退出码 %s / %.1fs / 标记文件 %s / %s"
@@ -487,7 +500,7 @@ def main():
             if must:
                 return 1
         if wiring_bad:
-            print("!! 密码框接线自检失败 —— 构建判为失败")
+            print("!! %s —— 构建判为失败" % "、".join(hit))
             return 1
 
     # 隐私检查（构建门槛）：确认 exe 里没夹带本机的账号密码。

@@ -54,7 +54,7 @@ APP_TITLE = "校园网自动登录"
 # ⚠️ 这里是**唯一来源**。界面标题、使用说明、--version、--selftest、
 #    以及 exe 文件属性里的版本，全部由它推导 —— 不要在别处另写一份，
 #    否则迟早漂移（改了一处忘了另一处，用户看到的版本号就是错的）。
-VERSION = "0.3.6"
+VERSION = "0.4.0"
 
 # 学校 portal 默认参数（拷到同校其他电脑上可直接用）
 DEFAULTS = {
@@ -345,6 +345,52 @@ def read_json(path):
         return None
 
 
+# ==================== 账号文件的互斥 ====================
+#
+# 🔴 为什么需要（2026-10-03，有复现脚本 _repro_accounts_race.py）：
+#     `upsert_account` / `update_account_record` 都是「读 → 改 → 写」三步，
+#     而写账号的线程**不止一个**：
+#       · GUI 主线程：保存、删除账号
+#       · GUI 后台任务线程：切账号 / 退出账号（start_job 起的 daemon 线程）
+#       · 守护进程（独立进程，--auto --guard）—— 这条锁管不到，见下
+#     两个写者交错时后写的覆盖先写的，账号就没了。
+#     实测：6 个写者各写 30 个**互不相同**的 uid，期望 181 个，
+#     实际只剩 31~61 个 —— 丢 66%~83%。
+#
+# 🔴 为什么锁的是「整段读-改-写」而不是 load/save 各一把：
+#     只给 load_accounts / save_accounts 各包一把锁是**假的修复** ——
+#     锁在两步之间就放掉了：
+#         T1 读 → T2 读 → T1 写 → T2 写      ← T2 覆盖掉 T1 的改动
+#     看着像修好了，其实一次都没拦住。所以必须提供 mutate_accounts()，
+#     让调用方把三步放在同一个临界区里。
+#
+# ⚠️ 这个锁**只管本进程内的线程**。守护进程是另一个进程，锁文件才管得住它 ——
+#    那是另一个问题，没在这个改动里处理。
+_ACCOUNTS_LOCK = threading.RLock()
+
+# 等锁的上限。超时后**照常执行**，不抛异常也不阻塞界面：
+#   这个程序退出走 TerminateProcess，任何「无限等锁」都可能等不到；
+#   宁可偶发一次覆盖，也不能让「加锁」变成新的卡死来源。
+ACCOUNTS_LOCK_TIMEOUT = 2.0
+
+
+def mutate_accounts(fn):
+    """在锁里做一次完整的「读 → 改 → 写」。fn(store) 就地修改，返回值忽略。
+
+    这是**唯一**推荐的账号写入口。直接用 load_accounts + save_accounts
+    自己拼三步，就等于把上面那个坑又踩一遍。
+    """
+    got = _ACCOUNTS_LOCK.acquire(timeout=ACCOUNTS_LOCK_TIMEOUT)
+    try:
+        store = load_accounts()
+        fn(store)
+        save_accounts(store)
+        return store
+    finally:
+        if got:
+            _ACCOUNTS_LOCK.release()
+
+
 # ==================== 配置 ====================
 def load_config():
     cfg = read_json(CONFIG_FILE)
@@ -362,21 +408,36 @@ def save_config(cfg):
 
 
 def load_accounts():
-    s = read_json(ACCOUNTS_FILE)
-    if not isinstance(s, dict):
-        s = {}
-    if not isinstance(s.get("accounts"), dict):
-        s["accounts"] = {}
-    if not s.get("lastOnline"):
-        s["lastOnline"] = ""
-    for k, v in list(s["accounts"].items()):
-        if not isinstance(v, dict):
-            s["accounts"][k] = {"passwd": "", "lastSuccess": "", "lastAttempt": "", "lastResult": ""}
-    return s
+    """读账号库。
+
+    ⚠️ **只读**用可以直接调；只要打算改内容，就必须走 `mutate_accounts()` ——
+       自己拼「load → 改 → save」等于绕过锁，见 mutate_accounts 的说明。
+    """
+    got = _ACCOUNTS_LOCK.acquire(timeout=ACCOUNTS_LOCK_TIMEOUT)
+    try:
+        s = read_json(ACCOUNTS_FILE)
+        if not isinstance(s, dict):
+            s = {}
+        if not isinstance(s.get("accounts"), dict):
+            s["accounts"] = {}
+        if not s.get("lastOnline"):
+            s["lastOnline"] = ""
+        for k, v in list(s["accounts"].items()):
+            if not isinstance(v, dict):
+                s["accounts"][k] = {"passwd": "", "lastSuccess": "", "lastAttempt": "", "lastResult": ""}
+        return s
+    finally:
+        if got:
+            _ACCOUNTS_LOCK.release()
 
 
 def save_accounts(store):
-    write_json(ACCOUNTS_FILE, store)
+    got = _ACCOUNTS_LOCK.acquire(timeout=ACCOUNTS_LOCK_TIMEOUT)
+    try:
+        write_json(ACCOUNTS_FILE, store)
+    finally:
+        if got:
+            _ACCOUNTS_LOCK.release()
 
 
 def upsert_account(uid, pwd, overwrite):
@@ -385,33 +446,38 @@ def upsert_account(uid, pwd, overwrite):
     overwrite=False 时**不覆盖**已存的密码 —— 切换账号时必须这样，
     否则回滚目标的密码就被新密码冲掉了，保险会失效。
     """
-    store = load_accounts()
-    if uid not in store["accounts"]:
-        store["accounts"][uid] = {"passwd": pwd, "lastSuccess": "", "lastAttempt": "", "lastResult": ""}
-    elif overwrite or not store["accounts"][uid].get("passwd"):
-        store["accounts"][uid]["passwd"] = pwd
-    save_accounts(store)
+    def _do(store):
+        if uid not in store["accounts"]:
+            store["accounts"][uid] = {"passwd": pwd, "lastSuccess": "",
+                                      "lastAttempt": "", "lastResult": ""}
+        elif overwrite or not store["accounts"][uid].get("passwd"):
+            store["accounts"][uid]["passwd"] = pwd
+
+    mutate_accounts(_do)
 
 
 def update_account_record(uid, pwd, ok):
-    store = load_accounts()
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    if uid not in store["accounts"]:
-        store["accounts"][uid] = {"passwd": "", "lastSuccess": "", "lastAttempt": "", "lastResult": ""}
-    a = store["accounts"][uid]
-    a["lastAttempt"] = now
-    a["lastResult"] = "成功" if ok else "失败"
-    if ok:
-        a["passwd"] = pwd
-        a["lastSuccess"] = now
-        store["lastOnline"] = uid
-    save_accounts(store)
+
+    def _do(store):
+        if uid not in store["accounts"]:
+            store["accounts"][uid] = {"passwd": "", "lastSuccess": "",
+                                      "lastAttempt": "", "lastResult": ""}
+        a = store["accounts"][uid]
+        a["lastAttempt"] = now
+        a["lastResult"] = "成功" if ok else "失败"
+        if ok:
+            a["passwd"] = pwd
+            a["lastSuccess"] = now
+            store["lastOnline"] = uid
+
+    mutate_accounts(_do)
 
 
 def set_last_online(uid):
-    store = load_accounts()
-    store["lastOnline"] = uid
-    save_accounts(store)
+    def _do(store):
+        store["lastOnline"] = uid
+    mutate_accounts(_do)
 
 
 def note_logout():
@@ -423,10 +489,10 @@ def note_logout():
     光看 lastOnline 是否为空判不出来（开机时它本来就可能是空的），
     所以单独记一个时刻，守护据此避让一段时间。
     """
-    store = load_accounts()
-    store["lastOnline"] = ""
-    store["lastLogout"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    save_accounts(store)
+    def _do(store):
+        store["lastOnline"] = ""
+        store["lastLogout"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    mutate_accounts(_do)
 
 
 def logged_out_recently(within=GUARD_RESPECT_LOGOUT):
@@ -507,7 +573,12 @@ def migrate_legacy_data():
         save_config(cfg)
         old_acc = read_json(os.path.join(src, "accounts.json"))
         if isinstance(old_acc, dict) and isinstance(old_acc.get("accounts"), dict):
-            save_accounts(old_acc)
+            # 这里要的是「整份替换成旧位置那一份」，所以 clear + update，
+            # 而不是把旧账号并进当前账号库 —— 保持原语义，只是挪进锁里。
+            def _do(store):
+                store.clear()
+                store.update(old_acc)
+            mutate_accounts(_do)
         log("已从 %s 继承旧配置" % src)
         return True
     return False
@@ -842,10 +913,10 @@ NET_TEXT = {
 }
 
 NET_COLOR = {
-    NET_OFF_CAMPUS: "#bbbbbb",
-    NET_OK: "#28a745",
-    NET_NEED_LOGIN: "#dc3545",
-    NET_UNKNOWN: "#bbbbbb",
+    NET_OFF_CAMPUS: "#94a3b8",
+    NET_OK: "#16a34a",
+    NET_NEED_LOGIN: "#dc2626",
+    NET_UNKNOWN: "#94a3b8",
 }
 
 
@@ -1015,9 +1086,15 @@ def wait_for_campus(max_seconds=60):
     """
     deadline = time.time() + max_seconds
     next_portal = 0.0
+    # ⚠️ 网段列表**提到循环外**（2026-10-03）。campus_subnets() 会 load_config()，
+    #    也就是每轮读一次 config.json —— 而上面那句「要**便宜**」是认真的：
+    #    0.5 秒一轮 × 60 秒 = 120 次读盘，全是白读（配置不可能在这 60 秒里变，
+    #    何况它还是本程序自己写的）。原来注释说「只看一次本机 IP」，
+    #    实现却每轮读盘 —— 注释和实现对不上，是这次顺手修掉的原因。
+    subnets = campus_subnets()
     while time.time() < deadline:
         ip = local_ipv4()
-        if ip and any(ip.startswith(p) for p in campus_subnets()):
+        if ip and any(ip.startswith(p) for p in subnets):
             return True
         now = time.time()
         if now >= next_portal:
@@ -1041,6 +1118,14 @@ def url_parameter():
 
 
 # ==================== portal ====================
+# 门户表单的**公共字段**：同一套门户模板参数，登录 / 取认证页 / 下线都要带。
+#
+# ⚠️ 这里是**唯一来源**（2026-10-03 收敛）。以前 `_auth_page` 和 `portal_logout`
+#    各自把同样这 20 个键**又抄了一遍**，三份内容一致纯属巧合 —— 哪天门户改了
+#    `templatetype` 之类，改一处漏两处就会「能登录但取不到 distoken」，
+#    而认证逻辑和日志全都正常，只有逐键对比表单才看得出来。
+#    要加 / 改公共字段就只改这里；两个表单一律用 auth_form() / logout_form() 构造。
+#    回归靠 `form_drift_test.py`（金标准 = 收敛前真正发出去的内容）。
 LOGIN_EXTRA = {
     "scheme": "http", "serverIp": "tomcat_server:80", "hostIp": "http://127.0.0.1:8080/",
     "loginType": "auth_type", "isBindMac1": "0", "pageid": "5", "templatetype": "1",
@@ -1051,6 +1136,31 @@ LOGIN_EXTRA = {
     "notice_pic_loop2": "/portal/uploads/pc/demo3/images/rrs_bg.jpg",
     "remInfo": "on", "desc_lb": "on",
 }
+
+
+def auth_form(uid, pwd):
+    """取认证页（webauth.do）要 POST 的表单：公共字段 + 本次要认证的账号密码。
+
+    ⚠️ 与 portal_login 的用法**不同**，别互相替代：
+       portal_login 是拿门户重定向给的参数当底，本表用来**补缺**（setdefault，不覆盖门户值）；
+       本函数是**从零构造**固定模板表单（那一步拿不到门户参数，也不需要）。
+    """
+    return dict(LOGIN_EXTRA, userId=uid, passwd=pwd)
+
+
+def logout_form(user, token):
+    """下线（webdisconn.do）要 POST 的表单。
+
+    与登录表单的差异（逐键核过，别凭印象改；金标准见 form_drift_test.py）：
+        去掉 remInfo / desc_lb —— 这两个是**登录页的显示开关**，下线用不到
+        多出 auth_type="0" / other1="disconn" —— 下线专用
+        distoken 用真 token（登录表单那里是空串）、url / userId 补上
+    """
+    form = dict(LOGIN_EXTRA, auth_type="0", distoken=token,
+                url=TRIGGER_URL, userId=user, other1="disconn")
+    for k in ("remInfo", "desc_lb"):
+        form.pop(k, None)
+    return form
 
 
 def portal_login(uid, pwd):
@@ -1187,16 +1297,9 @@ def _auth_page(uid, pwd):
         sess.get("%s/webauth.do?%s" % (host, urlp), timeout=10)
     except Exception:
         pass
-    form = {
-        "scheme": "http", "serverIp": "tomcat_server:80", "hostIp": "http://127.0.0.1:8080/",
-        "loginType": "auth_type", "isBindMac1": "0", "pageid": "5", "templatetype": "1",
-        "listbindmac": "0", "recordmac": "0", "isRemind": "1",
-        "loginTimes": "", "groupId": "", "distoken": "", "echostr": "",
-        "isautoauth": "", "mobile": "",
-        "notice_pic_loop1": "/portal/uploads/pc/demo3/images/logo.jpg",
-        "notice_pic_loop2": "/portal/uploads/pc/demo3/images/rrs_bg.jpg",
-        "userId": uid, "passwd": pwd, "remInfo": "on", "desc_lb": "on",
-    }
+    # 表单字段只在 LOGIN_EXTRA 定义一份，别在这儿再抄一遍
+    # （这里以前就是第二份，靠人工和 LOGIN_EXTRA 保持一致）。
+    form = auth_form(uid, pwd)
     try:
         r = sess.post("%s/webauth.do?%s" % (host, urlp), data=form, timeout=20)
     except Exception as e:
@@ -1312,16 +1415,9 @@ def portal_logout():
         # 也可能真的没在线。不在这里下判断，交给调用方按 None 重试。
         return None
     log("已取得 distoken")
-    form = {
-        "scheme": "http", "serverIp": "tomcat_server:80", "hostIp": "http://127.0.0.1:8080/",
-        "loginType": "auth_type", "auth_type": "0", "isBindMac1": "0", "pageid": "5",
-        "templatetype": "1", "listbindmac": "0", "recordmac": "0", "isRemind": "1",
-        "loginTimes": "", "groupId": "", "distoken": token, "echostr": "",
-        "isautoauth": "", "mobile": "",
-        "notice_pic_loop1": "/portal/uploads/pc/demo3/images/logo.jpg",
-        "notice_pic_loop2": "/portal/uploads/pc/demo3/images/rrs_bg.jpg",
-        "url": TRIGGER_URL, "userId": cfg.get("userId", ""), "other1": "disconn",
-    }
+    # 下线表单 = 公共字段去掉两个登录页开关 + 下线专用字段。
+    # 差异集中在 logout_form() 里，这里不再摆一份字面量（以前这里就是第三份）。
+    form = logout_form(cfg.get("userId", ""), token)
     post_url = "%s/webdisconn.do?%s" % (host, url_parameter())
     log("下线请求(POST): %s" % post_url)
     body = ""
@@ -2667,17 +2763,26 @@ class PasswordField(object):
         self.reveal = False
         self.focused = False
 
-        self.box = tk.Frame(parent, bg="#ffffff", highlightbackground="#c9ced6",
-                            highlightthickness=1, bd=0)
-        self.entry = tk.Entry(self.box, font=font_main, relief="flat", bd=0,
-                              bg="#ffffff", fg=fg, highlightthickness=0,
+        # 配色跟着 run_gui 那套走（BG/CARD/LINE/BLUE_* 都是模块级常量）。
+        # 这里以前散着一堆字面量（#c9ced6 / #0b5ed7 / #eef4fb），
+        # 换主题时必然漏掉一处，所以一并收敛。
+        #
+        # 2026-10-04 换成 Canvas 圆角底（`round_panel`），高度**和旧版一致**：
+        #   旧：1px 描边 + `ipady=6`          → 内容上下各 7
+        #   新：panel `pad_y=5` + `ipady=2`   → 内容上下各 7
+        # 水平：左边旧 `1+10=11`、新 `8+3=11`；右边旧 `1+8=9`、新 `1+8=9`。
+        # `self.box` 仍然是那个「可以 pack 的控件」（现在是 Canvas）——
+        # pwd_gui_test 和 run_gui 都是直接 pack 它，没有别的用法。
+        self.box, _body = round_panel(parent, tk, 8, 5, 5)
+        self.entry = tk.Entry(_body, font=font_main, relief="flat", bd=0,
+                              bg=CARD, fg=fg, highlightthickness=0,
                               insertbackground=fg)
-        self.entry.pack(side="left", fill="x", expand=True, ipady=6, padx=(7, 0))
-        self.button = tk.Button(self.box, text="显示", font=font_small,
-                                relief="flat", bd=0, bg="#ffffff", fg="#0b5ed7",
-                                activebackground="#eef4fb", activeforeground="#0b5ed7",
-                                cursor="hand2", padx=8, command=self.toggle_reveal)
-        self.button.pack(side="right", padx=(4, 6), ipady=6)
+        self.entry.pack(side="left", fill="x", expand=True, ipady=2, padx=(3, 0))
+        self.button = tk.Button(_body, text="显示", font=font_small,
+                                relief="flat", bd=0, bg=CARD, fg=BLUE_DARK,
+                                activebackground=BLUE_SOFT, activeforeground=BLUE_DARK,
+                                cursor="hand2", padx=10, command=self.toggle_reveal)
+        self.button.pack(side="right", padx=(4, 1), ipady=2)
 
         self.entry.bind("<KeyPress>", self._on_key)
         self.entry.bind("<FocusIn>", lambda e: self.set_focus(True))
@@ -2783,6 +2888,18 @@ class PasswordField(object):
 # 两处硬编码同一个字符串迟早会漂移，那时门槛就静默失效了（找不到这个串，
 # 于是永远不拦）。改这句话之前先确认 build.py 引用的是这个常量而不是字面量。
 WIRING_FAIL_PHRASE = "密码框接线自检失败"
+
+# 「界面自检」失败的固定标识，和上面那个各管一摊。**build.py 也从这里导入。**
+#
+# ⚠️ 为什么必须单独有一个串（2026-10-04 实测踩到）：
+#     build.py 里 `--guitest` 是**软门槛**（`must=False`）—— 理由是受控会话里
+#     建 Tk 会飘（有时 0.9s、有时 14s、有时不返回），不能拿它当构建成败的判据。
+#     所以「界面没建起来」只打印一行参考；**只有**命中 WIRING_FAIL_PHRASE 才硬拦。
+#     于是界面自检（比如「按钮和背景同色」）抛出的 GUI_FAIL 会被当成
+#     「环境问题」轻轻放过 —— 门槛看着接上了，其实根本没拦。
+#     分开的理由和上面那句一样：确定性代码错误要硬拦，环境性抖动只能参考。
+#     这个串就是给前者的。
+UI_FAIL_PHRASE = "界面自检失败"
 
 # 接线自检用的假密码。**必须是假字符串** —— 如果这里写真实密码，
 # 它就会被打进 exe，`leak_check.py` 会（正确地）判定隐私检查不通过。
@@ -3086,11 +3203,778 @@ def update_wiring_check(btn_ver):
 # 界面配色。**提到模块级**是为了让 run_gui 之外的窗口也能用同一套 ——
 # `--help` 在打包版里要弹一个说明窗口（没有 stdout，print 出去看不见），
 # 颜色写两份迟早会漂移，两块界面就不一样了。
-BG = "#f0f2f5"
-CARD = "#ffffff"
-FG = "#222222"
-SUB = "#666666"
-BLUE = "#0078d4"
+#
+# 2026-10-04 换了一套：原来的 `#f0f2f5 + #0078d4` 是 Windows 8 时代的观感，
+# 一屏之内全是直角和纯色块。现在用中性偏冷的灰阶打底（slate 系），
+# 主色换成对比度更高的蓝，再拆出「描边 / 浅底 / 危险 / 成功」四组语义色 ——
+# 散落在各处的字面量（`#0b5ed7`、`#e7f0ff` 这类）全部收敛到这里，
+# 以后调色只改这一处。
+BG = "#eef1f6"          # 页面底色（卡片之间的缝）
+CARD = "#ffffff"        # 卡片 / 输入框底色
+FG = "#0f172a"          # 主文字
+SUB = "#64748b"         # 次要文字 / 分区标题
+BLUE = "#2563eb"        # 主色
+BLUE_DARK = "#1d4ed8"   # 主色按下态
+BLUE_SOFT = "#e8efff"   # 主色的浅底（标签、可点小字）
+LINE = "#e3e8ef"        # 卡片描边 / 分隔线
+FIELD = "#f8fafc"       # 输入框内底色
+OK = "#16a34a"
+OK_SOFT = "#e7f7ec"
+DANGER = "#dc2626"
+DANGER_SOFT = "#fdecec"
+WARN = "#b45309"
+# 分区强调色。2026-10-04 加：原来五个分区标题**全是同一种灰字**，
+# 一屏看下去没有任何层次，也就是用户说的「太单调」。
+# 每个分区配一组「强色 + 浅底」，浅底画圆角小徽章、强色画图标和描边。
+# 取值和站点上的徽章色板同源（见 make_site.py 的 --t-*-bg/fg），
+# 这样软件和网站的观感是一套。
+VIOLET = "#7c3aed"
+VIOLET_SOFT = "#f1ecfe"
+CYAN = "#0891b2"
+CYAN_SOFT = "#e0f5f8"
+# 分区标题的文字色。比 SUB 深一档 —— 标题要压得住下面的正文，
+# 但又不抢主按钮的蓝。
+SEC_FG = "#334155"
+
+# 状态徽章的浅底，和 NET_COLOR 一一对应。
+# ⚠️ 放在这里（UI 配色区）而不是紧挨着 NET_COLOR（文件中部）：
+#    它要引用 OK_SOFT / DANGER_SOFT，而那两个常量在下面才定义。
+#    写死在 NET_COLOR 旁边就得把 `#e7f7ec` 再抄一遍 —— 抄一遍就是一处漂移源。
+#    NET_COLOR 本身不依赖任何 UI 常量（命令行也要用），所以它留在原处。
+NET_SOFT = {
+    NET_OFF_CAMPUS: "#eef2f7",
+    NET_OK: OK_SOFT,
+    NET_NEED_LOGIN: DANGER_SOFT,
+    NET_UNKNOWN: "#eef2f7",
+}
+
+
+def _hex_rgb(s):
+    """`"#rrggbb"` -> (r, g, b)；不是这个格式就返回 None。"""
+    s = (s or "").strip()
+    if len(s) != 7 or not s.startswith("#"):
+        return None
+    try:
+        return tuple(int(s[i:i + 2], 16) for i in (1, 3, 5))
+    except ValueError:
+        return None
+
+
+def _walk_widgets(w):
+    yield w
+    for c in w.winfo_children():
+        for x in _walk_widgets(c):
+            yield x
+
+
+# 两个颜色至少差这么多（单通道最大差，0~255）才算「看得出是两种颜色」。
+# 参照现有取值定：账号行「选用」按钮 #f1f5f9 落在白卡 #ffffff 上，差 14 ——
+# 那是肉眼一眼就能分辨的程度。取 8 留一点余量，但足够拦住「几乎同色」。
+_CONTRAST_MIN = 8
+
+# 默认「禁用灰」在浅底上撞了背景时改用的颜色。
+# 比 BG(#eef1f6) 深 15 级、比 CARD(#ffffff) 深 32 级，两个底上都看得出来。
+_DISABLED_FALLBACK = "#dfe5ee"
+
+
+def _color_delta(a, b):
+    """两个 `"#rrggbb"` 的单通道最大差（0~255）。任一个解析不了就返回 None。"""
+    ra, rb = _hex_rgb(a), _hex_rgb(b)
+    if ra is None or rb is None:
+        return None
+    return max(abs(ra[i] - rb[i]) for i in range(3))
+
+
+def _pick_disabled_bg(disabled_bg, parent_bg):
+    """给「禁用态」挑个底色：跟背景分不开就换一档看得见的灰。
+
+    ⚠️ 为什么单独抽成函数（2026-10-04）：
+        这段判断必须能**脱离 Tk** 单独测 —— 而它原本长在 round_button 里，
+        round_button 要建 Canvas，受控会话里建 Tk 时好时坏（同一份代码实测
+        0.9s / 14s / 直接挂住，见 wiring_gate_test.py 顶部）。判定逻辑是这条
+        门槛的核心，不能跟 Tk 的脾气绑在一起。
+    """
+    d = _color_delta(disabled_bg, parent_bg)
+    if d is not None and d < _CONTRAST_MIN:
+        return _DISABLED_FALLBACK
+    return disabled_bg
+
+
+def ui_contrast_check(root):
+    """在**真实控件树**里核对：每个圆角按钮的填充色都和它坐的背景分得开。
+
+    为什么需要（2026-10-04 实测踩到）：
+        「使用说明」按钮的静止底色一开始写成了 `#eef1f6` —— 那正是页面底色 BG。
+        结果按钮和背景完全融成一片，截图里就剩四个灰字，跟普通说明文字没区别，
+        用户根本不会去点。这类错**不抛任何异常**：逻辑自检全绿、窗口照常显示、
+        `--guitest` 也是 GUI_OK，只有把截图放大若干倍才看得出来。
+        静态读源码同样靠不住 —— `bg="#eef1f6"` 和几百行外的 `BG = "#eef1f6"`
+        隔着半屏，肉眼对不上。
+
+        所以这里**不看源码，直接问控件**：「你的填充色和你的背景色一样吗？」
+        要查的三种填充色都挂在按钮上（见 round_button 里的 `_rb_*`）：
+        静止态、禁用态 —— 这两个都必须和背景分得开。
+
+    为什么用「色差阈值」而不是「是否相等」：
+        相等只是最极端的情况。差 2~3 级的两种灰，肉眼同样分不出来，
+        但 `==` 判不出来。阈值取 _CONTRAST_MIN，并且**说明这个数从哪来**，
+        免得以后有人以为它是随手挑的。
+
+    找不到任何按钮时**抛异常而不是返回 OK**：
+        否则一旦按钮不再挂 `_rb_bg`，这条自检就变成永远通过的空转 ——
+        「永远通过」和「通过」在输出上一模一样，正是本项目最忌讳的假绿灯。
+
+    返回一句人话结论；发现可疑就抛 AssertionError —— 消息**以 UI_FAIL_PHRASE 打头**，
+    这样 --guitest 不但会落成 GUI_FAIL，build.py 还能靠那个串认出「这是确定性的
+    界面缺陷」并硬拦构建。不带那个串的话，只会被当成 Tk 环境抖动轻轻放过。
+    """
+    checked = 0
+    bad = []
+    for w in _walk_widgets(root):
+        fill = getattr(w, "_rb_bg", None)
+        if fill is None:
+            continue
+        checked += 1
+        text = getattr(w, "_rb_text", "?")
+        back = getattr(w, "_rb_parent_bg", None)
+        for label, color in (("静止态", fill),
+                             ("禁用态", getattr(w, "_rb_disabled_bg", fill))):
+            delta = _color_delta(color, back)
+            if delta is None:
+                continue
+            if delta < _CONTRAST_MIN:
+                bad.append("「%s」的%s底色 %s 和它坐的背景 %s 几乎同色"
+                           "（单通道最大差 %d，要求 >= %d）"
+                           % (text, label, color, back, delta, _CONTRAST_MIN))
+    if not checked:
+        raise AssertionError(
+            UI_FAIL_PHRASE + "：控件树里一个圆角按钮都没找到 —— 要么界面没建起来，"
+            "要么按钮不再挂 _rb_bg 了。这条自检正在空转，不能算通过。")
+    if bad:
+        raise AssertionError(UI_FAIL_PHRASE + "：有按钮看不出是个按钮"
+                             "（会和背景融成一片）：\n  " + "\n  ".join(bad))
+    return "圆角按钮配色自检：%d 个按钮的静止态/禁用态都与背景可区分（阈值 %d）" % (
+        checked, _CONTRAST_MIN)
+
+
+def _draw_round_rect(cv, x1, y1, x2, y2, r, fill, tags=None):
+    """在 Canvas 上画一个圆角矩形：两个矩形 + 四个扇形。
+
+    ⚠️ 为什么不用 `create_polygon(..., smooth=True)`（2026-10-04 实测踩到）：
+        Tk 的 smooth 是**过线段中点的二次 B 样条**，顶点只当控制点用。
+        后果有两个，都很要命：
+          ① 画出来的形状整体**缩进**控制多边形内部 —— 按钮底边会离开
+             Canvas 边缘，下面露出一条背景色；
+          ② 实际圆角半径只有给定值的一半左右 —— r=9 在 36px 高的按钮上
+             放大 4 倍才勉强看出一丝倒角，等于没做。
+        这个写法是**精确**的：角就是四分之一的圆，边就是边。
+
+    tags：给画出来的 6 个图元打同一个标签，调用方才能整批 `delete` / `tag_lower`。
+          卡片是**会重画**的（窗口一改宽高就得重画一次），没有标签就只能
+          `delete("all")` —— 那会把 create_window 放进去的内容控件一起干掉。
+    """
+    if r <= 0 or x2 - x1 <= 2 * r or y2 - y1 <= 2 * r:
+        cv.create_rectangle(x1, y1, x2, y2, fill=fill, outline="", tags=tags)
+        return
+    cv.create_rectangle(x1 + r, y1, x2 - r, y2, fill=fill, outline="", tags=tags)
+    cv.create_rectangle(x1, y1 + r, x2, y2 - r, fill=fill, outline="", tags=tags)
+    d = 2 * r
+    # Tk 的角度：0° 在三点钟方向，逆时针为正。
+    for ax, ay, start in ((x1, y1, 90), (x2 - d, y1, 0),
+                          (x1, y2 - d, 180), (x2 - d, y2 - d, 270)):
+        cv.create_arc(ax, ay, ax + d, ay + d, start=start, extent=90,
+                      style="pieslice", fill=fill, outline="", tags=tags)
+
+
+def pill_radius(height):
+    """胶囊形半径：给定高度，返回「看着是圆的、又不会退化成直角」的半径。
+
+    🔴 为什么是 `height//2 - 1` 而不是 `height//2`：
+        `_draw_round_rect` 在 `2r >= 短边` 时会**直接退回画一个直角矩形**
+        （那是给 r<=0 准备的兜底）。取 `height//2` 正好踩在边界上 ——
+        圆角会**静默消失**，而且没有任何报错，只能靠肉眼在图里发现。
+        减 1 就稳了。
+    """
+    return max(4, int(height) // 2 - 1)
+
+
+def round_chip(parent, tk, text, font, fg, soft, page=CARD, pad_x=9,
+               height=18, radius=None, command=None, cursor="hand2",
+               hover=None):
+    """圆角小标签（徽章）。可以当纯标签（不传 command），也可以当小按钮用。
+
+    ⚠️ 为什么不用 `tk.Label` 加个底色：**Label 只有直角**。
+        「当前使用」「上次登录」这两个标签就坐在账号行里、紧挨着账号数字，
+        方角在圆角卡片中间特别扎眼 —— 那正是用户说的「太方正」。
+        同样的问题也出在标题行的「检查更新」和隐私区的「清除本机保存的账号密码」上。
+    ⚠️ 文字挂在 `_rb_text` 上（和 round_button 用同一个属性名）：
+        Canvas 的 `create_text` 内容**查不出来**，探针和截图脚本就靠这个属性
+        才认得出「这里有一块写了字的控件」。不挂的话，`layout_probe` 那张
+        「最靠下的控件」表里它就是个无名氏 —— 而最靠下的往往正是最该被认出来的。
+    ⚠️ 高度**故意做得比行高低**（18 vs 约 24）：徽章是靠 `pack(side="left")`
+        **垂直居中**在行里的，所以它多高都不影响行高，也就不会动 CONTENT_H。
+        哪天想把它改得比行高还高，就得重新量内容高度了。
+
+    🔴 兼容性契约（**改这里之前先看 run_gui 怎么用它**）：
+        它在 run_gui 里替代的是两个 `tk.Label` 做的小链接，必须支持：
+          · `configure(text=... / fg=... / bg=... / font=... / cursor=...)`
+            —— `set_busy()` 忙碌时会把下载进度写进版本号那一行
+          · `cget("text")` / `cget("cursor")`
+            —— `update_wiring_check()` 要读它确认「版本号看得见、能点」
+          · `bind("<Button-1>")` / `event_generate("<Button-1>")`
+            —— 接线自检会**真发一个点击事件**，确认它真的会跑到检查更新
+        ⚠️ 少支持哪一个，表现都是**静默的**：`set_busy` 那段整个包在
+           `try/except: pass` 里，改了不生效也一声不吭。
+           所以这一组接口不是「锦上添花」，是必须。
+    """
+    import tkinter.font as tkfont
+
+    st = {"text": text, "font": font, "fg": fg, "bg": soft, "hover": hover,
+          "hovering": False, "state": "normal"}
+    r = pill_radius(height) if radius is None else radius
+
+    def measure():
+        try:
+            return tkfont.Font(font=st["font"]).measure(st["text"]) + 2 * pad_x
+        except Exception:
+            return len(st["text"]) * 12 + 2 * pad_x
+
+    cv = tk.Canvas(parent, width=measure(), height=height, bg=page,
+                   highlightthickness=0, bd=0,
+                   cursor=cursor if command else "arrow")
+
+    def redraw(_e=None):
+        try:
+            w = measure()
+            if int(cv.cget("width")) != w:
+                cv.configure(width=w)          # 文案变长/变短要跟着变宽
+        except Exception:
+            return                             # 控件正在被销毁，画不了就算了
+        bg = st["bg"]
+        if st["hovering"] and st["hover"]:
+            bg = st["hover"]
+        cv.delete("all")
+        _draw_round_rect(cv, 0, 0, w, height, r, bg)
+        cv.create_text(w / 2.0, height / 2.0, text=st["text"], font=st["font"],
+                       fill=st["fg"])
+        cv._rb_text = st["text"]
+
+    if command:
+        def _click(_e=None):
+            if st["state"] == "disabled":
+                return
+            command()
+        cv.bind("<Button-1>", _click)
+        cv.bind("<Enter>", lambda e: (st.update(hovering=True), redraw()))
+        cv.bind("<Leave>", lambda e: (st.update(hovering=False), redraw()))
+
+    def configure(**kw):
+        state = kw.pop("state", None)
+        if state is not None:
+            st["state"] = state
+            cv.configure(cursor="arrow" if state == "disabled" else cursor)
+        for k in ("text", "font", "fg", "bg", "hover"):
+            if k in kw:
+                st[k] = kw.pop(k)
+        if kw:
+            tk.Canvas.configure(cv, **kw)
+        redraw()
+
+    def cget(key):
+        if key in ("text", "font", "fg", "bg"):
+            return st[key]
+        if key == "state":
+            return st["state"]
+        return tk.Canvas.cget(cv, key)
+
+    cv.configure = configure
+    cv.cget = cget
+    # 挂出填充色，让 ui_contrast_check 也覆盖到这些小链接 ——
+    # 「点得到、但看不出是个能点的东西」和「按钮和背景同色」是同一类静默缺陷。
+    cv._rb_bg = soft
+    cv._rb_parent_bg = page
+    redraw()
+    return cv
+
+
+def round_check(parent, tk, text, var, command, font, page=CARD, fg=FG,
+                box=18, radius=5, gap=9, pad_y=3, disabled_fg="#a3adbb"):
+    """圆角复选框：Canvas 画的圆角方框 + 对勾，右边跟一句说明文字。返回外层 Frame。
+
+    ⚠️ 为什么不用 `tk.Checkbutton`：
+        Windows 上它画的是**系统主题的方角指示器** —— 在一屏圆角里就是个异类，
+        而 Tk 没有任何开关能改它的形状（`indicatoron=0` 会把整个控件变成
+        一个方块按钮，更难看）。
+    ⚠️ 为什么返回的是 Frame 而不是那个 Canvas：
+        点文字也该能切换（复选框的通用约定），所以方框和文字得在同一个容器里、
+        绑同一份点击处理。外面再包一层的另一个好处是 `pack()` 的行为和
+        原来的 Checkbutton 一样（横向、居左）。
+    ⚠️ `pad_y=3` 不是随手挑的：`tk.Checkbutton` 自带指示器内边距，一行是 30px；
+        这里文字 24px，加 3+3 才凑回 30 —— 不改这个数，「开机自启」那张卡就会
+        矮 6px，CONTENT_H 跟着变。
+
+    🔴 兼容性契约（**改这里之前先看 run_gui 怎么用它**）：
+        · `configure(state="normal"/"disabled")` —— `load_all()` 会用它
+        · `cget("text")` —— 探针要能读到它的文字
+      这两条失效都是**静默的**：禁用不生效 = 用户以为关了自启、其实还开着。
+    """
+    st = {"state": "normal", "on": bool(var.get())}
+
+    wrap = tk.Frame(parent, bg=page)
+    cv = tk.Canvas(wrap, width=box, height=box, bg=page,
+                   highlightthickness=0, bd=0, cursor="hand2")
+    cv.pack(side="left", pady=pad_y)
+    lab = tk.Label(wrap, text=text, font=font, bg=page, fg=fg, cursor="hand2")
+    lab.pack(side="left", padx=(gap, 0), pady=pad_y)
+
+    def redraw():
+        disabled = st["state"] == "disabled"
+        on = st["on"]
+        if disabled:
+            edge = _DISABLED_FALLBACK
+            inner = _DISABLED_FALLBACK if on else page
+        else:
+            edge = BLUE if on else "#c7d0dc"
+            inner = BLUE if on else page
+        cv.delete("all")
+        # 1.5px 圆角描边 = 外圈描边色 + 内圈缩进 1.5 的填充色。
+        # 选中时内外同色 → 一整块实心圆角方块，正是想要的样子。
+        _draw_round_rect(cv, 0, 0, box, box, radius, edge)
+        _draw_round_rect(cv, 1.5, 1.5, box - 1.5, box - 1.5,
+                         max(radius - 1.5, 2), inner)
+        if on:
+            # 对勾。坐标按 box 归一化，改 box 大小不用重算。
+            cv.create_line(box * 0.26, box * 0.53, box * 0.43, box * 0.70,
+                           box * 0.75, box * 0.31, fill="#ffffff", width=2.1,
+                           capstyle="round", joinstyle="round")
+
+    def sync(*_a):
+        """外部改了 `var`（load_all 同步真实状态、勾选失败后回滚）也要跟着重画。"""
+        st["on"] = bool(var.get())
+        redraw()
+
+    def toggle(_e=None):
+        if st["state"] == "disabled":
+            return
+        st["on"] = not st["on"]
+        var.set(st["on"])            # 走 trace → sync → redraw
+        redraw()
+        command()
+
+    for w in (cv, lab):
+        w.bind("<Button-1>", toggle)
+    var.trace_add("write", sync)
+
+    def configure(**kw):
+        state = kw.pop("state", None)
+        if state is not None:
+            st["state"] = state
+            off = state == "disabled"
+            for w in (cv, lab):
+                w.configure(cursor="arrow" if off else "hand2")
+            lab.configure(fg=disabled_fg if off else fg)
+        if kw:
+            tk.Frame.configure(wrap, **kw)
+        redraw()
+
+    def cget(key):
+        if key == "text":
+            return text
+        if key == "state":
+            return st["state"]
+        return tk.Frame.cget(wrap, key)
+
+    # 覆盖实例上的方法（和 round_button 同样的手法：模块顶层不 import tkinter，
+    # 所以没法写 `class _RoundCheck(tk.Frame)`）。**故意不做 `config` 别名** ——
+    # 见 round_button 里那段说明：漏掉的那次宁可响亮地报错。
+    wrap.configure = configure
+    wrap.cget = cget
+    wrap._ck_text = text
+    redraw()
+    return wrap
+
+
+# 圆角面板：Canvas 画底 + 内容 Frame。**card()、状态条、输入框都用它** ——
+# 一份实现，免得几处各画一遍圆角、半径还不一样。
+ROUND_PANEL_TAG = "panelbg"
+
+
+def round_panel(parent, tk, pad_x, pad_y, radius, fill=CARD, line=LINE, page=BG,
+                stretch=False):
+    """造一个圆角面板，返回 `(canvas, body)`。
+
+    用法：`cv, body = round_panel(parent, tk, 19, 15, 14)`，把内容塞进 body，
+    再 `cv.pack(fill="x", ...)`。
+
+    ⚠️ 约束（**必须成立，否则圆角会被内容糊成方的**）：
+        `pad_x >= radius` 且 `pad_y >= radius`。
+        body 是一个**矩形** Frame，底色 = fill。它一旦伸进角上那块圆弧区域，
+        就会用一块白方块把圆角盖掉 —— 而且**不抛任何异常**，只是看着
+        「圆角没生效」。所以这里直接 assert，宁可当场炸也不要静默退回直角。
+
+    ⚠️ 高度得自己跟着内容走：
+        Frame 会自动被子控件撑开，**Canvas 不会** —— 它的 `height` 是个固定值。
+        不补这一步，卡片会永远停在 Canvas 的默认高度（7cm ≈ 265px），
+        内容直接被切掉。做法是 body 每次 `<Configure>`（= 内容变了）就把
+        Canvas 高度设成 `body 需要的高度 + 2*pad_y`。
+        实测这个高度和旧实现（`Frame + highlightthickness=1` +
+        `body.pack(padx=18, pady=14)`）**逐像素相等** —— 见 card() 里的算式。
+
+    ⚠️ `stretch=True` 是**另一种模式**，给「跟着窗口长大」的容器用
+        （说明窗口的正文区）：这时高度交给几何管理器（`fill/expand`），
+        `fit()` 直接不干活，同时 body 也铺满整块卡片。
+        两种模式不能混：既 `expand` 又自己设 `height`，谁最后写谁生效，
+        表现出来就是「窗口拉大了、卡片没跟着长」。
+
+    ⚠️ 不要在 Canvas 上 `delete("all")`：
+        `create_window` 放进去的 body 是**画布上的一个图元**，`delete("all")`
+        会把它一起删掉（内容控件连带消失）。重画只删 `ROUND_PANEL_TAG`。
+    """
+    if pad_x < radius or pad_y < radius:
+        raise ValueError(
+            "round_panel: pad_x/pad_y 必须 >= radius，否则内容矩形会盖住圆角"
+            "（pad_x=%s pad_y=%s radius=%s）" % (pad_x, pad_y, radius))
+
+    cv = tk.Canvas(parent, bg=page, highlightthickness=0, bd=0)
+    body = tk.Frame(cv, bg=fill)
+    win = cv.create_window(pad_x, pad_y, window=body, anchor="nw")
+    memo = {"h": -1}
+    # 描边色放在一个**可变容器**里，而不是闭包里的普通变量 ——
+    # 输入框聚焦时要把描边从灰改成蓝（见 panel_set_line），
+    # 而 redraw 是闭包，只有能改到它读的那个对象才生效。
+    edge = {"line": line}
+
+    def fit(_e=None):
+        if stretch:
+            # 拉伸模式：高度由几何管理器给（`fill="both", expand=True`），
+            # **不能自己设 height** —— 那会和 expand 抢，谁最后写谁生效，
+            # 表现出来就是「窗口拉大了，卡片没跟着长」或者反过来闪一下。
+            return
+        try:
+            want = body.winfo_reqheight() + 2 * pad_y
+        except Exception:
+            return                              # 控件正在被销毁，问不到就收手
+        # 记住上次设过的值：不然 `configure(height=...)` → `<Configure>` →
+        # 再 `configure` 会自激成死循环。
+        if want != memo["h"]:
+            memo["h"] = want
+            cv.configure(height=want)
+
+    def redraw(_e=None):
+        try:
+            w, h = cv.winfo_width(), cv.winfo_height()
+        except Exception:
+            return
+        if w <= 2 * radius or h <= 2 * radius:
+            # 还没布局完（初始是 1x1）。这时候画会落成一小块方角色片，
+            # 比不画还难看 —— 等下一次 <Configure>。
+            return
+        cv.delete(ROUND_PANEL_TAG)
+        # 1px 圆角描边 = 外圈描边色 + 内圈缩进 1px 的面板底。
+        # 不用 create_rectangle(outline=...) 是因为那个 outline 是**方角**的，
+        # 一圈方框套在圆角上，四个角立刻露馅。
+        _draw_round_rect(cv, 0, 0, w, h, radius, edge["line"],
+                         tags=ROUND_PANEL_TAG)
+        _draw_round_rect(cv, 1, 1, w - 1, h - 1, max(radius - 1, 2), fill,
+                         tags=ROUND_PANEL_TAG)
+        cv.tag_lower(ROUND_PANEL_TAG)
+
+    def on_cv(_e=None):
+        fit()
+        redraw()
+        # 不包 try：`win` 是 create_window 那个图元，**我们从不 delete 它**
+        # （重画只删 ROUND_PANEL_TAG，见文件头说明），所以这里不该失败。
+        # 真失败了就该响 —— 吞掉它 = 内容宽度永远不跟着窗口走，而且毫无提示。
+        w = max(cv.winfo_width() - 2 * pad_x, 1)
+        if stretch:
+            # 拉伸模式下内容也要跟着铺满，否则文字区只占卡片顶部一小块，
+            # 下面留一大片白 —— 看着像「没加载完」。
+            cv.itemconfigure(win, width=w,
+                             height=max(cv.winfo_height() - 2 * pad_y, 1))
+        else:
+            cv.itemconfigure(win, width=w)
+
+    body.bind("<Configure>", fit)
+    cv.bind("<Configure>", on_cv)
+    # 先摆一次：不然首帧高度是 Canvas 的默认 7cm，会闪一条空带。
+    # 内容加进来之后 body 会再触发一次 <Configure>，那时才是最终高度。
+    fit()
+    # 挂出来供探针/测试核对「这是个圆角面板，不是普通 Frame」。
+    # 不加这一手的话，测试只能去猜控件树形状，猜错了也不报错。
+    cv._rp_body = body
+    cv._rp_radius = radius
+    cv._rp_pad = (pad_x, pad_y)
+    cv._rp_edge = edge
+    cv._rp_redraw = redraw
+    return cv, body
+
+
+def panel_set_line(cv, color):
+    """改圆角面板的描边色并立刻重画（输入框聚焦变蓝用）。
+
+    ⚠️ 必须真的重画一次：`_draw_round_rect` 是把颜色**烤进图元**的，
+        改个变量不会让已经画上去的线变色 —— 只改不重画 = 看着毫无反应，
+        而且没有任何报错。
+    """
+    cv._rp_edge["line"] = color
+    cv._rp_redraw()
+
+
+# ==================== 线性小图标 ====================
+# 形状都写在**归一化的 24x24 方框**里，绘制时按 size/24 缩放。
+#
+# ⚠️ 为什么自绘，不用 emoji / Unicode 符号（⚙ 🔒 👤 这类）：
+#     Tk 在 Windows 上会把它们交给**字体**去渲染 —— 颜色不受我们控制
+#     （深色底上可能是黑的、跟主题不搭），基线也不受控（大小跟着字号跑，
+#     同一个图标在不同分区可能大小不一）。自绘的笔画颜色是我们指定的，
+#     才能跟着配色走 —— 而「图标要能上色」正是这次改版的目的。
+# ⚠️ 为什么不用图片（png/ico）：
+#     打包版里多一个资源文件，就多一份「有没有被 PyInstaller 打进去」的风险
+#     （本项目已经因为 res_path 踩过）。几条线就够的东西，零资源零依赖更划算。
+#
+# 造型约定（和站点上的内联 SVG 是同一套，看着才像一家人）：
+#     只描边不填充、线宽 1.8/24、线头线角都是圆的。
+_ICON_STROKE = 1.8
+
+# name -> [(kind, ...), ...]
+#   ("line", x1, y1, x2, y2)
+#   ("poly", [(x, y), ...])              自动闭合
+#   ("oval", x1, y1, x2, y2)             描边圆
+#   ("rect", x1, y1, x2, y2)             描边方（锁体这种本来就方的形状用它）
+#   ("arc",  x1, y1, x2, y2, start, extent)   描边弧
+_ICON_SHAPES = {
+    # 三横线 = 列表。
+    # ⚠️ 原来画的是「三个小圆点 + 三条线」（2026-10-04 截图放大后发现）：
+    #    点只有 2.6/24 大，缩到 13px 的徽章里就是 1.4 像素 —— 三个点糊成
+    #    一条竖线，看着像个「I」。小尺寸下**细节就是噪声**，改成一目了然的
+    #    三横线（长度递减，避免看着像汉堡菜单）。
+    "list": [("line", 3.6, 6.6, 20.4, 6.6), ("line", 3.6, 12.0, 20.4, 12.0),
+             ("line", 3.6, 17.4, 14.4, 17.4)],
+    # 头 + 肩
+    "user": [("oval", 8.4, 3.0, 15.6, 10.2),
+             ("arc", 4.2, 12.4, 19.8, 24.0, 0, 180)],
+    # 电源：缺口圆环 + 竖线
+    "power": [("line", 12.0, 2.6, 12.0, 11.4),
+              ("arc", 4.2, 4.2, 19.8, 19.8, 120, 300)],
+    # 锁：上半圆弧（锁梁）+ 方体
+    "lock": [("arc", 6.6, 3.4, 17.4, 14.2, 0, 180),
+             ("rect", 4.2, 11.2, 19.8, 21.0)],
+    # 盾牌
+    "shield": [("poly", [(12.0, 2.6), (19.8, 5.4), (19.8, 11.4),
+                         (12.0, 21.0), (4.2, 11.4), (4.2, 5.4)])],
+    # 地球 = 网络状态
+    "globe": [("oval", 2.6, 2.6, 21.4, 21.4), ("line", 2.6, 12.0, 21.4, 12.0),
+              ("oval", 8.2, 2.6, 15.8, 21.4)],
+    # 下载箭头（版本/更新）
+    "down": [("line", 12.0, 2.8, 12.0, 15.2),
+             ("poly", [(7.4, 10.8), (12.0, 15.4), (16.6, 10.8)]),
+             ("poly", [(3.6, 16.4), (3.6, 20.6), (20.4, 20.6), (20.4, 16.4)])],
+}
+
+
+def _draw_icon(cv, name, color, cx, cy, size=14.0, width=_ICON_STROKE,
+               tags=None):
+    """以 (cx, cy) 为中心画一个 size×size 的线性图标，返回画了几个图元。
+
+    不认识的名字返回 0 —— **调用方应该拿它当失败**（见 `icon_badge` 的说明）。
+    """
+    shapes = _ICON_SHAPES.get(name)
+    if not shapes:
+        return 0
+    k = float(size) / 24.0
+    x0, y0 = cx - size / 2.0, cy - size / 2.0
+    w = max(width * k, 1.0)
+
+    def X(v):
+        return x0 + v * k
+
+    def Y(v):
+        return y0 + v * k
+
+    n = 0
+    for s in shapes:
+        kind = s[0]
+        if kind == "line":
+            cv.create_line(X(s[1]), Y(s[2]), X(s[3]), Y(s[4]), fill=color,
+                           width=w, capstyle="round", tags=tags)
+        elif kind == "poly":
+            pts = []
+            for (a, b) in s[1]:
+                pts += [X(a), Y(b)]
+            pts += [X(s[1][0][0]), Y(s[1][0][1])]      # 闭合
+            cv.create_line(*pts, fill=color, width=w, capstyle="round",
+                           joinstyle="round", tags=tags)
+        elif kind == "oval":
+            cv.create_oval(X(s[1]), Y(s[2]), X(s[3]), Y(s[4]), outline=color,
+                           width=w, tags=tags)
+        elif kind == "rect":
+            cv.create_rectangle(X(s[1]), Y(s[2]), X(s[3]), Y(s[4]),
+                                outline=color, width=w, tags=tags)
+        elif kind == "arc":
+            cv.create_arc(X(s[1]), Y(s[2]), X(s[3]), Y(s[4]), start=s[5],
+                          extent=s[6], style="arc", outline=color, width=w,
+                          tags=tags)
+        n += 1
+    return n
+
+
+def icon_badge(parent, tk, name, fg, soft, box=22, radius=7, icon=13.0,
+               page=CARD):
+    """圆角彩色小徽章：浅色圆角底 + 同色系线性图标。返回那个 Canvas。
+
+    ⚠️ 图标名写错时**抛异常**，不静默画一个空徽章：
+        空徽章看着只是「这里没图标」，跟设计如此完全一样 —— 正是本项目
+        最忌讳的假绿灯。宁可当场炸。
+    """
+    cv = tk.Canvas(parent, width=box, height=box, bg=page,
+                   highlightthickness=0, bd=0)
+    _draw_round_rect(cv, 0, 0, box, box, radius, soft)
+    if not _draw_icon(cv, name, fg, box / 2.0, box / 2.0, size=icon):
+        raise ValueError("icon_badge: 不认识的图标名 %r（可选：%s）"
+                         % (name, ", ".join(sorted(_ICON_SHAPES))))
+    return cv
+
+
+def round_button(parent, text, command, font, bg, fg, hover, active, parent_bg,
+                 height=38, radius=9, width=None, pad_x=30,
+                 disabled_bg="#eef1f6", disabled_fg="#a3adbb"):
+    """造一个圆角按钮，返回控件。
+
+    ⚠️ 为什么是**工厂函数**而不是 `class RoundButton(tk.Canvas)`：
+        这个文件顶层**不 import tkinter**（所有用到 Tk 的地方都是延迟导入），
+        这样打包版跑 `--version` / `--purge` / `--selftest` 时不必加载 Tk，
+        `build.py` 也才能安全地 `import campus_login`。
+        写成类就必须在模块顶层写 `class X(tk.Canvas)` —— 那就把 tkinter
+        拉进导入期了。所以在函数里再 import，和文件里其它地方一致。
+
+    ⚠️ 为什么不用 `tk.Button`：
+        Windows 上的 tk.Button 是**直角 + 系统主题描边**，一排三个方块按钮
+        是这套界面最显旧的地方，而 Tk 没有圆角控件，只能 Canvas 自己画。
+
+    🔴 兼容性契约（**改这里之前先看 run_gui 里怎么用它的**）：
+        · `set_busy()` 会对返回的控件调 `configure(state="disabled"/"normal")`
+        · `render_accounts()` 会对它调 `winfo_exists()`
+      这两条失效是**静默的** —— 按钮看着灰了却还能点，
+      正好把「忙碌时并发写账号库」那个口子重新打开。所以下面把
+      `configure` 重写成先吃掉 `state`，其余原样交给 Canvas。
+
+      另外两个方法纯粹是**为测试脚本**留的（生产代码一处都不调）：
+        · `invoke()` —— `ui_shot.py` 按文字找到按钮后靠它「点一下」
+        · `cget("state")` —— 让脚本能断言「忙的时候它真的灰了」
+      Canvas 上没有 `state` 这个选项，不自己接住就会抛 TclError。
+
+      短别名 `config` **故意不做**（2026-10-04 删掉过一次）：
+      它和 `configure` 在 Tk 里是**两个不同的函数对象**，光写
+      `config = configure` 才等价；漏了别名，`btn.config(state=...)` 会绕过
+      上面那段拦截、直接抛 TclError。与其假装是个完整 Button，不如让漏掉的那次
+      响亮地报错 —— 静默失效才是这套界面真正怕的东西。
+    """
+    import tkinter as tk
+
+    st = {"state": "normal", "hover": False, "pressed": False}
+
+    # ⚠️ 默认的「禁用灰」`#eef1f6` 在**页面底色**上会跟背景融成一片（它正是 BG 本身），
+    #    那样一禁用按钮就整个消失了，用户只会觉得界面坏了。这里只在它真的和
+    #    背景分不开时才换一档更深的灰，调用方传了能用的颜色就不动它。
+    disabled_bg = _pick_disabled_bg(disabled_bg, parent_bg)
+
+    # 不给宽度就按文字量出来。Canvas 的默认宽度是 378px —— 拿它当按钮宽度
+    # 会得到一个横贯整行的怪物，所以这里必须自己算。
+    if width is None:
+        try:
+            import tkinter.font as tkfont
+            width = tkfont.Font(font=font).measure(text) + pad_x
+        except Exception:
+            width = 120
+
+    class _RoundButton(tk.Canvas):
+        def __init__(self, master):
+            super().__init__(master, height=height, width=width,
+                             highlightthickness=0, bd=0, bg=parent_bg)
+            # 文字挂在属性上，供脚本按文字找控件（ui_shot.find_button）。
+            # Canvas 的 create_text 内容**查不出来**，不挂这一手，
+            # 截图脚本就会静默地找不到按钮 —— 它只打印一行「没找到」，
+            # 然后照样跑完，看起来像成功了。
+            self._rb_text = text
+            # 把三种状态的填充色也挂出来，供 ui_contrast_check 核对
+            # 「这个按钮看得出是个按钮」—— 它不看源码，只问控件。
+            self._rb_bg = bg
+            self._rb_parent_bg = parent_bg
+            self._rb_disabled_bg = disabled_bg
+            self._redraw()
+            self.bind("<Configure>", lambda e: self._redraw())
+            self.bind("<Enter>", self._on_enter)
+            self.bind("<Leave>", self._on_leave)
+            self.bind("<Button-1>", self._on_press)
+            self.bind("<ButtonRelease-1>", self._on_release)
+
+        def invoke(self):
+            """按一下。tk.Button 也有这个方法，测试脚本两种按钮都能这么点。"""
+            if st["state"] != "disabled":
+                command()
+
+        # --- 绘制 ---
+        def _redraw(self):
+            self.delete("all")
+            try:
+                w = self.winfo_width()
+                h = self.winfo_height()
+            except Exception:
+                return
+            if w <= 1:                       # 还没布局完，等 <Configure> 再来
+                return
+            if h <= 1:
+                h = height
+            disabled = st["state"] == "disabled"
+            if disabled:
+                cur_bg, cur_fg = disabled_bg, disabled_fg
+            elif st["pressed"]:
+                cur_bg, cur_fg = active, fg
+            elif st["hover"]:
+                cur_bg, cur_fg = hover, fg
+            else:
+                cur_bg, cur_fg = bg, fg
+            _draw_round_rect(self, 0, 0, w, h, radius, cur_bg)
+            self.create_text(w / 2, h / 2, text=text, font=font, fill=cur_fg)
+
+        # --- 交互 ---
+        def _on_enter(self, _e=None):
+            st["hover"] = True
+            self._redraw()
+
+        def _on_leave(self, _e=None):
+            st["hover"] = st["pressed"] = False
+            self._redraw()
+
+        def _on_press(self, _e=None):
+            if st["state"] == "disabled":
+                return
+            st["pressed"] = True
+            self._redraw()
+
+        def _on_release(self, _e=None):
+            was = st["pressed"]
+            st["pressed"] = False
+            self._redraw()
+            if was and st["state"] != "disabled":
+                command()
+
+        # --- 兼容 tk.Button 的那一小撮接口 ---
+        def configure(self, **kw):
+            state = kw.pop("state", None)
+            if state is not None:
+                st["state"] = state
+                super().configure(cursor="arrow" if state == "disabled" else "hand2")
+                self._redraw()
+            if kw:
+                super().configure(**kw)
+
+        def cget(self, key):
+            if key == "state":
+                return st["state"]
+            return super().cget(key)
+
+    return _RoundButton(parent)
 
 
 def _ui_font(root, tkfont):
@@ -3135,23 +4019,34 @@ def show_text_window(title, text, width=780, height=640):
         fam, base = _ui_font(r, tkfont)
         r.geometry("%dx%d" % (width, height))
 
-        body = tk.Frame(r, bg=CARD)
-        body.pack(fill="both", expand=True, padx=14, pady=(12, 0))
+        # 正文区：圆角卡片（`stretch=True` —— 它要跟着窗口长大，不是跟着内容）。
+        # ⚠️ 滚动条**放在卡片外面**（兄弟节点，坐在灰底上）：
+        #    Tk 的 Scrollbar 是系统原生控件，只有直角；塞在圆角卡片里，
+        #    它那条直边会一直顶到卡片圆角上，看着就是「圆角破了」。
+        #    挪出去之后它坐在页面底色上，谁也不碍着谁。
+        wrap = tk.Frame(r, bg=BG)
+        wrap.pack(fill="both", expand=True, padx=OUTER_PAD, pady=(OUTER_PAD, 0))
+        sb = tk.Scrollbar(wrap)
+        sb.pack(side="right", fill="y", padx=(8, 0))
+        body_cv, body = round_panel(wrap, tk, 15, 13, 12, stretch=True)
+        body_cv.pack(side="left", fill="both", expand=True)
         txt = tk.Text(body, wrap="word", font=(fam, base), bg=CARD, fg=FG,
-                      relief="flat", bd=0, padx=6, pady=2, cursor="arrow")
-        sb = tk.Scrollbar(body, command=txt.yview)
+                      relief="flat", bd=0, padx=14, pady=12, cursor="arrow",
+                      selectbackground=BLUE_SOFT, selectforeground=FG,
+                      spacing1=2, spacing3=2)
+        txt.pack(fill="both", expand=True)
+        sb.configure(command=txt.yview)
         txt.configure(yscrollcommand=sb.set)
-        sb.pack(side="right", fill="y")
-        txt.pack(side="left", fill="both", expand=True)
         txt.insert("1.0", text)
         txt.configure(state="disabled")      # 只读；仍可选中、可 Ctrl+C 复制
 
-        bar = tk.Frame(r, bg=CARD)
-        bar.pack(fill="x", padx=14, pady=12)
-        tk.Button(bar, text="知道了", font=(fam, base), bg=BLUE, fg="#ffffff",
-                  activebackground="#106ebe", activeforeground="#ffffff",
-                  relief="flat", bd=0, cursor="hand2", padx=26, pady=6,
-                  command=r.destroy).pack(side="right")
+        bar = tk.Frame(r, bg=BG)
+        bar.pack(fill="x", padx=OUTER_PAD, pady=OUTER_PAD)
+        h = base * 2 + 16
+        round_button(bar, "知道了", r.destroy, (fam, base),
+                     bg=BLUE, fg="#ffffff", hover=BLUE_DARK, active="#1e40af",
+                     parent_bg=BG, height=h, radius=pill_radius(h)
+                     ).pack(side="right")
         r.mainloop()
         return True
     except Exception:
@@ -3191,22 +4086,102 @@ def run_gui(smoke=False):
         return tk.Label(parent, text=text, bg=bg, fg=fg,
                         font=(fam, size or BASE, "bold" if bold else "normal"), **kw)
 
+    # --- 布局骨架 ---
+    # 页面 = 冷灰底 + 一张张白卡片。原来是「一个大白卡包住全部内容」，
+    # 分区之间只有一条 1px 细线，层次出不来；改成每区一张卡、卡间留 10px 灰缝，
+    # 一眼能分出「状态 / 账号 / 设置 / 隐私」几块。
     outer = tk.Frame(root, bg=BG)
     outer.pack(fill="both", expand=True, padx=OUTER_PAD, pady=OUTER_PAD)
-    card = tk.Frame(outer, bg=CARD, highlightthickness=0)
-    card.pack(fill="both", expand=True)
 
     # 内容放进可滚动区域。屏幕矮的时候（1366x768、1080p@150%…）内容会比窗口高，
     # 没有滚动的话底部「开机自启」就永远够不到 —— 那是真的没法开自启，不是难看。
-    canvas = tk.Canvas(card, bg=CARD, highlightthickness=0, bd=0)
-    vsb = tk.Scrollbar(card, command=canvas.yview)
+    canvas = tk.Canvas(outer, bg=BG, highlightthickness=0, bd=0)
+    vsb = tk.Scrollbar(outer, command=canvas.yview)
     canvas.configure(yscrollcommand=vsb.set)
+    vsb.pack(side="right", fill="y")
     canvas.pack(side="left", fill="both", expand=True)
 
-    holder = tk.Frame(canvas, bg=CARD)
-    inner = tk.Frame(holder, bg=CARD)
-    inner.pack(fill="both", expand=True, padx=22, pady=INNER_PAD)
+    holder = tk.Frame(canvas, bg=BG)
+    inner = tk.Frame(holder, bg=BG)
+    inner.pack(fill="both", expand=True, padx=(0, 2), pady=0)
     holder_id = canvas.create_window((0, 0), window=holder, anchor="nw")
+
+    # 卡片的内边距与圆角半径。**这三个数是几何常量，不是审美参数** ——
+    # 它们和旧实现（1px 描边的 Frame + `body.pack(padx=18, pady=14)`）
+    # **逐像素等价**：
+    #     旧：box 高 = body + 2×14(ipady) + 2×1(highlightthickness) = body + 30
+    #         body 宽 = inner 宽 - 2×18 - 2×1                        = inner 宽 - 38
+    #     新：cv  高 = body + 2×15                                    = body + 30
+    #         body 宽 = cv 宽 - 2×19                                  = inner 宽 - 38
+    # 也就是说：**光换卡片实现本身，内容高度一个像素都没变**（实测验证过：
+    # 旧/新实现在同一份数据下都量到 814）。
+    # 🔴 但这一轮改版最后 CONTENT_H 还是从 830 变成了 **827**，来源是另外三处
+    #    （列表容器去掉方角描边 −2、开机自启换成圆角复选框 +1、隐私区的小链接
+    #      换成圆角片 −2）。所以别把「card() 是等价的」误读成「这一轮不用重量」。
+    # 🔴 谁要动这三个数，必须同时跑 `content_h_probe.py` 重新量，
+    #    并把结果同步进 `geometry_test.py` 的 CONTENT_H / MEASURED_HEIGHTS。
+    # 🔴 还有一条硬约束：`pad_x >= radius` 且 `pad_y >= radius`（round_panel 会断言）。
+    #    违反的话 body 那块白矩形会盖住圆角，看着就像「圆角没生效」。
+    CARD_PAD_X = 19
+    CARD_PAD_Y = 15
+    CARD_R = 14
+
+    def card(pady=(0, 9), padx=CARD_PAD_X, ipady=CARD_PAD_Y, radius=CARD_R):
+        """一张圆角分区卡片，撑满宽度。返回往里塞控件的 Frame。
+
+        所有分区都走这里 —— 间距就只有一个来源，以后调整体疏密只改默认值。
+
+        ⚠️ 为什么从 `Frame + 1px 描边` 换成 Canvas（2026-10-04）：
+            Tk 没有圆角容器，`highlightthickness` 画出来的是**四个直角 + 一圈硬边**。
+            一屏之内五张方卡叠在一起，就是用户说的「太方正」。Canvas 能精确画
+            圆角（`_draw_round_rect` 就是为这个写的），代价是内容要放进
+            `create_window` 里、高度得自己跟着内容走 —— 这部分收在 `round_panel`。
+
+        ⚠️ 竖向数值是**量出来的**，不是看着顺眼挑的：设置窗口的高度直接等于
+        内容高度（`window_geometry` 的 EXTRA_H 已归零），所以这里每加 1px，
+        窗口就高 1px。5 张卡 × 上下各多 2px 就是 20px —— 在 1707x1067 这种
+        屏幕上，内容一旦越过 `sh * SCREEN_H_RATIO`（906）就会冒出滚动条。
+        改完请跑 `content_h_probe.py` 重新量，并同步 `geometry_test.py`
+        的 `CONTENT_H`。
+        """
+        cv, body = round_panel(inner, tk, padx, ipady, radius)
+        cv.pack(fill="x", pady=pady)
+        return body
+
+    # 分区标题的「配色 + 图标」表。key 就是标题原文。
+    #
+    # 🔴 为什么用表而不是在调用点一个个传色值：
+    #    五个分区各传各的，迟早会出现「同一个绿两种写法」这种漂移；
+    #    而且新增分区时**很容易忘了配色**，于是它默默变成灰字 —— 静默退化。
+    #    这里故意**不给兜底**：标题不在表里就抛异常（见下面的 sec）。
+    #    新增分区必须来这里登记，这是有意的摩擦。
+    SEC_STYLE = {
+        "已保存的账号": (VIOLET, VIOLET_SOFT, "list"),
+        "账号信息":     (BLUE, BLUE_SOFT, "user"),
+        "开机自启":     (OK, OK_SOFT, "power"),
+        "隐私":         (DANGER, DANGER_SOFT, "lock"),
+        "网络状态":     (CYAN, CYAN_SOFT, "globe"),
+    }
+
+    def sec(parent, text):
+        """分区小标题：圆角彩色图标徽章 + 深色标题字。
+
+        ⚠️ 高度和加图标之前**完全一致**（22px 徽章 vs 22px 的 Label 行高，
+           外层都是 pady=(0,7)）—— 所以换上去之后内容高度一个像素都没变。
+           这条是刻意的：改竖向间距就要重标定 CONTENT_H，能不碰就不碰。
+        """
+        style = SEC_STYLE.get(text)
+        if style is None:
+            raise ValueError(
+                "sec(): 标题 %r 没在 SEC_STYLE 里登记配色/图标。"
+                "新增分区请去 run_gui 的 SEC_STYLE 加一行 —— "
+                "这里不给默认值，就是为了不让新分区悄悄退化成没有图标的灰字。"
+                % text)
+        fg, soft, icon = style
+        head = tk.Frame(parent, bg=CARD)
+        head.pack(anchor="w", pady=(0, 7))
+        icon_badge(head, tk, icon, fg, soft).pack(side="left")
+        lbl(head, text, SMALL, True, SEC_FG).pack(side="left", padx=(8, 0))
 
     holder.bind("<Configure>",
                 lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
@@ -3227,9 +4202,10 @@ def run_gui(smoke=False):
     # 标题行：「使用说明」放最右边，紧挨着窗口右上角的最小化按钮下方
     # ⚠️ 这里的间距值在 0.3.6 统一收紧过（14→10 这类），原因见 window_geometry
     # 的说明：16:10 屏上窗口本来就吃紧，每一段 pady 都在叠加成「太高」。
-    head = tk.Frame(inner, bg=CARD)
-    head.pack(fill="x", pady=(0, 10))
-    lbl(head, "%s · 设置" % APP_TITLE, TITLE, True).pack(side="left")
+    # 标题行**不套卡片**，直接坐在灰底上 —— 它相当于页面标题，套卡反而变矮胖。
+    head = tk.Frame(inner, bg=BG)
+    head.pack(fill="x", pady=(2, 10))
+    lbl(head, "%s · 设置" % APP_TITLE, TITLE, True, bg=BG).pack(side="left")
     # 版本号紧跟在标题右边，小字弱色。用户要报问题时第一眼就能看到它。
     # **同时它也是「检查更新」的入口**（做成链接样式的小字，不新增第四个按钮 ——
     # 主按钮固定三个是既有的界面铁律，改按钮要同步改 set_busy 的控件元组）。
@@ -3237,91 +4213,170 @@ def run_gui(smoke=False):
     # ⚠️ 视觉上必须让人看出「这行字能点」：只绑 cursor 是没用的 ——
     # 截图里它跟普通灰字一模一样，用户根本不会去点。所以给它加：
     #   ① 下划线（链接的通用约定）
-    #   ② 浅蓝底色（和后面的灰底「使用说明」按钮区分开，但不抢主按钮的视觉）
+    #   ② 浅蓝圆角底（和后面的灰底「使用说明」按钮区分开，但不抢主按钮的视觉）
     # 这两个加起来，一眼就知道是可点的东西。
-    btn_ver = tk.Label(head, text="v%s　检查更新" % VERSION,
-                       font=(fam, SMALL, "underline"),
-                       fg="#0b5ed7", bg="#e7f0ff", cursor="hand2", padx=7, pady=1)
-    btn_ver.pack(side="left", padx=(8, 0))
-    # hover 时加深底色，进一步确认「可点」。
-    btn_ver.bind("<Enter>", lambda e: btn_ver.configure(bg="#d2e4ff"))
-    btn_ver.bind("<Leave>", lambda e: btn_ver.configure(bg="#e7f0ff"))
-    btn_ver.bind("<Button-1>", lambda e: on_check_update())
-    tk.Button(head, text="使用说明", font=(fam, SMALL), bg="#eef0f3", fg="#333",
-              activebackground="#e0e4ea", activeforeground="#333",
-              relief="flat", bd=0, cursor="hand2", padx=14, pady=3,
-              command=lambda: show_help()).pack(side="right")
+    #
+    # 2026-10-04 从 `tk.Label` 换成 Canvas 圆角片（`round_chip`）：
+    # Label 只有直角，和周围的圆角卡片不搭。接口是对齐的（见 round_chip 的契约），
+    # `set_busy()` 改文字/配色和 `update_wiring_check()` 的点击自检都照常工作。
+    btn_ver = round_chip(head, tk, "v%s　检查更新" % VERSION,
+                         (fam, SMALL, "underline"), BLUE_DARK, BLUE_SOFT,
+                         page=BG, height=SMALL + 14, hover="#d3e0ff",
+                         command=lambda: on_check_update())
+    btn_ver.pack(side="left", padx=(10, 0))
+    # ⚠️ 静止态底色**必须比页面底色 BG 明显深一点**（2026-10-04 实测踩到）：
+    #    第一版这里写的是 `bg="#eef1f6"` —— 那正是 BG 本身，于是按钮和背景完全
+    #    融成一片，截图里就剩四个灰字，和普通说明文字毫无区别，用户根本不会去点。
+    #    这类错**没有任何报错**，只有把截图放大才看得出来。
+    #    取值参照账号行「选用」按钮（#f1f5f9 落在白卡 #ffffff 上，差 14 级）——
+    #    这里也取与 BG 差 18 级左右的一档，保证一眼能看出是个按钮。
+    round_button(head, "使用说明", lambda: show_help(), (fam, SMALL),
+                 bg="#dbe1eb", fg="#475569", hover="#ccd5e3", active="#bfc9da",
+                 parent_bg=BG, height=SMALL + 16,
+                 radius=pill_radius(SMALL + 16)
+                 ).pack(side="right")
 
     # --- 状态条 ---
-    status = tk.Frame(inner, bg="#eef4fb")
-    status.pack(fill="x", pady=(0, 12))
-    dot = tk.Canvas(status, width=12, height=12, bg="#eef4fb", highlightthickness=0)
-    dot.pack(side="left", padx=(14, 10), pady=8)
-    dot_id = dot.create_oval(0, 0, 11, 11, fill="#bbbbbb", outline="")
-    status_text = lbl(status, "正在检测网络状态…", BASE, bg="#eef4fb", fg="#0c5460")
-    status_text.pack(side="left", pady=8)
+    # 圆角卡 + 彩色圆角图标徽章 + 文字。
+    # 原来是「4px 竖条 + 小圆点 + 文字」—— 三样都在传达同一个颜色，既挤、
+    # 又都做不大（竖条 4px、圆点 10px）。现在合成一个**会跟着状态变色**的
+    # 图标徽章，和分区标题同一套造型：一眼能看出「这是状态」，
+    # 也不会跟下面那块整块彩色底的提示消息混起来。
+    #
+    # ⚠️ 内边距 12/17 是量出来的：旧实现是「1px 描边 + pady=11」= 24，
+    #    这里 2×12 = 24，**逐像素等价**。半径必须 <= 内边距（round_panel 会断言）。
+    status_cv, status_body = round_panel(inner, tk, 17, 12, 11)
+    status_cv.pack(fill="x", pady=(0, 10))
+    st_icon = tk.Canvas(status_body, width=22, height=22, bg=CARD,
+                        highlightthickness=0, bd=0)
+    st_icon.pack(side="left", padx=(0, 10))
+    status_text = lbl(status_body, "正在检测网络状态…", BASE, bg=CARD, fg=FG)
+    status_text.pack(side="left")
+
+    def draw_status_icon(st):
+        """按状态重画徽章（浅底 + 同色系图标）。
+
+        浅底和图标色**必须成对换** —— 只换图标色的话，红图标压在浅绿底上
+        看着就是「画错了」，而这类错在截图里不一定显眼，只能靠这里锁死。
+        """
+        col = NET_COLOR.get(st, "#94a3b8")
+        soft = NET_SOFT.get(st, "#eef2f7")
+        st_icon.delete("all")
+        _draw_round_rect(st_icon, 0, 0, 22, 22, 7, soft)
+        _draw_icon(st_icon, "globe", col, 11, 11, size=13)
+
+    draw_status_icon(NET_UNKNOWN)
 
     # --- 账号列表 ---
-    lbl(inner, "已保存的账号", SMALL, True, SUB).pack(anchor="w", pady=(0, 4))
-    list_box = tk.Frame(inner, bg=CARD, highlightbackground="#e3e6ea", highlightthickness=1)
+    # ⚠️ 这里**故意不给列表容器加描边**（2026-10-04）：
+    #    原来是一个 `highlightthickness=1` 的方框。卡片本身已经圆角了，
+    #    里面再套一个**方角**框，四个角立刻把圆角的观感破坏掉；
+    #    而要把这个内框也做成圆角，就得给它上下各加 6px 内边距 ——
+    #    内容高度会凭空长 10px。收益是一个内框，代价是重标定所有几何数字，
+    #    不划算。改成「靠行与行之间的分隔线来分界」：分隔线天然是直的，
+    #    不会跟圆角打架。
+    c_acct = card()
+    sec(c_acct, "已保存的账号")
+    list_box = tk.Frame(c_acct, bg=CARD)
     list_box.pack(fill="x")
     list_inner = tk.Frame(list_box, bg=CARD)
     list_inner.pack(fill="x")
 
     # --- 表单 ---
-    lbl(inner, "账号信息", SMALL, True, SUB).pack(anchor="w", pady=(12, 2))
-    lbl(inner, "学号 / 账号", BASE, fg="#444").pack(anchor="w", pady=(6, 0))
+    def entry_box(parent, textvariable=None):
+        """带 1px 圆角描边、聚焦时描边变蓝的输入框。返回 (容器, Entry)。
+
+        为什么要包一层：`tk.Entry` **没有内部留白**（不像 ttk 有 padding），
+        文字会紧贴着左边框，看着很挤。标准做法是把 Entry 放进一个有底色和
+        描边的容器、再给 Entry 一点 padx —— 顺便就得到了聚焦变色的能力
+        （Entry 自己的 highlight 只能画在它自己那圈，而它现在被 padx 撑不满容器）。
+
+        ⚠️ 换成 Canvas 圆角底之后**高度一像素没变**（算过的，不是估的）：
+            旧：1px 描边 + `ipady=7`              → 文字上下各 8
+            新：panel `pad_y=6` + Entry `ipady=2` → 文字上下各 8
+           水平同理：旧 `1+10=11`，新 `8+3=11`。
+            所以这里能上圆角而**不用动 CONTENT_H**。
+        ⚠️ 半径只有 5，比卡片（14）小得多 —— 这是被几何锁死的：
+            半径必须 <= pad_y，而 pad_y 一加大整块就变高。
+            顺带也符合常规做法：输入框的圆角本来就该比卡片小。
+        """
+        cv, box = round_panel(parent, tk, 8, 6, 5, fill=FIELD)
+        cv.pack(fill="x")
+        e = tk.Entry(box, font=(fam, BASE), relief="flat", bd=0, bg=FIELD, fg=FG,
+                     highlightthickness=0, insertbackground=FG,
+                     textvariable=textvariable)
+        e.pack(fill="x", padx=3, ipady=2)
+        e.bind("<FocusIn>", lambda ev: panel_set_line(cv, BLUE))
+        e.bind("<FocusOut>", lambda ev: panel_set_line(cv, LINE))
+        return cv, e
+
+    c_form = card()
+    sec(c_form, "账号信息")
+    lbl(c_form, "学号 / 账号", SMALL, fg=SUB).pack(anchor="w", pady=(0, 5))
     var_uid = tk.StringVar()
-    ent_uid = tk.Entry(inner, textvariable=var_uid, font=(fam, BASE), relief="solid", bd=1)
-    ent_uid.pack(fill="x", ipady=5, pady=(3, 0))
-    lbl(inner, "密码", BASE, fg="#444").pack(anchor="w", pady=(8, 0))
+    ent_uid_box, ent_uid = entry_box(c_form, var_uid)
+    lbl(c_form, "密码", SMALL, fg=SUB).pack(anchor="w", pady=(12, 5))
 
     # --- 密码框（带隐私保护）---
     # 规则都在 PasswordField 里（那样才能单独建窗口测交互），这里只负责摆放。
-    pwd_field = PasswordField(inner, tk, (fam, BASE), (fam, SMALL), FG)
-    pwd_field.box.pack(fill="x", pady=(3, 0))
+    pwd_field = PasswordField(c_form, tk, (fam, BASE), (fam, SMALL), FG)
+    pwd_field.box.pack(fill="x")
 
     # --- 按钮（从上到下排列，每个占一整行）---
+    # 🔴 三个主按钮是界面铁律：`set_busy` 的控件元组就是这三个，改数量要同步改它。
     def mkbtn(parent, text, cmd, kind="ghost"):
         style = {
-            "primary": (BLUE, "#ffffff", "#106ebe"),
-            "ghost":   ("#e9edf2", "#333333", "#dde3ea"),
-            "danger":  ("#fdeceb", "#c0392b", "#fbdcd9"),
+            "primary": (BLUE, "#ffffff", BLUE_DARK, "#1e40af"),
+            "ghost":   ("#f1f5f9", "#334155", "#e7ecf3", "#dbe2ea"),
+            "danger":  (DANGER_SOFT, DANGER, "#fbdada", "#f8caca"),
         }[kind]
-        b = tk.Button(parent, text=text, command=cmd, font=(fam, BASE),
-                      bg=style[0], fg=style[1], activebackground=style[2],
-                      activeforeground=style[1], relief="flat", bd=0, cursor="hand2",
-                      disabledforeground="#9aa0a6")
-        b.pack(fill="x", pady=(0, 6), ipady=7)
+        # 胶囊形：半径 = 高度的一半减 1（见 pill_radius 的说明）。
+        # 原来是 9 —— 在 34px 高的按钮上只有一丝倒角，看着还是方的。
+        h = BASE * 2 + 14
+        b = round_button(parent, text, cmd, (fam, BASE),
+                         bg=style[0], fg=style[1], hover=style[2], active=style[3],
+                         parent_bg=CARD, height=h, radius=pill_radius(h))
+        b.pack(fill="x", pady=(0, 7))
         return b
 
-    btns = tk.Frame(inner, bg=CARD)
-    btns.pack(fill="x", pady=(14, 0))
+    btns = tk.Frame(c_form, bg=CARD)
+    btns.pack(fill="x", pady=(16, 0))
     btn_switch = mkbtn(btns, "切换到此账号", lambda: on_switch(), "primary")
     btn_save = mkbtn(btns, "仅保存", lambda: on_save())
     btn_out = mkbtn(btns, "退出当前账号", lambda: on_logout(), "danger")
 
     # --- 消息 ---
-    msg = lbl(inner, "", BASE, bg="#e8f2fb", fg="#0c5460", anchor="w", justify="left",
-              wraplength=760)
-    msg.pack(fill="x", ipady=8, pady=(10, 0))
+    # 为什么外面再套一个 holder（2026-10-04）：`pack_forget()` 之后再 `pack()`
+    # 会把控件排到**最后**，而不是回到原位 —— 原来的写法让提示消息跑到窗口最底部
+    # （隐私区下面），离刚点的按钮隔了一屏。holder 常驻、只增删里面的 msg，
+    # 位置就固定在账号卡片下方了。
+    msg_holder = tk.Frame(inner, bg=BG)
+    msg_holder.pack(fill="x")
+    msg = lbl(msg_holder, "", BASE, bg=BLUE_SOFT, fg=FG, anchor="w", justify="left",
+              wraplength=700, padx=14, highlightthickness=1,
+              highlightbackground=LINE)
+    msg.pack(fill="x", ipady=10, pady=(0, 10))
     msg.pack_forget()
 
     # --- 开机自启 ---
-    # 分隔带从 (20,14) 收到 (12,10)：0.3.6 统一收紧竖向间距
-    tk.Frame(inner, bg="#eef0f3", height=1).pack(fill="x", pady=(12, 10))
-    lbl(inner, "开机自启", SMALL, True, SUB).pack(anchor="w", pady=(0, 4))
+    c_auto = card()
+    sec(c_auto, "开机自启")
     var_auto = tk.BooleanVar()
-    chk = tk.Checkbutton(inner, text="开机时自动登录校园网", variable=var_auto,
-                         command=lambda: on_toggle_autostart(), bg=CARD, fg="#333",
-                         activebackground=CARD, font=(fam, BASE), anchor="w",
-                         selectcolor="#ffffff", cursor="hand2")
+    # 圆角自绘复选框（见 round_check 的说明）。接口和 tk.Checkbutton 对齐：
+    # `configure(state=...)` / `cget("text")` 都能用，`variable` 换成显式传 var。
+    chk = round_check(c_auto, tk, "开机时自动登录校园网", var_auto,
+                      lambda: on_toggle_autostart(), (fam, BASE))
     chk.pack(anchor="w")
 
     # 「开机自启」勾打着、但快捷方式其实已失效时的提示。
     # 快捷方式存的是绝对路径，挪动 exe 就会指不到；而光看勾选状态发现不了，
     # 所以必须把这种静默失败显式说出来。默认不显示。
-    warn_auto = lbl(inner, "", SMALL, False, "#b45309", justify="left", wraplength=700)
+    #
+    # ⚠️ 它必须**挂在这张卡里面**（2026-10-04）：refresh_auto_warning() 是
+    #    pack_forget() + pack() 的写法，而 re-pack 会把控件排到**末尾**。
+    #    挂在内层卡片里，末尾就是勾选框下面 —— 正好；挂在最外层 inner 上，
+    #    它就会跑到整个窗口最底部（隐私区下面），离勾选框隔了一屏。
+    warn_auto = lbl(c_auto, "", SMALL, False, WARN, justify="left", wraplength=680)
 
     def refresh_auto_warning():
         try:
@@ -3335,14 +4390,14 @@ def run_gui(smoke=False):
             warn_auto.configure(
                 text="⚠ 开机自启项指向的是 exe 的「旧位置」，开机时实际不会生效。\n"
                      "   把下面的勾取消、再重新勾选一次即可修好。")
-            warn_auto.pack(anchor="w", pady=(6, 0))
+            warn_auto.pack(anchor="w", pady=(8, 0))
         elif old_args:
             # 0.2.0 装的 .lnk 参数是 `--auto`，没有 `--guard` —— 开机照常登录，
             # 但掉线后不会自动重连。不提示的话用户会以为新版本没修好。
             warn_auto.configure(
                 text="⚠ 开机自启还是「旧设置」：开机照常登录，但掉线后不会自动重连。\n"
                      "   把下面的勾取消、再重新勾选一次即可升级。")
-            warn_auto.pack(anchor="w", pady=(6, 0))
+            warn_auto.pack(anchor="w", pady=(8, 0))
         else:
             warn_auto.pack_forget()
 
@@ -3352,38 +4407,52 @@ def run_gui(smoke=False):
     # 不该逼他先学会开终端。
     # 做成和「检查更新」同款的小链接，**不新增第四个主按钮**（主按钮固定三个
     # 是界面铁律；这里也不进 set_busy 的控件元组 —— 忙碌拦截由 on_purge 自己做）。
-    tk.Frame(inner, bg="#eef0f3", height=1).pack(fill="x", pady=(12, 10))
-    lbl(inner, "隐私", SMALL, True, SUB).pack(anchor="w", pady=(0, 4))
-    lbl(inner, "账号密码只存在这台电脑上，不会上传到任何服务器。",
-        SMALL, fg="#666").pack(anchor="w")
-    btn_purge = tk.Label(inner, text="清除本机保存的账号密码",
-                         font=(fam, SMALL, "underline"),
-                         fg="#c0392b", bg="#fdeceb", cursor="hand2",
-                         padx=7, pady=1)
-    btn_purge.pack(anchor="w", pady=(6, 0))
+    c_priv = card(pady=(0, 0))
+    sec(c_priv, "隐私")
+    lbl(c_priv, "账号密码只存在这台电脑上，不会上传到任何服务器。",
+        SMALL, fg=SUB).pack(anchor="w")
+    # 同样换成圆角片（和版本号那行同一个理由：Label 只有直角）。
     # 和版本号那行同一个道理：光绑 cursor 是没用的 —— 截图里它跟普通灰字
     # 一模一样，用户根本不会去点。下划线 + 浅红底 + hover 加深，才看得出能点。
-    btn_purge.bind("<Enter>", lambda e: btn_purge.configure(bg="#fbdcd9"))
-    btn_purge.bind("<Leave>", lambda e: btn_purge.configure(bg="#fdeceb"))
-    btn_purge.bind("<Button-1>", lambda e: on_purge())
+    btn_purge = round_chip(c_priv, tk, "清除本机保存的账号密码",
+                           (fam, SMALL, "underline"), DANGER, DANGER_SOFT,
+                           height=SMALL + 14, hover="#fbdada",
+                           command=lambda: on_purge())
+    btn_purge.pack(anchor="w", pady=(10, 0))
 
     # --- 状态 ---
     state = {"busy": False, "queue": None, "buttons": None,
              # 升级用的临时状态。都要走界面线程，所以放在这里而不是局部变量。
-             "pending": None, "dl_text": ""}
+             "pending": None, "dl_text": "",
+             # 账号列表里每行的「删除」按钮。render_accounts 每次重建列表都会换一批，
+             # 所以这里存的是**当前这一批**。set_busy 必须能拿到它们 —— 见下面的说明。
+             "row_btns": []}
 
     def show(text, kind="info"):
-        color = {"ok": ("#e6f6ea", "#155724"),
-                 "err": ("#fdeceb", "#721c24"),
-                 "info": ("#e8f2fb", "#0c5460")}[kind]
+        color = {"ok": (OK_SOFT, "#14532d"),
+                 "err": (DANGER_SOFT, "#7f1d1d"),
+                 "info": (BLUE_SOFT, "#1e3a8a")}[kind]
         msg.configure(text=text, bg=color[0], fg=color[1])
-        msg.pack(fill="x", ipady=10, pady=(16, 0))
+        msg.pack(fill="x", ipady=10, pady=(0, 10))
 
     def set_busy(b):
         state["busy"] = b
         st = "disabled" if b else "normal"
         for w in (btn_switch, btn_save, btn_out):
             w.configure(state=st)
+        # 🔴 账号列表里每行的「删除」也必须跟着灰掉（2026-10-03 加）。
+        #    原来这个元组里只有上面三个按钮，而「删除」是 render_accounts 每次
+        #    现建的、不在其中 —— 于是「切换账号 / 退出账号」在后台跑的那十几秒里，
+        #    用户仍然能点删除。那条路会走 drop() → mutate_accounts()，
+        #    和后台线程的 update_account_record() 抢同一份账号库。
+        #    （锁已经能兜住，但让入口根本不出现更好 —— 用户也不该在忙的时候删东西。）
+        #
+        #    这批按钮会被 render_accounts 整批 destroy 掉，所以先问「还在不在」再动它
+        #    —— 对已销毁的控件 configure 会抛 TclError。不用 try/except 是为了
+        #    和上面那三个按钮保持同一种写法，也免得又添一个「静默吞异常」。
+        for w in state.get("row_btns") or ():
+            if w.winfo_exists():
+                w.configure(state=st)
         # 升级期间版本号小字也不能点，否则会并发起两个检查/两次替换。
         try:
             btn_ver.configure(cursor="arrow" if b else "hand2")
@@ -3396,7 +4465,7 @@ def run_gui(smoke=False):
                 btn_ver.configure(text=state["dl_text"])
             elif not b:
                 btn_ver.configure(text="v%s　检查更新" % VERSION,
-                                  fg="#0b5ed7", bg="#e7f0ff",
+                                  fg=BLUE_DARK, bg=BLUE_SOFT,
                                   font=(fam, SMALL, "underline"))
         except Exception:
             pass
@@ -3416,6 +4485,8 @@ def run_gui(smoke=False):
     def render_accounts():
         for w in list_inner.winfo_children():
             w.destroy()
+        # 上面 destroy 之后，旧的那批「删除」按钮已经失效 —— 重新收集。
+        state["row_btns"] = []
         store = load_accounts()
         cfg = load_config()
         cur = cfg.get("userId") or ""
@@ -3423,33 +4494,56 @@ def run_gui(smoke=False):
         ids.sort(key=lambda k: (store["accounts"][k].get("lastSuccess") or "", k), reverse=True)
 
         if not ids:
-            lbl(list_inner, "暂无保存的账号", SMALL, fg="#999").pack(anchor="w", padx=14, pady=9)
+            lbl(list_inner, "暂无保存的账号", SMALL, fg=SUB).pack(anchor="w", padx=14, pady=14)
             return
         for i, uid in enumerate(ids):
             a = store["accounts"][uid]
             row = tk.Frame(list_inner, bg=CARD)
             row.pack(fill="x")
             if i:
-                tk.Frame(list_inner, bg="#eef0f3", height=1).pack(fill="x")
+                tk.Frame(list_inner, bg=LINE, height=1).pack(fill="x")
             left = tk.Frame(row, bg=CARD)
-            left.pack(side="left", fill="x", expand=True, padx=14, pady=6)
+            left.pack(side="left", fill="x", expand=True, padx=14, pady=9)
             line = tk.Frame(left, bg=CARD)
             line.pack(anchor="w")
             lbl(line, uid, BASE, True).pack(side="left")
             if uid == cur:
-                lbl(line, " 当前使用 ", SMALL - 1, fg="#0b5ed7", bg="#e7f0ff").pack(side="left", padx=(6, 0))
+                round_chip(line, tk, "当前使用", (fam, SMALL - 1), BLUE_DARK,
+                           BLUE_SOFT).pack(side="left", padx=(8, 0))
             if uid == store.get("lastOnline"):
-                lbl(line, " 上次登录 ", SMALL - 1, fg="#1a7f37", bg="#e2f6e6").pack(side="left", padx=(4, 0))
+                round_chip(line, tk, "上次登录", (fam, SMALL - 1), "#15803d",
+                           OK_SOFT).pack(side="left", padx=(4, 0))
             if a.get("lastSuccess"):
-                lbl(left, "上次成功：%s" % a["lastSuccess"], SMALL - 1, fg="#888").pack(anchor="w")
+                lbl(left, "上次成功：%s" % a["lastSuccess"], SMALL - 1,
+                    fg=SUB).pack(anchor="w", pady=(3, 0))
             right = tk.Frame(row, bg=CARD)
-            right.pack(side="right", padx=12)
-            tk.Button(right, text="选用", font=(fam, SMALL), relief="solid", bd=1,
-                      bg="#ffffff", cursor="hand2",
-                      command=lambda u=uid: pick(u)).pack(side="left", padx=4)
-            tk.Button(right, text="删除", font=(fam, SMALL), relief="solid", bd=1,
-                      fg="#c0392b", bg="#ffffff", cursor="hand2",
-                      command=lambda u=uid: drop(u)).pack(side="left", padx=4)
+            right.pack(side="right", padx=14)
+            # ⚠️ 这里**故意不做整行 hover**（2026-10-04 试过又撤了）：
+            #    圆角按钮是 Canvas 画的，它四个角露出的是自己的 bg（=CARD 白）。
+            #    整行一变灰，那两个按钮的角上就顶着两块白方块。
+            #    要把角一起染上就得给按钮也改 bg，可按钮的 <Enter>/<Leave>
+            #    已经用来做自己的 hover 了 —— Tk 的 bind 是**覆盖**不是叠加，
+            #    再绑一次会把按钮自身的悬停效果弄没。
+            #    收益不大、坑很实在，所以只保留按钮自己的悬停反馈。
+            rh = SMALL + 16
+            round_button(right, "选用", lambda u=uid: pick(u), (fam, SMALL),
+                         bg="#f1f5f9", fg="#334155", hover="#e7ecf3", active="#dbe2ea",
+                         parent_bg=CARD, height=rh, radius=pill_radius(rh), pad_x=26
+                         ).pack(side="left", padx=(0, 6))
+            # 「删除」原来的静止态是**白底**，在白卡片上完全看不出是个按钮
+            # （截图放大后才发现的）。给一层很浅的红：既看得出能点，
+            # 又不会像「退出当前账号」那样抢眼。
+            b_del = round_button(right, "删除", lambda u=uid: drop(u), (fam, SMALL),
+                                 bg="#fef6f6", fg=DANGER, hover=DANGER_SOFT,
+                                 active="#f8caca", parent_bg=CARD,
+                                 height=rh, radius=pill_radius(rh), pad_x=26)
+            b_del.pack(side="left")
+            # 新建的按钮必须**按当前忙碌状态**初始化：任务结束时 handle_msg 是先
+            # load_all()（会重建列表）再 set_busy(False) 的，中间那一刻如果新按钮
+            # 默认是 normal，忙碌期间就又能点了 —— 正好绕开刚加的那道禁用。
+            if state["busy"]:
+                b_del.configure(state="disabled")
+            state["row_btns"].append(b_del)
 
     def pick(uid):
         store = load_accounts()
@@ -3459,11 +4553,13 @@ def run_gui(smoke=False):
     def drop(uid):
         if not messagebox.askyesno(APP_TITLE, "从列表中删除账号 %s 吗？" % uid):
             return
-        store = load_accounts()
-        store["accounts"].pop(uid, None)
-        if store.get("lastOnline") == uid:
-            store["lastOnline"] = ""
-        save_accounts(store)
+
+        def _do(store):
+            store["accounts"].pop(uid, None)
+            if store.get("lastOnline") == uid:
+                store["lastOnline"] = ""
+
+        mutate_accounts(_do)
         render_accounts()
 
     def load_all():
@@ -3472,11 +4568,12 @@ def run_gui(smoke=False):
         pwd_field.set(cfg.get("passwd") or "")
         uid = cfg.get("userId")
         if uid:
-            store = load_accounts()
-            if uid not in store["accounts"]:
-                store["accounts"][uid] = {"passwd": cfg.get("passwd") or "",
-                                          "lastSuccess": "", "lastAttempt": "", "lastResult": ""}
-                save_accounts(store)
+            def _do(store):
+                if uid not in store["accounts"]:
+                    store["accounts"][uid] = {"passwd": cfg.get("passwd") or "",
+                                              "lastSuccess": "", "lastAttempt": "",
+                                              "lastResult": ""}
+            mutate_accounts(_do)
         render_accounts()
         try:
             var_auto.set(is_autostart_on())
@@ -3508,7 +4605,10 @@ def run_gui(smoke=False):
         kind, payload = msg
         if kind == "status":
             st = payload
-            dot.itemconfigure(dot_id, fill=NET_COLOR.get(st, "#bbbbbb"))
+            # 徽章的浅底 + 图标色一起换（见 draw_status_icon）。
+            # 原来是「圆点 + 左侧竖条 + 文字」三处一起改；现在合成一个徽章，
+            # 少了两处要同步的地方，也就少了两处能漏改的地方。
+            draw_status_icon(st)
             status_text.configure(text=NET_TEXT.get(st, "网络状态未知"))
         elif kind == "job":
             code, text = payload
@@ -3813,7 +4913,10 @@ def run_gui(smoke=False):
         """
         win = tk.Toplevel(root)
         win.title("使用说明 · %s v%s" % (APP_TITLE, VERSION))
-        win.configure(bg=CARD)
+        # 窗口底色 = **页面底色**，不是卡片底色 —— 正文区是一张圆角卡片，
+        # 卡片和窗口同色的话圆角就看不出来了（这是刚把直角改成圆角时最
+        # 容易漏的一步：改卡片忘了改窗口）。
+        win.configure(bg=BG)
         win.transient(root)              # 跟随主窗口，不单独占一个任务栏项
         ico = icon_path()
         if ico:
@@ -3822,24 +4925,36 @@ def run_gui(smoke=False):
             except Exception:
                 pass
 
-        body = tk.Frame(win, bg=CARD)
-        body.pack(fill="both", expand=True, padx=16, pady=(14, 0))
+        # 正文区：圆角卡片（`stretch=True` —— 它要跟着窗口长大，不是跟着内容）。
+        # ⚠️ 滚动条**放在卡片外面**（兄弟节点，坐在灰底上）：
+        #    Tk 的 Scrollbar 是系统原生控件，只有直角；塞在圆角卡片里，
+        #    它那条直边会一直顶到卡片圆角上，看着就是「圆角破了」。
+        #    这一段和 `show_text_window()`（命令行 `--help` 用）是同一套做法，
+        #    改一处记得看另一处 —— 它俩本来就是同一个「看长文本」的窗口，
+        #    历史上是两份独立实现，已经因此漏改过一次（弹窗截图字节没变）。
+        wrap = tk.Frame(win, bg=BG)
+        wrap.pack(fill="both", expand=True, padx=OUTER_PAD, pady=(OUTER_PAD, 0))
+        sb = tk.Scrollbar(wrap)
+        sb.pack(side="right", fill="y", padx=(8, 0))
+        body_cv, body = round_panel(wrap, tk, 15, 13, 12, stretch=True)
+        body_cv.pack(side="left", fill="both", expand=True)
         txt = tk.Text(body, wrap="word", font=(fam, BASE), bg=CARD, fg=FG,
-                      relief="flat", bd=0, padx=6, pady=2,
-                      spacing1=1, spacing3=1, cursor="arrow")
-        sb = tk.Scrollbar(body, command=txt.yview)
+                      relief="flat", bd=0, padx=14, pady=12, cursor="arrow",
+                      selectbackground=BLUE_SOFT, selectforeground=FG,
+                      spacing1=2, spacing3=2)
+        sb.configure(command=txt.yview)
         txt.configure(yscrollcommand=sb.set)
-        sb.pack(side="right", fill="y")
-        txt.pack(side="left", fill="both", expand=True)
+        txt.pack(fill="both", expand=True)
         txt.insert("1.0", HELP_TEXT + SWITCH_HELP)
         txt.configure(state="disabled")  # 只读；仍可选中复制
 
-        bar = tk.Frame(win, bg=CARD)
-        bar.pack(fill="x", padx=16, pady=14)
-        tk.Button(bar, text="知道了", font=(fam, BASE), bg=BLUE, fg="#ffffff",
-                  activebackground="#106ebe", activeforeground="#ffffff",
-                  relief="flat", bd=0, cursor="hand2", padx=26, pady=6,
-                  command=win.destroy).pack(side="right")
+        bar = tk.Frame(win, bg=BG)
+        bar.pack(fill="x", padx=OUTER_PAD, pady=OUTER_PAD)
+        h = BASE * 2 + 16
+        round_button(bar, "知道了", win.destroy, (fam, BASE),
+                     bg=BLUE, fg="#ffffff", hover=BLUE_DARK, active="#1e40af",
+                     parent_bg=BG, height=h, radius=pill_radius(h)
+                     ).pack(side="right")
 
         if smoke:
             win.withdraw()               # 自检时不真的弹出来
@@ -3860,23 +4975,36 @@ def run_gui(smoke=False):
         start_job("正在退出当前账号…", action_runner(do_logout))
 
     def on_toggle_autostart():
+        if state["busy"]:
+            # 有任务在跑（切换账号 / 退出 / 自启设置本身）。此刻不该改自启设置，
+            # 把勾同步回**真实状态**，免得用户以为改了。
+            var_auto.set(is_autostart_on())
+            return
         want = var_auto.get()
-        ok, why = set_autostart(want)
-        if not ok:
-            var_auto.set(not want)
-            show("设置失败：%s" % why, "err")
-            return
-        refresh_auto_warning()      # 重新勾选之后，警告要跟着消失
-        if not want:
-            show("已关闭开机自启", "ok")
-            return
-        # 说清楚走的是哪条路。只有建不了计划任务时才会退回启动文件夹，
-        # 而那条路要等到开机后约 85 秒（计划任务约 25 秒）—— 不告诉用户的话，
-        # 他下次开机还是会觉得「怎么又这么慢」。
-        if autostart_mode() == "task":
-            show("已开启开机自启", "ok")
-        else:
-            show("已开启开机自启（本机退回用「启动文件夹」，开机会慢约 1 分钟）", "ok")
+
+        def job():
+            ok, why = set_autostart(want)
+            if not ok:
+                return 1, "设置失败：%s" % why
+            if not want:
+                return 0, "已关闭开机自启"
+            # 说清楚走的是哪条路。只有建不了计划任务时才会退回启动文件夹，
+            # 而那条路要等到开机后约 85 秒（计划任务约 25 秒）—— 不告诉用户的话，
+            # 他下次开机还是会觉得「怎么又这么慢」。
+            if autostart_mode() == "task":
+                return 0, "已开启开机自启"
+            return 0, "已开启开机自启（本机退回用「启动文件夹」，开机会慢约 1 分钟）"
+
+        # 🔴 为什么必须放后台（2026-10-03 改）：
+        #    set_autostart() → task_create() → _ps()，而 _ps 的超时是 **60 秒**。
+        #    正常约 1 秒，但组策略禁用 / 任务计划服务停了 / 杀软拦 PowerShell 时会
+        #    走满 60 秒 —— 在主线程跑就是「界面冻 60 秒、而且一个字的提示都没有」，
+        #    用户只会以为程序死了（很可能直接强杀进程）。
+        #    ⚠️ 失败时**不用**手动把勾翻回去：handle_msg → load_all() 会用
+        #       is_autostart_on() 读真实状态同步复选框，refresh_auto_warning() 也跟着
+        #       更新 —— 这两件事 load_all() 都做了，原来那行 var_auto.set 是多余的手工活，
+        #       而且一旦漏了某个分支就会「勾与实际对不上」。
+        start_job("正在设置开机自启…", job)
 
     # --- 启动 ---
     # queue 已在模块顶层导入（poll() 要按名字捕获 queue.Empty）
@@ -3911,6 +5039,9 @@ def run_gui(smoke=False):
         # 更新入口接线自检：真给版本号小字发一个点击，确认整条链通。
         # 同 pwd_wiring_check —— 光看代码证明不了「点下去真的会跑」。
         log(update_wiring_check(btn_ver))
+        # 按钮配色自检：确认没有哪个按钮的底色和它坐的背景同色
+        # （同色 = 按钮隐形。这类错不抛异常，只有放大截图才看得见）。
+        log(ui_contrast_check(root))
         # 顺便把说明弹窗也建一次，确认它能起来（不显示，建完就销毁）
         try:
             hv = show_help()

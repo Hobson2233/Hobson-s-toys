@@ -4,7 +4,7 @@
 
 > 非官方项目，与学校网络管理部门无关。请仅使用你本人有权访问的账号，并遵守学校的网络使用规定。
 
-当前版本 0.3.6，从 [Releases](../../releases) 下载。
+当前版本 0.4.0，从 [Releases](../../releases) 下载。
 
 ![设置主界面](docs/main.png)
 
@@ -54,7 +54,9 @@ python build.py
 
 `build.py` 依次完成打包、冒烟测试、隐私检查与可移植性检查，任一步骤未通过则不出包。
 
-发布站点时，把构建产物交给工作区根目录的 `make_site.py` 放进 `site/`，再由 `make_manifest.py` 生成更新清单，最后用 `deploy/deploy.py` 把 `site/` 发布到 Cloudflare Worker 的静态资源上。发布是**整份替换**：新版本目录里没有的文件，线上会直接消失（所以旧版安装包不会留在服务器上）。
+发布站点时，把构建产物交给工作区根目录的 `make_site.py` 放进 `site/`，再由 `make_manifest.py` 生成更新清单，最后用 `deploy/deploy.py` 把 `site/` 发布到 Cloudflare Worker 的静态资源上。
+
+页面是**整份替换**的：新版本目录里没有的页面文件，线上会直接消失。但**历史安装包会保留** —— 它们归档在工作区的 `dl_archive/`，每次发布整体放进 `site/dl/`，所以站点上有一个[历史版本页](https://hobson2233.dpdns.org/history)，每个发布过的版本都能下载。安装包文件名带版本号（`dl/campus-login-0.4.0.exe`），因此可以配长缓存。
 
 开发脚本、测试清单与排障说明见 [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)。
 

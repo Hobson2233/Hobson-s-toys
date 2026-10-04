@@ -100,10 +100,20 @@ def grab(widget, name):
 
 
 def find_button(w, text):
-    """在控件树里按文字找按钮（run_gui 里的按钮都是局部变量，拿不到引用）。"""
+    """在控件树里按文字找按钮（run_gui 里的按钮都是局部变量，拿不到引用）。
+
+    ⚠️ 2026-10-04 起按钮**不再都是 tk.Button**：「使用说明」和三个主按钮换成了
+    Canvas 手绘的圆角按钮（见 campus_login.round_button）。它们把文字挂在
+    `_rb_text` 属性上，这里一并认。
+
+    为什么要专门说这一句：漏认的后果是**静默的** —— 找不到就只打印一行
+    「没找到」，后面的截图流程照样跑完，看起来像成功了，其实第 5 张图是空的。
+    """
     for c in w.winfo_children():
         try:
             if isinstance(c, tk.Button) and c.cget("text") == text:
+                return c
+            if getattr(c, "_rb_text", None) == text:
                 return c
         except Exception:
             pass
