@@ -6,9 +6,13 @@
 
 ```
 campus_login.py         主程序（单文件，无参=GUI；命令行开关见 `SWITCH_HELP`，或用 --help 打印）
+palette.py              界面配色的**唯一来源**（程序与站点 CSS 共用一份，见「界面配色」一节）
 paths.py                统一的路径解析（不要在脚本里写死绝对路径）
 proc_tree.py            进程树管理：Job Object + 看门狗 + _MEI 残留清理
-build.py                构建入口，带四道门槛
+build.py                构建入口，带五道门槛（含域名一致性，见下）
+run_tests.py            测试统一入口：fast / env / gate 三档 + `--audit` 查漏登记
+domain_drift_test.py    站点域名「多处不漂移」一致性测试（构建门槛，源码级）
+school_profile_test.py  学校参数：换学校只改 config.json 真的生效（含阳性对照）
 savepoint.py            本地存档：改代码前打快照，搞砸了能回退
 ast_bugscan.py          AST 级 bug 扫描（自查用，带阳性/阴性对照）
 stack_probe.py          卡住时打印所有线程堆栈（排障用）
@@ -16,12 +20,69 @@ local_secrets.example.py  本地凭据模板（复制成 local_secrets.py 填真
 docs/                   README 用的界面截图与本文件
 ```
 
+`palette.py` 和 `updater.py` 一样是**顶层 import** —— PyInstaller 的 `--onefile` 是「纯脚本目录」，
+不走包机制，所以同级模块顶层 import 就会被打包进去（藏在函数里的 import 反而容易被漏掉）。
+
 ## 测试与诊断脚本
+
+**先用统一入口跑一遍**，别靠脑子记「这次该跑哪几个」：
+
+```bash
+python run_tests.py            # = fast，纯逻辑，秒级（13 个）
+python run_tests.py env        # 要 Tk / 真桌面 / pylnk3（12 个）
+python run_tests.py gate       # 需要一个已构建的 exe（5 个）
+python run_tests.py gate <exe> # 指定 exe；不传就用 paths.find_exe()
+python run_tests.py --list     # 全部清单（含**永不自动跑**的 manual 档，附原因）
+python run_tests.py --audit    # 只查「有没有 *_test.py / *_probe.py 漏登记」
+```
+
+三档的分界就是「在无人值守会话里跑不跑得动」。三个设计要点：
+
+- **`--audit` 是防漏接的**。新写了 `*_test.py` 却忘了登记进 `run_tests.py`，它就红。
+  项目里那三十多个「本来该跑、只是没人接」的脚本就是这么攒出来的 ——
+  跑不动的**也要登记**，放 `MANUAL` 并写清原因。
+- **输出走临时文件，不走管道**。理由同 `build.py` 里那条坑：`--onefile` 的
+  bootloader 会起子进程，孙进程继承写端；孙进程不退，管道就永远等不到 EOF，
+  **设了 timeout 也照样挂死**。写文件没有「等 EOF」这回事。
+- 超时不是 `p.kill()` 就完事 —— 这些脚本会起 Tk / 子进程 / 甚至 exe，
+  必须 `proc_tree.kill_tree(p.pid)` 连整棵树一起收。
+
+⚠️ 本脚本**不建 Tk 窗口**，所以它在哪种解释器下跑都行；但它**跑的那些脚本**可能
+需要 tkinter / pylnk3，所以跑 `env` / `gate` 档前先确认解释器齐（见下）。
+
+### 分档分错会长什么样（2026-10-05 实测）
+
+第一版 `env` 档塞了 18 个，实跑 **12 通过 / 6 没通过**。逐个查下来，
+**6 个「失败」里 5 个是分档错，只有 1 个是真 bug**：
+
+| 脚本 | 表面 | 实际 |
+|---|---|---|
+| `logout_fail_probe.py` | 失败：`start_job 用 state["busy"] 判重入` | 🔴 **真回归** —— 它按源码文本断言，`run_gui` 拆成 `LoginApp` 后 `state` 变成了 `self.state`，字面量对不上了 |
+| `updater_test.py` | 超时 240s | 受限会话把回环连接丢弃（脚本自己的 docstring 就写了），换个环境就好 |
+| `watchdog_gil_test.py` | 失败 | **概率性**复现 Tk 卡死，复现不到就报「什么都没验到」，脚本自己写了「常复现不到」 |
+| `fresh_test.py` | 超时 + 1 项 FAIL | 断言「数据目录落在 `ProgramData` 下」，而受限会话里 `ProgramData` 不可写、程序**正确地**退回 `%APPDATA%`；末尾 Tk 收尾还会卡 |
+| `tk_probe.py` | 超时 241s | 诊断探针，打印完事件表后 Tk 收尾卡住 |
+| `tk_exit_race_test.py` | 失败（退出码 1） | 它验的是「`os._exit` 会卡」这个**已知结论**，结论成立时**故意退 1** —— 1 是「判断成立」，不是「失败」 |
+
+**两条教训**：
+
+1. **「按源码文本断言」的测试是重构的隐形地雷。** 那个真回归之所以能被发现，
+   纯粹是因为统一入口终于把 `logout_fail_probe.py` 跑起来了 —— 它平时没人跑。
+   现在它改用**容忍 `self.` 前缀的正则**，下次再重构不用回来改。
+2. **`MANUAL` 不只是「会动真实账号」。** 还应该收：
+   ① 断言依赖本机条件（`ProgramData` 可写 / 真回环网络）的；
+   ② 概率性、跑不到就是「什么都没验到」的；
+   ③ 结论成立时故意退非 0 的诊断探针。
+   这三类留在 `env` 档里，`run_tests.py env` 就会**永远红**，而「永远红」等于没人看。
+   代价是这些脚本平时跑不到 —— 所以 `--list` 会把它们连原因一起打出来。
 
 | 脚本 | 作用 | 能不能当门槛 |
 |---|---|---|
+| `run_tests.py` | **统一入口**：`fast` / `env` / `gate` 三档 + `--list` / `--audit`。不建 Tk，哪种解释器都能跑 | 是（已可当入口，未接进 build.py） |
 | `leak_check.py` | 隐私检查：exe 里有没有夹带账号密码 | 是门槛 |
 | `portability_check.py` | 可移植性：换台电脑能不能跑 | 是门槛 |
+| `domain_drift_test.py` | 站点域名「7 个文件说的是同一个域名」；**源码级**，故意放在打包之前 | 是门槛 |
+| `school_profile_test.py` | 学校参数（`triggerUrl` / `checkTargets` / `loginExtra` / `campusSubnets`…）改 config.json 真的生效；含阳性对照与「写坏了要退回默认」 | 否 |
 | `secret_scan.py` | **提交前**扫凭据 / 本机绝对路径 | 提交前跑（`--staged`） |
 | `help_check.py` | 内置使用说明确实进了 exe | 否（可以加进 build.py） |
 | `wiring_gate_test.py` | 验「接线自检」这道门槛的报警链路本身通不通 | 否 |
@@ -38,7 +99,8 @@ docs/                   README 用的界面截图与本文件
 | `proc_tree_test.py` | 进程树与看门狗，含「故意复现孤儿进程」 | 否 |
 | `autostart_test.py` | 开机自启的增删改查（**计划任务 + `.lnk` 两条路**）、`.lnk` 参数读法、`autostart_stale` / `autostart_outdated`、**升级迁移不被构建产物污染** | 否 |
 | `guard_test.py` | 守护判断表、守护标记自愈、用户主动退出的避让、`do_auto` 重试、`.lnk` 参数读法 | 否 |
-| `network_state_test.py` | 校园网判定 / MAC 校验 / `network_state` 四态 / 门户 MAC 替换 | 否 |
+| `network_state_test.py` | 校园网判定 / MAC 校验 / `network_state` 四态 / 门户 MAC 替换。⚠️ 第 2 节是**真机实测**，本机 IP 不在校园网段时**明确跳过**而不是假红（2026-10-05 改） | 否 |
+| `logout_fail_probe.py` | 两个窗口并发点「退出」→ 复现「退出失败」。段 1 按源码断言（**容忍 `self.` 前缀的正则**，别写死字面量）；段 2 用假门户。自带 `datasafe` 沙箱 | 否 |
 | `auto_timing_probe.py` | 把每次 `--auto` 的耗时按阶段拆开（定位「自启慢」慢在哪一段） | 否（诊断用） |
 | `ui_shot.py` / `layout_probe.py` | 截图 / 量布局（要真桌面） | 否 |
 | `png_zoom.py` | 裁切放大 PNG 局部、数字形个数（核对截图里画了什么） | 否 |
@@ -484,11 +546,21 @@ holder.winfo_height()    = 783      ← 需要多少就给多少，富余 0
 
 ## 界面配色、圆角与图标
 
-配色的**唯一来源**是 `campus_login.py` 顶部那组 `BG` / `CARD` / `FG` / `BLUE` /
-`OK` / `DANGER` / `VIOLET` / `CYAN` … 常量（提到模块级，`--help` 的说明窗口也用同一套）。
-改配色只改那一处，别在控件旁边写字面量。
+配色的**唯一来源**是 `palette.py` 里那组 `BG` / `CARD` / `FG` / `BLUE` /
+`OK` / `DANGER` / `VIOLET` / `CYAN` … 常量（`campus_login.py` 顶层 import 它们，
+`--help` 的说明窗口也用同一套）。改配色只改那一处，别在控件旁边写字面量。
 每种强调色都配了一个 `*_SOFT` 浅底（`BLUE_SOFT` / `OK_SOFT` / `DANGER_SOFT` /
 `VIOLET_SOFT` / `CYAN_SOFT`）—— 图标徽章和小标签用的都是「深色前景 + `*_SOFT` 浅底」这一对。
+
+> **2026-10-05 之前不是这样**：这 19 个常量长在 `campus_login.py` 里，而站点那边
+> （`make_site.py` 的 `CSS`）另有一份**手工同步的副本** —— 实测两边重合 15 个，
+> 改一次配色要记得改两处，迟早会漏。现在站点 CSS 的 `:root` 常量块由
+> `make_site.py` 的 `palette_css()` **从 `palette.py` 生成**，`= palette.X` 的注释
+> 就是标给读的人看的：哪些值是生成的、哪些是站点独有的（`--bg` / `--code` /
+> 整个深色模式块…）。
+>
+> ⚠️ 站点里**还留着一批站点独有的色**（深色模式、代码块底色…），它们**不**跟着程序走。
+> 不要为了「统一」把深色模式也并进 `palette.py` —— 程序界面没有深色模式。
 
 ### 五个圆角工厂（Tk 一个圆角控件都没有）
 
@@ -561,14 +633,71 @@ holder.winfo_height()    = 783      ← 需要多少就给多少，富余 0
 - 徽章是「深色前景 + `*_SOFT` 浅底」成对出现，配色表是 `SEC_STYLE`；
   分区标题**没登记就直接报错**，免得漏配时它默默退回无徽章的旧样式。
 
-### 🔴 「使用说明」窗口有两份实现，改一处必须改另一处
+### ✅ 「使用说明」窗口的两份实现已经合一（2026-10-05）
+
+以前这里是**两份**实现，改一处必须改另一处：
 
 - `show_text_window()` —— 命令行 `--help` 用（模块级函数）
 - `run_gui.show_help()` —— 界面里点「使用说明」用（闭包）
 
 2026-10-04 圆角化时**只改了前者**，跑 `ui_shot.py` 一看第 5 张弹窗图的
 **字节数和改动前一模一样（55862）**，才反过来发现是两份实现。
-判断「截图到底有没有反映这次改动」不要靠扫一眼 —— **先比字节数**。
+
+现在正文 + 按钮栏收敛到两个模块级函数，两边都调它们：
+
+| 函数 | 管什么 |
+|---|---|
+| `text_panel(parent, tk, fam, base, text)` | 可滚动、可复制的只读长文本区，返回 `(外框, Text)` |
+| `text_panel_bar(parent, tk, fam, base, command)` | 底部那条「知道了」按钮栏 |
+
+- ⚠️ **`--help` 那条路可能没有 root 窗口**，所以 `text_panel` 只依赖传进来的 `parent`，
+  自己不去找 Tk 根窗口 —— 这是它能被两处共用的前提。
+- ✅ 合一之后验证过：`ui_shot.py` 第 5 张图在「合一前 vs 合一后」**逐像素 0 差异**。
+
+### ⚠️ 比截图别跨工具比（2026-10-05 踩到的坑）
+
+判断「界面有没有被改动」，**必须在同一个抓图工具下前后比**：
+
+- `ui_shot.py` 与 `refresh_screenshot.py` 抓同一份界面，结果**不是**逐像素相同的 ——
+  实测有约 2.5 万个像素差在 9..24 差量（文字亚像素抗锯齿 + 鼠标悬停的那个按钮）。
+  拿 `site_static/screenshot.png`（`refresh_screenshot.py` 出的）去比 `ui_shot.py`
+  的产物，会得到一片「有差异」的假警报。
+- 还有个**必然的 1 行差异**：y=31 那一行左边 66px。它是**操作系统画的窗口边框行**
+  （颜色 `(159,161,164)` **不在 `palette.py` 里**，且 Tk 从不画那条线），
+  客户区从它下面才开始。跨工具、跨版本都可能差这一行，**别去追**。
+- 判断方法：把差异按**颜色差量分档**（`<=8` / `<=24` / `<=64` / `>64`）。
+  **只有 `>64` 才算结构性改动**；一片 `<=24` 就是抗锯齿噪声。
+  `pixdiff2.py` 就是这个思路（放在工作区，不属于仓库）。
+- ⚠️ 比之前先确认工具**自身可重复**：同一份代码连跑两次，md5 必须一样。
+  不一样就说明它在抓实时状态（鼠标位置、网络状态行），md5 对比无意义。
+
+### `run_gui` 已经拆成 `LoginApp` 类（2026-10-05）
+
+`run_gui()` 原来是**一个约 1000 行的函数**，里面套了 25 个嵌套闭包，状态全是闭包变量。
+现在：
+
+- `class LoginApp` —— 状态是 `self.*` 属性，一眼列全；每个动作是一个方法，能单独读。
+- `def run_gui(smoke=False)` —— **保留这个名字**，只是转发 `return LoginApp(smoke).run()`。
+  `main()` / `ui_shot.py` / `layout_probe.py` / `content_h_probe.py` / `content_h_matrix.py` /
+  `fresh_test.py` 全都按这个名字调它，所以**调用方一行都没改**。
+
+拆分时**只搬家、没顺手改任何数值或顺序**（控件创建顺序、`pack` 参数、每处 pady 原样搬）。
+验收方式：
+
+| 检查 | 结果 |
+|---|---|
+| `ui_shot.py` 拆类前 vs 后 | **0 个结构性差异**（只有抗锯齿级噪声） |
+| `content_h_probe.py` 的 `reqh` | **827**，与拆类前、与 `geometry_test.CONTENT_H` 一致 |
+| 窗口几何 | `820x827+443+80`，与拆类前一致 |
+| `--guitest` / `pwd_wiring_check` / `ui_contrast_check` | 全过 |
+
+- ⚠️ `tk` / `messagebox` 存成了 `self.tk` / `self.messagebox` —— 仍是**在 `__init__` 里延迟 import**，
+  没有提到模块顶层（理由见「圆角按钮的兼容契约」：顶层不 import tkinter，
+  `--version` / `--selftest` 才不必加载 Tk）。
+- ⚠️ `CARD_PAD_X` / `CARD_PAD_Y` / `CARD_R` 放成了**类属性**而不是 `__init__` 里的局部量 ——
+  `card()` 的默认参数要在**类定义时**求值，那一刻还没有 `self`。
+- 🔴 拆完之后 `sec()` 的报错文案指向 `LoginApp.SEC_STYLE`（原来是「run_gui 的 SEC_STYLE」）。
+  有测试断言这句话时记得同步。
 - ⚠️ **改竖向间距必须重新标定 `geometry_test.CONTENT_H`**：窗口高 = 内容高。
   两个都跑：`python content_h_probe.py`（本机真实状态）、
   `python content_h_matrix.py`（各状态矩阵）。
@@ -595,6 +724,84 @@ holder.winfo_height()    = 783      ← 需要多少就给多少，富余 0
   「整齐」这件事本身是个好信号：说明圆角卡片改造是**几何中性**的，那 −3 来自
   另外三处刻意调整（列表容器去掉 1px 方角描边等），不是某个卡片被悄悄撑高/压扁。
   以后哪一轮改完发现各档的差值**不一致**，先去查那几张受影响的卡片，别直接改表。
+
+## 学校参数：常量保留、只加一层访问器（2026-10-05）
+
+`campus_login.py` 顶部有一节「学校参数：换学校只改 config.json」，里面是
+`SCHOOL_KEYS`（八个可覆盖的键）。**换学校不用改源码**，写进数据目录的
+`config.json` 就行（README 的「适配其它学校」一节是给用户看的同一件事）。
+
+实现上刻意**没有**把常量搬进一个大字典，而是：
+
+| 常量（留在原地，带自己的「为什么」注释） | 访问器（读 config 覆盖，退回常量） |
+|---|---|
+| `DEFAULTS`（`portalHost` / `wlanAcIp` / `wlanAcName` / `timeoutSec`） | `load_config()` |
+| `DEFAULT_CAMPUS_SUBNETS` | `campus_subnets()` |
+| `TRIGGER_URL` | `trigger_url()` |
+| `CHECK_TARGETS` | `check_targets()` |
+| `LOGIN_EXTRA` | `login_extra()` |
+
+为什么这么拆，而不是「一个 `PORTAL_PROFILE` 大字典」：
+
+1. **常量旁边那些注释是资产**。`CHECK_TARGETS` 上那段「为什么不是一个地址就够」
+   （首次 DNS 7.4 秒）、`LOGIN_EXTRA` 上那段「以前三处各抄一份」——
+   搬进一个远离使用现场的大字典，等于把它们流放了。项目最怕的正是「注释与代码脱节」。
+2. **测试直接引用常量**（`net_check_test.py` 用 `C.CHECK_TARGETS[0][0]`、
+   `form_drift_test.py` 用 `C.LOGIN_EXTRA`）。搬走就要改一堆测试，
+   收益却只是「看起来整齐」。
+
+🔴 **取值一律走访问器**。直接引用常量的话 config.json 改了它也不跟着变，
+于是「配置看着写对了、实际压根没生效」—— 这正是本项目最警惕的那类静默错误
+（`campus_subnets()` 从 2026-09-19 就是这么做的，另外三个是 2026-10-05 补齐）。
+
+几个刻意的设计决定：
+
+- **`loginExtra` 是浅合并，不是整体替换**。换学校时多数字段（`scheme` / `loginType` /
+  `pageid`…）其实一样，逼用户抄全 20 个键只会抄漏。
+  ⚠️ 已知限制：**没法靠配置删掉一个默认字段**（值写 `null` 会被 `load_config` 丢掉）。
+- **`checkTargets` 是整体替换**。它是「一张检测表」，追加语义反而容易让人算不清最终有几条。
+- **写坏了必须退回默认，不能把程序弄瘸**。`[]` / 类型不对 / 空串 / 只有坏元素，
+  一律退回默认 —— 否则「测不出网」会被误判成「网络真的不通」，用户上不了网还查不出原因。
+- **访问器都收一个可选的已读好的 `cfg`**，免得一次登录里把同一个文件读三遍。
+
+回归靠 `school_profile_test.py`（43 项）。它有三段是**故意**这么设计的：
+
+1. 无 config 时取值与默认常量**逐字相同**（证明没有悄悄改行为）；
+2. 有 config 时**真的跟着变**，且 `auth_form` / `logout_form` / `url_parameter`
+   这些**真正发出去的东西**也变了（只验访问器等于自嗨）；
+3. **单键覆盖 → 清掉 → 必须变回来**，逐个键走一遍。第 3 段是防
+   「往 `SCHOOL_KEYS` 加了个键，但忘了写访问器」—— 那时它会红。
+
+## 站点域名：为什么**保留多份**、只加测试（2026-10-05）
+
+发布站域名 `hobson2233.dpdns.org` 出现在 **7 个文件**里，各有各的理由：
+
+| 文件 | 为什么这里有 |
+|---|---|
+| `repo/updater.py` | 拼更新清单地址（`MANIFEST_URL`） |
+| `repo/campus_login.py` | 内置「使用说明」正文里写给用户看 |
+| `repo/help_check.py` | 打包门槛核对 exe 里那份说明 |
+| `make_site.py` | 站点根地址 + 页面文案 |
+| `make_manifest.py` | 清单里的下载地址 |
+| `deploy/deploy.py` | 发布后校验用的地址 |
+| `wrangler.toml` | 配置注释里提醒「改 Worker 名会让这个域名失联」 |
+
+以前只在文档里写了一句「三处必须同源」—— 而实际是 7 个文件，全靠人记。
+
+🔴 **为什么不干脆合并成一处**：`repo/` 是要被**单独 clone / 单独打包**的
+（PyInstaller onefile），`updater.py` 不能去 import 工作区根目录的文件 ——
+合并会把 `repo/` 变成「离开工作区就跑不起来」。所以这里的选择是
+**保留各自的副本，用测试守住一致性**，比强行合并便宜得多，也不动打包结构。
+
+`domain_drift_test.py` 就是这个测试（已接进 `build.py`，**放在打包之前** ——
+它只读源码，坏了立刻返回，不必等 PyInstaller 跑完才发现）：
+
+- 金标准 = 「**所有提到它的地方说的是同一个域名**」，不是某个理想值。
+  真要换域名时每一处都改，测试自然绿；只改一处会红 —— 那正是它存在的意义。
+- 只认 `SUFFIX = "dpdns.org"` 这个后缀，不去猜「哪些字符串像域名」（那会误伤 `github.com`）。
+  换域名时**连这个常量一起改**，测试会因为「一处都找不到」而报错，不会静默通过。
+- 带阳性 + 阴性对照（`--selftest`）：注入第二个域名必须报「不止一个域名」、
+  把某个来源清空必须报「一处都不提」、原样扫描必须零问题。
 
 ## 站点：本地预览与截图
 

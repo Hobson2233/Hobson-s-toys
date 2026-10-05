@@ -4,7 +4,7 @@
 
 > 非官方项目，与学校网络管理部门无关。请仅使用你本人有权访问的账号，并遵守学校的网络使用规定。
 
-当前版本 0.4.0，从 [Releases](../../releases) 下载。
+当前版本 0.4.1，从 [Releases](../../releases) 下载。
 
 ![设置主界面](docs/main.png)
 
@@ -56,24 +56,48 @@ python build.py
 
 发布站点时，把构建产物交给工作区根目录的 `make_site.py` 放进 `site/`，再由 `make_manifest.py` 生成更新清单，最后用 `deploy/deploy.py` 把 `site/` 发布到 Cloudflare Worker 的静态资源上。
 
-页面是**整份替换**的：新版本目录里没有的页面文件，线上会直接消失。但**历史安装包会保留** —— 它们归档在工作区的 `dl_archive/`，每次发布整体放进 `site/dl/`，所以站点上有一个[历史版本页](https://hobson2233.dpdns.org/history)，每个发布过的版本都能下载。安装包文件名带版本号（`dl/campus-login-0.4.0.exe`），因此可以配长缓存。
+页面是**整份替换**的：新版本目录里没有的页面文件，线上会直接消失。但**历史安装包会保留** —— 它们归档在工作区的 `dl_archive/`，每次发布整体放进 `site/dl/`，所以站点上有一个[历史版本页](https://hobson2233.dpdns.org/history)，每个发布过的版本都能下载。安装包文件名带版本号（`dl/campus-login-0.4.1.exe`），因此可以配长缓存。
 
 开发脚本、测试清单与排障说明见 [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)。
 
 ## 适配其它学校
 
-默认配置位于 `campus_login.py` 的 `DEFAULTS`：
+**不用改源码。** 把要改的项写进数据目录里的 `config.json` 就行
+（`C:\ProgramData\CampusLogin\config.json`，没有就自己建一个）：
 
-```python
-DEFAULTS = {
-    "portalHost": "http://202.196.169.166",   # 认证门户地址
-    "wlanAcIp":   "10.0.1.10",                # AC 地址
-    "wlanAcName": "ZZHK-ZAX-BRAS",            # AC 名称
-    "timeoutSec": 8,
+```json
+{
+  "portalHost": "http://202.196.169.166",
+  "wlanAcIp": "10.0.1.10",
+  "wlanAcName": "ZZHK-ZAX-BRAS",
+  "campusSubnets": ["10."],
+  "triggerUrl": "http://1.1.1.1/",
+  "loginExtra": { "pageid": "5", "templatetype": "1" }
 }
 ```
 
-认证协议为标准 `webauth.do` 表单提交。更换学校时用浏览器开发者工具抓取一次登录请求，按上述字段修改即可，也可直接修改数据目录中的 `config.json`。
+写进去的键覆盖默认值，**没写的继续用默认**。可覆盖的项一共八个：
+
+| `config.json` 键 | 默认值 | 含义 |
+|---|---|---|
+| `portalHost` | `http://202.196.169.166` | 认证门户地址 |
+| `wlanAcIp` | `10.0.1.10` | AC（接入控制器）地址 |
+| `wlanAcName` | `ZZHK-ZAX-BRAS` | AC 名称 |
+| `timeoutSec` | `8` | 各项网络超时（秒） |
+| `campusSubnets` | `["10."]` | 校园网段前缀，用来判断「在不在校园网」 |
+| `triggerUrl` | `http://1.1.1.1/` | 认证成功后跳转的目标 |
+| `checkTargets` | 见源码「学校参数」一节 | 连通性检测目标，`[[url, 期望正文, 名字], …]` |
+| `loginExtra` | 见源码「学校参数」一节 | 门户表单的公共字段模板 |
+
+认证协议为标准 `webauth.do` 表单提交。更换学校时用浏览器开发者工具抓一次登录请求，
+把表单里的固定字段写进 `loginExtra` 即可。三个容易踩的点：
+
+- `loginExtra` 是**浅合并** —— 只覆盖你写出来的键，其余仍用默认。所以通常只需改
+  `pageid` / `templatetype` 这类真正变了的字段，不必抄全 20 个键。
+- `checkTargets` 是**整体替换**（不是追加）。写成 `[]` 或类型不对会**退回默认**，
+  不会把程序变成「永远测不出网」。
+- 写入的值类型不对、或者写成空串 / 空表，一律**退回默认**而不是让程序失灵。
+  这一条有回归测试盯着（`repo/school_profile_test.py`，43 项含阳性对照）。
 
 ## 隐私与数据
 
@@ -81,7 +105,7 @@ DEFAULTS = {
 
 - 账号、密码与登录记录只写在**本机** `C:\ProgramData\CampusLogin\`（该目录不可写时回退到 `%APPDATA%\CampusLogin\`）。所以把 exe 拷给别人，不会带出你的账号。
 - 程序对外只访问两类地址：学校的认证门户（见下方 `DEFAULTS` 里的 `portalHost`）和更新发布站 `hobson2233.dpdns.org`。没有统计、上报、崩溃收集或任何第三方接口。
-- 上面两条不必只凭信任：**代码是开源的**，在源码里搜 `urlopen` 或 `http`，就能看到全部对外请求，每一处的目标地址都是写死的常量，没有拼接出来的隐藏地址。
+- 上面两条不必只凭信任：**代码是开源的**，在源码里搜 `urlopen` 或 `http`，就能看到全部对外请求。所有目标地址都集中在 `campus_login.py` 顶部的「学校参数」一节（门户、AC、连通性检测目标、认证后跳转），既没有拼接出来的隐藏地址，也不从网络下发；想换学校时改的正是同一处默认值（或用上节的 `config.json` 覆盖）。
 
 想在本机清掉账号数据，两种方式都行：
 

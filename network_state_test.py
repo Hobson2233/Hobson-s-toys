@@ -52,8 +52,18 @@ check("本地管理位（Wi-Fi Direct）通过", C.valid_mac("86:9e:56:40:69:1d"
 # ------------------------------------------------------- 2. on_campus_network
 section("2. on_campus_network —— 真机实测 + 阳性对照")
 real = C.on_campus_network()
-print("     本机出口 IP = %r，校园网段 = %r" % (C.local_ipv4(), C.campus_subnets()))
-check("本机在校园网（实测）", real, True)
+_ip = C.local_ipv4()
+print("     本机出口 IP = %r，校园网段 = %r" % (_ip, C.campus_subnets()))
+# ⚠️ 这一条**只在校园网里才有意义** —— 判据第 1 条就是「本机 IP 落在校园网段」。
+#    在宿舍/家里跑，real 本来就该是 False；那时报失败是**测试在说谎**，不是代码有 bug。
+#    （2026-10-05 加：本机出口是 192.168.3.12，实测这条天天假红，于是改成明确跳过。）
+#    注意这**不是**把断言删掉：只要本机在校园网段内，这一条照旧是硬断言。
+if _ip and any(_ip.startswith(p) for p in C.campus_subnets()):
+    check("本机在校园网（实测）", real, True)
+else:
+    print("  [跳过] 本机出口 IP %r 不在校园网段 %r 里 —— "
+          "这一条只在校园网内有效（在校外它本来就该是 False）"
+          % (_ip, C.campus_subnets()))
 
 # 阳性对照：把判据改成不可能满足，必须返回 False。
 # 没有这一步，就分不清「判断正确」和「判断恒为 True」。

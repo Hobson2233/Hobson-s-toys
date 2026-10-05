@@ -23,10 +23,16 @@
 ⚠️ 段 2 用的是假门户，只走 do_logout 的判定分支 —— 目的是证明**并发本身**
    足以造出「退出失败」，而不是证明真校园网一定这么回。
 
+🔴 段 2 会走 `do_logout()`，而它会写 `last-result.json`（可能还有 `accounts.json`）
+   —— 也就是说**这个脚本会写真实数据**。所以 main() 第一件事是 `datasafe.sandbox()`，
+   收尾再 `assert_untouched()` 核对。（2026-10-05 补：之前没有沙箱，
+   属于「意图只读、行为写盘」—— 跟 layout_probe 当年一样的毛病。）
+
 用法：
     python logout_fail_probe.py          # 走源码里的 do_logout，不连真门户
 """
 import os
+import re
 import sys
 import threading
 import time
@@ -34,6 +40,7 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import campus_login as C  # noqa: E402
+import datasafe           # noqa: E402
 
 FAILS = []
 
@@ -58,16 +65,22 @@ def static_evidence():
     print("=== 段 1：忙碌标志是不是每个窗口自己的？===")
     src = open(os.path.join(HERE, "campus_login.py"), encoding="utf-8").read()
 
-    # run_gui 每次调用都新建一个 state 字典。字典本身是新的，但内容呢？
-    check_true("run_gui 里有 state 字典", 'state = {"busy": False' in src)
+    # ⚠️ 2026-10-05：`run_gui` 拆成了 `LoginApp` 类，`state` 从局部变量变成
+    #    `self.state`。下面几条原本是写死的字面量（`'if state["busy"]:'`），
+    #    一拆类就**静默失效**了 —— 探针红了才发现。
+    #    现在统一用**容忍 `self.` 前缀的正则**，下次再重构不用回来改一遍。
+    #    顺带一提：拆类之后「state 是每个窗口自己的」从「靠约定」变成了
+    #    「结构上必然」——`self.state` 就是实例属性。
+    check_true("state 在 __init__ 里新建（每个窗口一份）",
+               re.search(r'self\.state\s*=\s*\{"busy"', src) is not None)
     check_true("set_busy 直接改 state[\"busy\"]",
-               'state["busy"] = b' in src)
+               re.search(r'self\.state\["busy"\]\s*=\s*b\b', src) is not None)
     check_true("start_job 用 state[\"busy\"] 判重入",
-               'if state["busy"]:' in src)
+               re.search(r'if\s+self\.state\["busy"\]:', src) is not None)
 
     # 关键：busy 是布尔，不是「本次任务的所有者」。谁都能把它置 True / False。
     check_true("busy 是布尔而不是持有者标识",
-               'state["busy"] = b' in src and 'state["busy"] = ' in src
+               re.search(r'self\.state\["busy"\]\s*=\s*b\b', src) is not None
                and "owner" not in src)
 
     # 有没有「一个进程只许一个窗口」的闸门？找单实例锁 / mutex / 命名事件。
@@ -138,6 +151,9 @@ def run_logout_like_gui(who, patch_portal=True):
 
 
 def main():
+    # 🔴 必须在段 2 之前：段 2 会走 do_logout()，而它写 last-result.json。
+    #    把真实数据复制进临时目录，之后所有写入都落在那里。
+    datasafe.sandbox(copy_real=True, tag="logout_fail_probe")
     static_evidence()
 
     print()
@@ -201,6 +217,12 @@ def main():
                C.RESULT_FILE.count("last-result") == 1)
 
     print()
+    # 收尾核对：真实数据一个字节都不许变。变了就把退出码也带脏。
+    try:
+        print(datasafe.assert_untouched())
+    except RuntimeError as e:
+        print(e)
+        FAILS.append("真实数据被改动了")
     if FAILS:
         print("失败 %d 项: %s" % (len(FAILS), ", ".join(FAILS)))
         return 1

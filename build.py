@@ -374,6 +374,22 @@ def main():
         print("当前解释器没有 tkinter，换一个（见本文件顶部的用法说明）")
         return 1
 
+    # 域名一致性检查（构建门槛，**源码级** —— 故意放在打包之前）。
+    # 站点域名散在 7 个文件里（程序内置说明 / 更新清单地址 / 站点构建 / 发布校验 /
+    # wrangler 注释），必须字面一致；以前只在文档里写了句「三处必须同源」，
+    # 实际是 7 个文件、全靠人记。理由与「为什么不合并成一处」见 domain_drift_test.py 顶部。
+    # 放最前面：它只读源码，坏了立刻返回，不必等 PyInstaller 跑完才发现。
+    print()
+    try:
+        import domain_drift_test
+        rc_dom = domain_drift_test.run()
+    except Exception as e:
+        print("!! 域名一致性检查无法执行: %s: %s" % (type(e).__name__, e))
+        return 1
+    if rc_dom:
+        print("!! 域名一致性检查不通过 —— 构建判为失败")
+        return 1
+
     # 注意：不要用 --clean，也不要 rmtree/os.remove —— 会触发安全策略的
     # 「批量删除」保护（按 turn 累计计数，删 50 个就拦）。
     # 这里每次自动挑一个**全新的**目录，PyInstaller 全程没有可删的东西。
