@@ -17,6 +17,7 @@
    （跟 `fresh_test.py` 一个手法），末尾再核对真实 config.json 的 md5 没变。
 """
 import hashlib
+import json
 import os
 import shutil
 import sys
@@ -175,8 +176,53 @@ for _k in C.SCHOOL_KEYS:
     _off = _probes[_k]()
     check("%-14s 覆盖生效、清掉即回默认" % _k, _on != _off, True)
 
-# ------------------------------------------------------------------ 6. 收尾
-section("6. 收尾：真实数据目录一个字节都没动")
+# ------------------------- 6. 从旧位置迁移时，学校参数一个都不许丢
+section("6. 迁移旧数据时必须保住全部学校参数（2026-10-05 修的回归）")
+# 🔴 背景：migrate_legacy_data() 重建 config.json 时原来 `for k in DEFAULTS`
+#    —— 只遍历 4 个键。换学校的用户额外写在 config.json 里的 campusSubnets /
+#    triggerUrl / checkTargets / loginExtra 会被**静默丢掉**，表现为
+#    「配置明明写了却不生效」（实测复现见 _repro_migrate_school_keys.py）。
+#    这里用阳性对照钉死：旧位置写全 8 个键 → 迁移后必须原样保住。
+_MIG_OLD = os.path.join(TMP, "legacy")
+_MIG_NEW = os.path.join(TMP, "migrated")
+os.makedirs(_MIG_OLD, exist_ok=True)
+os.makedirs(_MIG_NEW, exist_ok=True)
+_MIG_FULL = {
+    "userId": "2026000001", "passwd": "secret",
+    "portalHost": "http://10.20.30.40", "wlanAcIp": "10.20.0.1",
+    "wlanAcName": "OTHER-SCHOOL-BRAS", "timeoutSec": 12,
+    "campusSubnets": ["172.16."], "triggerUrl": "http://10.20.30.40/",
+    "checkTargets": [["http://10.20.30.40/204", None, "other"]],
+    "loginExtra": {"pageid": "9", "templatetype": "3"},
+}
+with open(os.path.join(_MIG_OLD, "config.json"), "w", encoding="utf-8") as _fh:
+    json.dump(_MIG_FULL, _fh, ensure_ascii=False)
+# 迁移的判据是「新位置没有 config.json」+「没被清过凭据」，两个都得先满足
+C.CONFIG_FILE = os.path.join(_MIG_NEW, "config.json")
+C.PURGED_FLAG = os.path.join(_MIG_NEW, "purged.flag")
+_legacy_orig = C.legacy_data_dirs
+C.legacy_data_dirs = lambda: [_MIG_OLD]
+try:
+    check("migrate_legacy_data() 返回 True（确实迁移了）", C.migrate_legacy_data(), True)
+finally:
+    C.legacy_data_dirs = _legacy_orig
+check("迁移后新位置生成了 config.json", os.path.isfile(C.CONFIG_FILE), True)
+_mig = json.load(open(C.CONFIG_FILE, encoding="utf-8"))
+for _k in C.SCHOOL_KEYS:
+    check("迁移保住 %-14s" % _k, _mig.get(_k), _MIG_FULL[_k])
+check("迁移保住 userId / passwd",
+      (_mig.get("userId"), _mig.get("passwd")), ("2026000001", "secret"))
+# 顺带：迁移是幂等的 —— 再跑一次不该改动已有的 config.json
+_mig_md5 = _md5(C.CONFIG_FILE)
+C.legacy_data_dirs = lambda: [_MIG_OLD]
+try:
+    check("第二次调用直接返回 False（幂等）", C.migrate_legacy_data(), False)
+finally:
+    C.legacy_data_dirs = _legacy_orig
+check("幂等：第二次调用没动 config.json", _md5(C.CONFIG_FILE), _mig_md5)
+
+# ------------------------------------------------------------------ 7. 收尾
+section("7. 收尾：真实数据目录一个字节都没动")
 check("CONFIG_FILE 指向临时目录",
       os.path.abspath(os.path.dirname(C.CONFIG_FILE)).startswith(
           os.path.abspath(TMP)), True)

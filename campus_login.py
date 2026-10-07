@@ -63,7 +63,7 @@ APP_TITLE = "校园网自动登录"
 # ⚠️ 这里是**唯一来源**。界面标题、使用说明、--version、--selftest、
 #    以及 exe 文件属性里的版本，全部由它推导 —— 不要在别处另写一份，
 #    否则迟早漂移（改了一处忘了另一处，用户看到的版本号就是错的）。
-VERSION = "0.4.2"
+VERSION = "0.4.3"
 
 # ==================== 学校参数：换学校只改 config.json ====================
 #
@@ -666,7 +666,14 @@ def migrate_legacy_data():
         cfg = dict(DEFAULTS)
         cfg["userId"] = old_cfg.get("userId", "") or ""
         cfg["passwd"] = old_cfg.get("passwd", "") or ""
-        for k in DEFAULTS:
+        # ⚠️ 这里必须遍历 **SCHOOL_KEYS**，不能只遍历 DEFAULTS。
+        #    DEFAULTS 只有 4 个键（portalHost / wlanAcIp / wlanAcName / timeoutSec），
+        #    而换学校的用户会在 config.json 里额外写 campusSubnets / triggerUrl /
+        #    checkTargets / loginExtra —— 只遍历 DEFAULTS 的话这 4 个键**静默丢失**，
+        #    用户看到的是「配置明明写了却不生效」（2026-10-05 用
+        #    _repro_migrate_school_keys.py 实测复现，退出码 1）。
+        #    回归钉在 school_profile_test.py 第 6 节。
+        for k in SCHOOL_KEYS:
             if old_cfg.get(k):
                 cfg[k] = old_cfg[k]
         save_config(cfg)
@@ -939,6 +946,180 @@ def test_internet(timeout=None, rounds=1):
     # 不是 204（判 None）。要是让 None 盖过 False，就会把「确实没认证」误报成
     # 「测不出来」，进而让 do_auto 不去登录、用户上不了网。
     return False if saw_blocked else None
+
+
+# ------------------------------------------------------------------ 测速
+#
+# 「测一下速度」量的是**用户到发布站**的下载速度 —— 也就是「我这台机器能不能
+# 顺畅下到这个软件」。不是「宽带标称带宽」，也不打算去调中科大测速网：
+# 它的「隐私和服务说明」原文写着「异常程序访问」的 IP 会被临时封禁，
+# 线上页面还加了 PoW（浏览器先算 0.5～2 秒 SHA-256 才让测速，中科大内网免检）
+# —— 那是明确针对脚本的拒绝。完整取证见 docs/DEVELOPMENT.md「测速」一节。
+
+SPEEDTEST_FILE = "speedtest.bin"
+
+# ⚠️ 地址**从 updater 派生**，不写字面量。
+#    `domain_drift_test.py` 会扫 campus_login.py 里出现的域名并要求和别处一致，
+#    而「三处必须同源」那条红线的前提是**域名只在一个地方写**。这里再写一遍，
+#    就等于又造了一处「换域名时会漏改」的地方 —— 而它漏改的症状是测速一直失败，
+#    和「网络不好」长得一模一样，极难查。
+SPEEDTEST_URL = updater.BASE_URL_HINT + "/" + SPEEDTEST_FILE
+
+SPEED_MIN_SECONDS = 2.5     # 至少量够这么久才给结论（少了噪声大）
+SPEED_MAX_ROUNDS = 4        # 最多下几轮。1 MiB × 4 = 4 MiB 上限 ——
+                            # 用户点一次「测一下速度」的流量天花板就靠这个兜住
+SPEED_TIMEOUT = 20          # 单轮超时。校园网慢起来 1 MiB 要 6 秒多，
+                            # 20 秒够扛住抖动，又不至于让用户干等
+
+
+def _speed_err(ex):
+    """把测速路上可能抛的异常翻成一句给用户看的中文。
+
+    ⚠️ 这里**故意不 import ssl**：本文件从头到尾不 import 它，理由见上面
+       「网络」一节的说明 —— PyInstaller 一旦看到 ssl，就会把
+       libcrypto-3.dll + libssl-3.dll（解压后约 5.8MB）一起打进来。
+       所以证书错误靠 `URLError.reason` 的文字来认：urllib 会把
+       `ssl.SSLError`（它是 OSError 的子类）包成 `URLError` 抛出来。
+    """
+    if isinstance(ex, urllib.error.HTTPError):
+        return "服务器返回 HTTP %s" % ex.code
+    if isinstance(ex, urllib.error.URLError):
+        reason = str(ex.reason)
+        up = reason.upper()
+        if "SSL" in up or "CERTIFICATE" in up:
+            return "证书校验失败：%s" % reason
+        return "连不上发布站：%s" % reason
+    if isinstance(ex, socket.timeout):
+        return "超时（%s 秒内没下完一轮）" % SPEED_TIMEOUT
+    return "%s: %s" % (type(ex).__name__, ex)
+
+
+def speed_probe(url=None, min_seconds=SPEED_MIN_SECONDS, max_rounds=SPEED_MAX_ROUNDS,
+                timeout=SPEED_TIMEOUT, opener=None, clock=None):
+    """下载发布站上的测速文件，量出下载速度。返回 (ok, info)。
+
+    ok=True 时 info 是 dict：
+        mbps         兆比特每秒（用户最认这个单位）
+        mbytes_per_s 兆字节每秒
+        bytes        计速用的总字节数（**不含**第 1 轮）
+        seconds      计速用的总耗时
+        rounds       计速的轮数
+        connect      第 1 轮的连接耗时（DNS + TCP + TLS + 响应头到达）
+    ok=False 时 info 是一句给用户看的中文原因。
+
+    🔴 为什么第 1 轮**不计入速度**：
+       第 1 轮里包含 DNS 解析 + TCP + TLS 握手，而这些**只发生一次**。
+       把它摊进平均值，量出来的数会同时受「握手多慢」和「带宽多大」影响，
+       而且偏差方向不固定（慢网被拉低得多、快网被拉低得少）——
+       换句话说，那个数**没法解释**。所以第 1 轮单独用来报「连接耗时」，
+       速度只从第 2 轮起算。
+       ⚠️ 代价是**至少要下两轮**。只下到一轮时宁可报「测不出来」，
+          也不给一个混着握手时间的假速度。
+
+    🔴 每轮都带一个**唯一的时间戳参数**：
+       测速文件在站点上配的是 `Cache-Control: no-store`，但那是我们这边的承诺；
+       客户端自己也带一个变化的 query，等于给「某一层偷偷缓存了」上了第二道保险。
+       缓存对测速是**致命**的 —— 命中一次缓存，那一轮走的是内存，
+       速度凭空翻几倍，而客户端完全看不出来（它只看到「很快」）。
+
+    `opener` / `clock` 只为测试而留（回环服务 + 假时钟），正常调用不传。
+    """
+    url = url or SPEEDTEST_URL
+    clock = clock or time.monotonic
+    if opener is None:
+        opener = urllib.request.build_opener(*_direct_handlers())
+
+    def one_round(idx):
+        """下一轮。返回 (字节数, 连接耗时, 总耗时)。异常原样往上抛。"""
+        sep = "&" if "?" in url else "?"
+        u = "%s%st=%d&r=%d" % (url, sep, int(time.time() * 1000), idx)
+        req = urllib.request.Request(u, headers={
+            "User-Agent": UA,
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+        })
+        t0 = clock()
+        fp = opener.open(req, timeout=timeout)
+        try:
+            connect = clock() - t0          # 到这一步响应头已经回来了
+            got = 0
+            while True:
+                chunk = fp.read(64 * 1024)
+                if not chunk:
+                    break
+                got += len(chunk)
+            return got, connect, clock() - t0
+        finally:
+            try:
+                fp.close()
+            except Exception:
+                pass
+
+    # ---- 第 1 轮：只用来量连接耗时 ----
+    try:
+        b0, connect, _e0 = one_round(0)
+    except Exception as ex:
+        return False, _speed_err(ex)
+    # 200 但一个字节都没有：多半是中间层塞了个空响应（或者 URL 被改写成了别的
+    # 东西）。第 1 轮就发现的事没必要再下第 2 轮 —— 而且这里不拦的话，
+    # 要等到第 2 轮才由下面那个 `got <= 0` 兜住，白跑一次请求。
+    if b0 <= 0:
+        return False, "服务器返回了空内容"
+
+    # ---- 第 2 轮起：计速 ----
+    total_bytes = 0
+    total_secs = 0.0
+    counted = 0
+    while counted < max_rounds - 1 and total_secs < min_seconds:
+        try:
+            got, _c, elapsed = one_round(counted + 1)
+        except Exception as ex:
+            # 后面几轮出错：已经量到数据的就用已量到的（结果照给，不假装失败）；
+            # 一轮都没量到才报错 —— 否则一次网络抖动就让整个功能看起来是坏的。
+            if counted:
+                break
+            return False, _speed_err(ex)
+        if got <= 0:
+            # 200 但一个字节都没读到：多半是中间层塞了个空响应。
+            if counted:
+                break
+            return False, "服务器返回了空内容"
+        total_bytes += got
+        total_secs += elapsed
+        counted += 1
+
+    if not counted or total_bytes <= 0 or total_secs <= 0:
+        return False, "没量到有效数据"
+
+    bps = total_bytes / total_secs
+    return True, {
+        "mbps": bps * 8.0 / 1e6,
+        "mbytes_per_s": bps / (1024.0 * 1024.0),
+        "bytes": total_bytes,
+        "seconds": total_secs,
+        "rounds": counted,
+        "connect": connect,
+    }
+
+
+def speed_describe(info):
+    """把 speed_probe 的成功结果拼成给用户看的多行文案。"""
+    mbps = info["mbps"]
+    if mbps >= 100:
+        shown = "%.0f Mbps" % mbps
+    elif mbps >= 10:
+        shown = "%.1f Mbps" % mbps
+    else:
+        shown = "%.2f Mbps" % mbps
+    lines = [
+        "下载速度 约 %s（%.2f MB/s）" % (shown, info["mbytes_per_s"]),
+        "连接耗时 %.2f 秒 · 量了 %.1f MB / %d 轮"
+        % (info["connect"], info["bytes"] / 1048576.0, info["rounds"]),
+    ]
+    # 量得太快说明这次采样点太少，如实说 —— 比给一个看着很精确的假数字好。
+    if info["seconds"] < 1.0:
+        lines.append("（这次量得太快，数字仅供参考）")
+    return "\n".join(lines)
 
 
 def campus_subnets():
@@ -2683,6 +2864,10 @@ HELP_TEXT = (("校园网自动登录 —— 使用说明（v%s）\n" % VERSION) 
   灰点  网络状态未知       这次没检测出来，不代表没网，
                         点「切换到此账号」试一次。
 
+  右边那个「测一下速度」量的是「从本程序的发布站下载」的速度，也就是这台
+  电脑能不能顺畅地下载和更新本程序。点一下，几秒后出结果。
+  它测的不是你家宽带的带宽，只是到发布站这一路。
+
 
 【账号密码存在哪】
 
@@ -4310,6 +4495,23 @@ class LoginApp:
         self.st_icon = st_icon
         self.status_text = status_text
 
+        # 「测一下速度」入口（2026-10-07 加）。
+        #
+        # 🔴 为什么**不新开一张卡**：设置窗口的高度直接等于内容高度，而内容一旦
+        #    越过 `sh * SCREEN_H_RATIO`（本机 1707x1067 → 906px）就会冒出滚动条。
+        #    当前内容 827px，再加一张卡（约 90px）就正好压线 —— 在他自己的机器上
+        #    凭空多一条滚动条，而「开机自启」会掉到滚动区外面去。
+        #    放进状态卡右侧既不用动高度，语义也对：它量的是「网络状态」这件事。
+        #
+        # 造型和「检查更新」「清除本机保存的账号密码」同一套（浅底 + 同色深字 +
+        # hover 加深）—— 同样是「看得出能点」的圆角片，同样**不新增第四个主按钮**
+        # （主按钮固定三个是界面铁律）。
+        self.btn_probe = round_chip(
+            status_body, tk, "测一下速度", (self.fam, self.SMALL), BLUE_DARK, BLUE_SOFT,
+            height=self.SMALL + 14, hover="#d3e0ff",
+            command=lambda: self.on_speed_probe())
+        self.btn_probe.pack(side="right")
+
         self.draw_status_icon(NET_UNKNOWN)
 
         # --- 账号列表 ---
@@ -4555,7 +4757,10 @@ class LoginApp:
     def set_busy(self, b):
         self.state["busy"] = b
         st = "disabled" if b else "normal"
-        for w in (self.btn_switch, self.btn_save, self.btn_out):
+        # 「测一下速度」也在这条链上（2026-10-07 加）。它不在「三个主按钮」那条
+        # 界面铁律里（它是状态卡里的圆角片，和「检查更新」同一类），但必须跟着灰：
+        # 忙碌时 start_job 是**静默 return** 的 —— 用户点了没反应，只会以为坏了。
+        for w in (self.btn_switch, self.btn_save, self.btn_out, self.btn_probe):
             w.configure(state=st)
         # 🔴 账号列表里每行的「删除」也必须跟着灰掉（2026-10-03 加）。
         #    原来这个元组里只有上面三个按钮，而「删除」是 render_accounts 每次
@@ -4929,6 +5134,37 @@ class LoginApp:
                 st, info = updater.STATE_UNKNOWN, "检查更新时出错"
             self.state["queue"].put(("upd_result", (st, info)))
         threading.Thread(target=work, daemon=True).start()
+
+    def on_speed_probe(self):
+        """点「测一下速度」触发。
+
+        测的是**到发布站的下载速度** —— 也就是「我这台机器能不能顺畅下到这个
+        软件」，不是宽带标称带宽。为什么不去调中科大测速网，见 speed_probe
+        上面的说明和 docs/DEVELOPMENT.md「测速」一节。
+
+        走 start_job 这条通用后台任务：跑完由 handle_msg 统一收尾
+        （load_all + show + refresh_status + set_busy(False)），
+        不需要像「检查更新」那样自定义消息类型。
+        """
+        if self.state["busy"]:
+            self.show("正在处理上一个操作，请稍候", "info")
+            return
+        self.start_job("正在测速…（约 3 秒）", self._speed_job)
+
+    def _speed_job(self):
+        """后台线程里跑。返回 (code, 给用户看的文案)。
+
+        ⚠️ 失败时**必须说清「测的是到发布站的速度」**：网络正常但发布站暂时
+           连不上时也会失败，而用户看到的只是一句「失败」—— 不说清他会以为
+           自己网断了，然后去折腾校园网认证。
+        """
+        ok, info = speed_probe()
+        if not ok:
+            return (-1, "测速失败：%s\n"
+                        "（这里测的是到发布站的下载速度，网络正常但发布站连不上时"
+                        "也会失败）" % info)
+        host = urlparse(updater.BASE_URL_HINT).netloc
+        return (0, "测速完成（到 %s 的下载速度）\n%s" % (host, speed_describe(info)))
 
     def form(self):
         uid = self.var_uid.get().strip()
