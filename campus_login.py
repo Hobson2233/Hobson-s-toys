@@ -63,7 +63,7 @@ APP_TITLE = "校园网自动登录"
 # ⚠️ 这里是**唯一来源**。界面标题、使用说明、--version、--selftest、
 #    以及 exe 文件属性里的版本，全部由它推导 —— 不要在别处另写一份，
 #    否则迟早漂移（改了一处忘了另一处，用户看到的版本号就是错的）。
-VERSION = "0.4.4"
+VERSION = "0.4.5"
 
 # ==================== 学校参数：换学校只改 config.json ====================
 #
@@ -2891,7 +2891,8 @@ HELP_TEXT = (("校园网自动登录 —— 使用说明（v%s）\n" % VERSION) 
 
   下载下来的文件会跟发布方公布的哈希值对一遍，对不上就直接丢掉。
 
-  更新包有两个来源：hobson2233.dpdns.org（本程序的发布站）和 GitHub。
+  更新包有多个来源：本程序的发布站 hobson2233.dpdns.org、GitHub，
+  以及发布站上另外列出的线路。
   下载前会各测一下速度，从快的那个下；一个下不动会自动换另一个。
 
   如果下载失败，程序会问你要不要用浏览器打开下载页。浏览器下载支持
@@ -3448,6 +3449,35 @@ def download_source_desc():
         return "%d 个（%s）" % (len(urls), "、".join(hosts))
     except Exception:
         log("下载源解析自检失败:\n%s" % traceback.format_exc())
+        return "解析失败（见日志）"
+
+
+def mirror_merge_desc():
+    """`--selftest` 用：远程附加源能不能被正确合并，且**主源没被顶掉**。
+
+    为什么真跑一遍而不是打印写死的说明：附加源是**从网上取回来的一个文件**，
+    它唯一能造成的伤害就是「改变首选下载地址」。这里断言两件事：
+      ① 附加源确实被追加上了（`{version}` 也替换了）；
+      ② 第一项仍然是我们自己的站。
+    写死的说明在那两条失效时照样打印「附加源可合并」，等于没有这个检查。
+    """
+    try:
+        root = updater.BASE_URL_HINT
+        primary = "%s/dl/campus-login-%s.exe" % (root, VERSION)
+        entries = [{"name": "自检假源",
+                    "url": "https://example.invalid/v{version}/x.exe"}]
+        merged = updater.merge_sources([primary], entries, VERSION)
+        if not merged or merged[0] != primary:
+            return "主源被顶掉了（异常）"
+        if len(merged) != 2 or "{version}" in merged[1]:
+            return "附加源没合并进来（异常）"
+        # 顺手确认「关掉的源会被跳过」—— 这是我们下线一条线路的唯一手段。
+        if updater.mirror_urls([{"url": "https://example.invalid/x",
+                                 "enabled": False}], VERSION):
+            return "enabled=false 没被跳过（异常）"
+        return "可合并，主源仍在第一位"
+    except Exception:
+        log("附加源合并自检失败:\n%s" % traceback.format_exc())
         return "解析失败（见日志）"
 
 
@@ -5198,8 +5228,17 @@ class LoginApp:
 
                 # 多源下载：清单里有几个源就试几个，先各测一下速度、从快的下。
                 # 老清单只有 url → candidate_urls 会退回成一项，行为跟以前一样。
+                #
+                # 附加源（0.4.5）：站点上那张 mirrors.json。**拉不到就当作没有**
+                # —— 它是锦上添花，不该让更新失败。主源永远来自清单第一项，
+                # 远程那张表只能往后追加（见 updater.merge_sources 的说明）。
+                mirrors = updater.fetch_mirrors()
+                base_urls = updater.candidate_urls(info)
+                urls = updater.candidate_urls(info, mirrors)
+                log("下载源 %d 个（附加源 %d 个）：%s"
+                    % (len(urls), len(urls) - len(base_urls), "、".join(urls)))
                 ok, reason, used = updater.download_multi(
-                    updater.candidate_urls(info), dest, sha256=info.get("sha256"),
+                    urls, dest, sha256=info.get("sha256"),
                     size=info.get("size"), on_progress=on_prog,
                     on_retry=on_retry, on_pick=on_pick)
                 if not ok:
@@ -5846,6 +5885,9 @@ def main():
             # candidate_urls，不是打印写死的说明 —— 写死的那句在函数被删掉
             # 之后照样打印，等于没有这个检查。见 download_source_desc()。
             "下载源: %s" % download_source_desc(),
+            # 远程附加源（0.4.5）能不能被正确合并、主源有没有被顶掉。
+            # 同样**真跑一遍** merge_sources，不是打印写死的说明。见 mirror_merge_desc()。
+            "附加源: %s" % mirror_merge_desc(),
             # 更新临时文件（.new/.new.part）和旧版本备份（.old）落在哪个目录。
             # **这行是「更新不再污染桌面」这条修复唯一的验证通道** —— GUI 里那段
             # 路径计算脚本点不到，只能靠它报出来做断言（见 verify_exe.py）。

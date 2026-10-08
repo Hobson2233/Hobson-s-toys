@@ -131,6 +131,31 @@ PROBE_MIN_SECONDS = 0.5
 PROBE_MAX_BYTES = 256 * 1024
 PROBE_TIMEOUT = 6
 
+# ---- 远程附加下载源（2026-10-08 加，0.4.5）----------------------------------
+#
+# 0.4.4 的下载源是**写死在发布清单里的**（`urls`）。想加一个源就得发一个新版本 ——
+# 而「想加源」这件事最常发生在**某个源挂了、用户正下不动**的时候，
+# 那时候我们恰恰发不了新版（用户下不动）。
+#
+# 所以把「附加源」抽成一个**独立的小文件**，客户端每次下载前拉一次：
+#
+#     mirrors.json   ← 短缓存（no-store），改完立刻生效，不用发新版
+#
+# 它和 version.json 的分工：
+#     version.json  跟着**版本号**走（发新版才变）—— 主源 + sha256 在它里面
+#     mirrors.json  跟着**线路**走（随时可改）  —— 只放附加源
+#
+# 🔴 三条必须守住的边界：
+#   1) **主源永远排第一，且来自 version.json，不来自 mirrors.json。**
+#      远程列表只能**追加**，不能删掉或顶替主源 —— 否则「站点上那个文件被改坏」
+#      就等于「用户被引到一个陌生地址」。
+#   2) **拉不到 / 格式不对 = 当作没有附加源**，绝不因此让更新失败。
+#      它是锦上添花，不是必需品（见 fetch_mirrors 的说明）。
+#   3) **真正的安全网是 sha256。** 清单里的 sha256 由主站给出并**强制校验**，
+#      所以一个被污染的 mirrors.json 最坏只能让下载失败 —— 装不上坏东西。
+MIRRORS_URL = BASE_URL_HINT + "/mirrors.json"
+MIRRORS_TIMEOUT = 6
+
 # 检查结果的状态。调用方必须三种都处理，不能把 UNKNOWN 当 CURRENT。
 STATE_NEWER = "newer"       # 有新版，info 里带下载信息
 STATE_CURRENT = "current"   # 已是最新
@@ -259,14 +284,108 @@ def _host_of(url):
         return url
 
 
-def candidate_urls(info):
+def fetch_mirrors(url=None, timeout=MIRRORS_TIMEOUT):
+    """拉远程附加源表。**所有能预见的失败都返回空列表，不抛异常。**
+
+    为什么不让它失败影响更新：这张表是**锦上添花**。它拉不到的时候，清单里
+    自带的那些源照样能用 —— 把「附加源拉取失败」升级成「更新失败」，
+    等于把锦上添花当成了救命稻草。
+
+    为什么不用 `fetch_manifest` 那套 (state, data)：那个接口是给「必须成功」
+    的路径用的，调用方得处理 STATE_UNKNOWN。这里不需要 —— 空列表就是
+    「没有附加源」，调用方不用分情况。
+
+    异常覆盖面：网络那一层由 `_get` 兜住（HTTPError / URLError / SSLError /
+    ValueError / OSError 全转成 `(False, 原因)`），解析那一层由下面的
+    `except` 兜住。**剩下能抛的只有代码 bug** —— 那种就该抛出来，别在这里吞掉。
+    """
+    ok, body = _get(url or MIRRORS_URL, timeout)
+    if not ok:
+        return []
+    try:
+        data = json.loads(body.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return []
+    if not isinstance(data, dict):
+        return []
+    raw = data.get("mirrors")
+    if not isinstance(raw, list):
+        return []
+    # 只挑出「像一条记录」的项，剩下的交给 _mirror_url 逐条判断。
+    # 不在这里报错：一张表里有一条坏的，不该让整张表作废。
+    return [item for item in raw if isinstance(item, dict)]
+
+
+def _mirror_url(entry, version):
+    """把一条附加源整理成可用地址；不可用返回 None。
+
+    `{version}` 会被替换成清单里的版本号 —— 这样**一张表管所有未来版本**，
+    不用每次发版都改它。这是它比「写死在清单里」强的地方。
+    """
+    if not isinstance(entry, dict):
+        return None
+    # `enabled` 默认 True。显式写 false 的跳过 —— 摘掉一个源不用删行，
+    # 留着下次还能一眼看到「它曾经在这儿、是我关掉的」。
+    if entry.get("enabled") is False:
+        return None
+    u = entry.get("url")
+    if not isinstance(u, str):
+        return None
+    u = u.strip()
+    if not u:
+        return None
+    if version:
+        u = u.replace("{version}", str(version))
+    # 和 _clean_urls 同样的理由：这张表也是**从网上取回来的**，
+    # 不该让它把我们引到 file:/// 之类的本地协议上去。
+    if not (u.startswith("http://") or u.startswith("https://")):
+        return None
+    return u
+
+
+def mirror_urls(entries, version):
+    """附加源记录 → 地址列表（去重、保序、丢掉不可用的）。"""
+    # 🔴 必须挡住「传进来的根本不是列表」：整个机制的前提就是
+    #    「坏数据不许带崩更新流程」。少了这一句，一个数字就能让
+    #    candidate_urls 抛 TypeError（2026-10-08 自检抓到的）。
+    if not isinstance(entries, (list, tuple)):
+        return []
+    out = []
+    for e in entries:
+        u = _mirror_url(e, version)
+        if u and u not in out:
+            out.append(u)
+    return out
+
+
+def merge_sources(manifest_urls, entries, version):
+    """把清单自带的源和远程附加源合成一份候选列表。
+
+    🔴 **第一项永远是 `manifest_urls[0]`（我们自己的站）。**
+       附加源只能往后追加，不能插队、不能顶替 —— 一个远程文件不该有能力
+       改变「首选从哪儿下」这件事。
+    """
+    out = [u for u in (manifest_urls or []) if isinstance(u, str)]
+    for u in mirror_urls(entries, version):
+        if u not in out:
+            out.append(u)
+    return out
+
+
+def candidate_urls(info, mirrors=None):
     """从 `evaluate()` 给的 info 里取出全部下载源。返回列表，第一项是主源。
 
     优先 `urls`（0.4.4 起的清单），没有就退回 `url`（老清单 / 老调用方）。
+
+    `mirrors` 是 `fetch_mirrors()` 拿到的**远程附加源**（0.4.5 起）。传了就
+    往后追加，第一项不受影响；不传就只是清单自带的那些源（老调用方的行为）。
     """
     if not isinstance(info, dict):
         return []
-    return _clean_urls(info.get("urls"), (info.get("url") or "").strip())
+    base = _clean_urls(info.get("urls"), (info.get("url") or "").strip())
+    if not mirrors:
+        return base
+    return merge_sources(base, mirrors, info.get("version"))
 
 
 def evaluate(manifest, current_version):
@@ -915,7 +1034,8 @@ def source_hint():
         由 help_check.py 拿这里的 BASE_URL_HINT 反算比对，防漂移。）
     """
     host = BASE_URL_HINT.split("//", 1)[-1]
-    return "更新源：%s 与 GitHub（下载前各测一下速度，从快的那个下）" % host
+    return ("更新源：%s、GitHub，以及站点上列出的其它线路"
+            "（下载前各测一下速度，从快的那个下）" % host)
 
 
 def _selftest():
@@ -1042,6 +1162,54 @@ def _selftest():
        candidate_urls({"url": "https://a/x",
                        "urls": ["https://a/x", "https://b/y"]}),
        ["https://a/x", "https://b/y"])
+
+    # --- 远程附加源（2026-10-08 加，0.4.5）---
+    # 这一组锁的是**边界**，不是「能不能用」：附加源是「从网上取回来的文件」，
+    # 它唯一能造成的伤害就是「改变首选下载地址」。所以断言集中在
+    # 「主源不许被顶掉」和「坏数据不许带崩流程」两件事上。
+    ck("附加源：{version} 会被替换",
+       mirror_urls([{"url": "https://m/x/v{version}/y.exe"}], "1.2.3"),
+       ["https://m/x/v1.2.3/y.exe"])
+    ck("附加源：enabled=false 跳过",
+       mirror_urls([{"url": "https://m/x", "enabled": False}], "1.0.0"), [])
+    ck("附加源：缺 url 跳过", mirror_urls([{"name": "x"}], "1.0.0"), [])
+    ck("附加源：只留 http(s)",
+       mirror_urls([{"url": "file:///c:/x"}, {"url": "https://m/ok"}], "1.0.0"),
+       ["https://m/ok"])
+    ck("附加源：去重保序",
+       mirror_urls([{"url": "https://m/x"}, {"url": "https://m/x"},
+                    {"url": "https://n/y"}], "1.0.0"),
+       ["https://m/x", "https://n/y"])
+    ck("附加源：非字典项丢掉", mirror_urls([1, None, "https://m/x"], "1.0.0"), [])
+
+    # 🔴 这一条是本机制存在的**前提**：远程文件不许改变「首选从哪儿下」。
+    ck("★ 合并后主源仍在第一位",
+       merge_sources(["https://mine/dl/x.exe"], [{"url": "https://m/x"}], "1.0.0"),
+       ["https://mine/dl/x.exe", "https://m/x"])
+    ck("★ 附加源顶不掉主源",
+       merge_sources(["https://mine/dl/x.exe"],
+                     [{"url": "https://mine/dl/x.exe"},
+                      {"url": "https://m/x"}], "1.0.0"),
+       ["https://mine/dl/x.exe", "https://m/x"])
+    ck("没有附加源 → 原样返回",
+       merge_sources(["https://mine/x"], [], "1.0.0"), ["https://mine/x"])
+
+    # 不传 mirrors 时行为必须和 0.4.4 完全一致（老调用方不受影响）。
+    ck("★ 不传 mirrors → 行为不变",
+       candidate_urls({"url": "https://a/x", "version": "1.0.0"}), ["https://a/x"])
+    ck("传 mirrors → 主源仍在第一位",
+       candidate_urls({"url": "https://a/x", "version": "1.0.0"},
+                      [{"url": "https://m/y"}])[0], "https://a/x")
+    ck("传 mirrors → 追加在后面（长度 2）",
+       len(candidate_urls({"url": "https://a/x", "version": "1.0.0"},
+                          [{"url": "https://m/y"}])), 2)
+    # 坏数据（不是列表 / 不是字典 / 全不可用）都不该抛异常、也不该改变主源。
+    ck("mirrors 是垃圾字符串 → 不影响主源",
+       candidate_urls({"url": "https://a/x", "version": "1.0.0"}, "垃圾"),
+       ["https://a/x"])
+    ck("mirrors 是数字 → 不影响主源",
+       candidate_urls({"url": "https://a/x", "version": "1.0.0"}, 123),
+       ["https://a/x"])
     ck("candidate_urls 认老清单（只有 url）",
        candidate_urls({"url": "https://a/x"}), ["https://a/x"])
     ck("candidate_urls 空 info → 空列表", candidate_urls({}), [])

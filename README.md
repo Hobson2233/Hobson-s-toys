@@ -4,7 +4,7 @@
 
 > 非官方项目，与学校网络管理部门无关。请仅使用你本人有权访问的账号，并遵守学校的网络使用规定。
 
-当前版本 0.4.4，从 [Releases](../../releases) 或 [hobson2233.dpdns.org](https://hobson2233.dpdns.org) 下载，[历史版本](https://hobson2233.dpdns.org/history) 也都留着。
+当前版本 0.4.5，从 [Releases](../../releases) 或 [hobson2233.dpdns.org](https://hobson2233.dpdns.org) 下载，[历史版本](https://hobson2233.dpdns.org/history) 也都留着。
 
 ![设置界面](docs/main.png)
 
