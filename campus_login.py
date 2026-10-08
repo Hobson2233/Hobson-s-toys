@@ -63,7 +63,7 @@ APP_TITLE = "校园网自动登录"
 # ⚠️ 这里是**唯一来源**。界面标题、使用说明、--version、--selftest、
 #    以及 exe 文件属性里的版本，全部由它推导 —— 不要在别处另写一份，
 #    否则迟早漂移（改了一处忘了另一处，用户看到的版本号就是错的）。
-VERSION = "0.4.3"
+VERSION = "0.4.4"
 
 # ==================== 学校参数：换学校只改 config.json ====================
 #
@@ -2890,7 +2890,12 @@ HELP_TEXT = (("校园网自动登录 —— 使用说明（v%s）\n" % VERSION) 
   它过一会儿会自己再试几次。
 
   下载下来的文件会跟发布方公布的哈希值对一遍，对不上就直接丢掉。
-  更新包只从 hobson2233.dpdns.org（本程序的发布站）下载。
+
+  更新包有两个来源：hobson2233.dpdns.org（本程序的发布站）和 GitHub。
+  下载前会各测一下速度，从快的那个下；一个下不动会自动换另一个。
+
+  如果下载失败，程序会问你要不要用浏览器打开下载页。浏览器下载支持
+  断点续传（网络断了能接着下），比程序内下载更稳，觉得慢也可以用它。
 
   如果显示「检查更新失败」，多半是当时网络不通，稍后再点一次就行。
   失败时会明确说「失败」，不会含糊地显示「已是最新版本」。
@@ -3333,6 +3338,117 @@ def update_dest_path(exe=None):
     # 此时它自己退回 exe 同目录 —— 宁可脏一点，也不能更新不了。
     return os.path.join(updater.work_dir_for(exe, data_dir()),
                         os.path.basename(exe) + ".new")
+
+
+# 下载进度每涨这么多百分比才推一次（不然队列会被进度消息淹没）。
+DL_STEP = 3
+
+
+def dl_progress_reset(state, now=None):
+    """把进度状态归零。**每次重试之前必须调**，理由见 dl_progress_text。"""
+    state["last"] = -1
+    # 用 perf_counter：单调、高精度。time.time() 会被系统对时改动，而且
+    # 在 Windows 上粒度约 15ms —— 测速那处已经因为它量到过 dt=0。
+    state["t0"] = time.perf_counter() if now is None else now
+
+
+def dl_progress_text(state, got, total, now=None):
+    """下载进度的节流与文案。该推就返回字符串，不该推返回 None。
+
+    `state` 是调用方持有的可变 dict：`{"last": 上次报的百分比, "t0": 本轮开始时刻}`。
+    ⚠️ **每轮重试都要 dl_progress_reset()** —— 忘了重置的表现是「新的一轮在
+       0% ~ 上次那个百分比之间**一条进度都不报**」，界面卡住不动，看着像死机。
+       2026-10-08 实测复现：第 1 轮报 3,6,…,60，第 2 轮只从 63 开始报。
+       （原来的实现把 `last` 挂在回调函数对象上，跨重试不重置，就是这个毛病。）
+
+    为什么抽成纯函数：闭包里的逻辑**脚本点不到**，只能靠点界面验证 ——
+    而这条 bug 恰恰只在「下载中途失败、然后重试」时才出现，最难手动撞上。
+
+    速度取的是**本轮平均**（从 state["t0"] 算），不是瞬时值 —— 瞬时值一抖就跳，
+    反而让人以为出问题了。dt 太小时不给速度（除法会被抖动放大）。
+    """
+    if now is None:
+        now = time.perf_counter()
+    pct = 0 if not total else int(got * 100 / total)
+    if pct < DL_STEP or pct == state["last"]:
+        return None
+    if pct < state["last"] + DL_STEP and pct != 100:
+        return None
+    state["last"] = pct
+    dt = now - state["t0"]
+    spd = ""
+    if dt > 0.3 and got:
+        spd = "  %.1f MB/s" % (got / dt / 1048576.0)
+    return "下载中 %d%%%s" % (pct, spd)
+
+
+def browser_fallback_url(info, used_url=""):
+    """下载失败时该用浏览器打开哪个地址。
+
+    优先用**这次实际试过的那个源**（`used_url`）—— 它刚才至少还连得上
+    （失败往往发生在下到一半），比让用户从主站从头再试一次更可能成功。
+    拿不到就退回清单里的主源；再拿不到就退回发布站首页。
+
+    抽成纯函数是为了能在 --selftest 里断言 —— 「真开一个浏览器」那一步
+    没法自动验，能验的是「该开哪个地址」这条判断。
+    """
+    used_url = (used_url or "").strip()
+    if used_url:
+        return used_url
+    if isinstance(info, dict):
+        u = (info.get("url") or "").strip()
+        if u:
+            return u
+    return updater.BASE_URL_HINT
+
+
+def open_in_browser(url):
+    """用系统默认浏览器打开一个网址。返回 True / False。
+
+    为什么要有这个出口（2026-10-08，用户反馈「室友在软件里更新下载超级慢」）：
+        程序内的下载**没有断点续传** —— 发布站是 Cloudflare Worker 的静态资源，
+        实测不支持 Range（带 Range 的请求返回的是 200 + 完整文件，不是 206），
+        所以网络一抖就得从 0 重来。而浏览器下载**支持续传**，断了能接着下，
+        还能看到真实进度。下载失败时给用户这条退路，比让他干瞪眼强。
+
+    ⚠️ `webbrowser` 用**函数内导入**：它只在「用户真的选了用浏览器打开」时
+       才需要。放函数里，模块导入阶段就不碰它 —— 少一个能把整个程序拖下水的
+       导入点。（PyInstaller 照样会把它打进包里，不影响 exe。）
+    """
+    try:
+        import webbrowser
+        return bool(webbrowser.open(url))
+    except Exception:
+        log("打开浏览器失败:\n%s" % traceback.format_exc())
+        return False
+
+
+def download_source_desc():
+    """`--selftest` 用：多源清单能不能被正确解析出两个下载源。
+
+    为什么**真的跑一遍**而不是打印一句写死的说明：0.4.4 的多源选路完全依赖
+    清单里的 `urls` 字段。字段名写错、或 evaluate() 忘了透传，症状是
+    **悄悄退回单源** —— 不报错、不失败，只是又变慢了。写死的说明在那时候
+    照样打印「主站 + GitHub」，等于没有这个检查。
+    """
+    try:
+        root = updater.BASE_URL_HINT
+        demo = {
+            "version": VERSION,
+            "url": "%s/dl/campus-login-%s.exe" % (root, VERSION),
+            "urls": ["%s/dl/campus-login-%s.exe" % (root, VERSION),
+                     "https://github.com/%s/releases/download/v%s/%s"
+                     % (updater.GITHUB_REPO, VERSION, updater.GITHUB_ASSET)],
+            "sha256": "a" * 64,
+            "size": 1,
+        }
+        _st, info = updater.evaluate(demo, "0.0.0")
+        urls = updater.candidate_urls(info)
+        hosts = [urlparse(u).hostname or u for u in urls]
+        return "%d 个（%s）" % (len(urls), "、".join(hosts))
+    except Exception:
+        log("下载源解析自检失败:\n%s" % traceback.format_exc())
+        return "解析失败（见日志）"
 
 
 def _self_update_desc():
@@ -4956,6 +5072,34 @@ class LoginApp:
                 self.btn_ver.configure(text=payload)
             except Exception:
                 pass
+        elif kind == "upd_download_failed":
+            # 参数：失败原因 + 建议用浏览器打开的地址（见 start_upgrade）。
+            #
+            # 为什么要在界面线程里单独处理、而不是并进 upd_result：
+            # 这里要弹一个询问框（后台线程不能弹），而且弹完之后**程序还在跑** ——
+            # 和 upd_result 那些「一次性的结论」不是一回事。
+            reason, url = payload
+            self.show("下载失败：%s" % reason, "err")
+            try:
+                if self.messagebox.askyesno(
+                        APP_TITLE,
+                        "自动下载没有成功。\n\n%s\n\n是否用浏览器打开下载页？\n\n"
+                        "浏览器下载支持断点续传（网络断了能接着下），"
+                        "比程序内下载更稳。" % reason):
+                    if open_in_browser(url):
+                        self.show("已用浏览器打开下载页：\n%s\n\n"
+                                  "下好之后，把它改名成和原来一样的文件名、"
+                                  "覆盖掉原文件即可（账号密码不受影响）。" % url,
+                                  "info")
+                    else:
+                        self.show("打不开浏览器。可以手动复制这个地址去下载：\n%s"
+                                  % url, "info")
+            except Exception:
+                log("处理下载失败提示异常:\n%s" % traceback.format_exc())
+            finally:
+                # 和 upd_result 同一个理由：任何一条路径都不能让界面卡在忙碌态，
+                # 否则三个按钮全灰、用户只能关掉重开。
+                self.set_busy(False)
         elif kind == "upd_result":
             # 参数：state（updater 的四态之一）+ info
             st, info = payload
@@ -5022,34 +5166,54 @@ class LoginApp:
                     % (info.get("version"), dest, work_dir))
                 self.state["queue"].put(("upd_progress", "下载中 0%"))
 
+                # 进度状态**必须是调用方持有的可变容器**，不能挂在回调函数对象上。
+                # 见 on_retry 那条注释：函数属性跨重试不重置，界面会卡住不动。
+                prog = {"last": -1, "t0": time.perf_counter()}
+
                 def on_prog(got, total):
-                    # 节流：每 3% 才推一次，不然队列会被进度消息淹没。
-                    pct = 0 if not total else int(got * 100 / total)
-                    if pct < 3 or pct == getattr(on_prog, "_last", -1):
-                        return
-                    if pct < getattr(on_prog, "_last", 0) + 3 and pct != 100:
-                        return
-                    on_prog._last = pct
-                    self.state["queue"].put(("upd_progress", "下载中 %d%%" % pct))
+                    # 节流和文案都在 dl_progress_text 里（纯函数，能被脚本断言）。
+                    txt = dl_progress_text(prog, got, total)
+                    if txt:
+                        self.state["queue"].put(("upd_progress", txt))
+
+                def on_pick(url, n, total):
+                    # 说清「现在从哪儿下、这是第几个源」。多源之后这一点更重要：
+                    # 用户有权知道程序在跟哪个地址说话（同 source_hint 的理由）。
+                    host = urlparse(url).hostname or url
+                    head = "下载中" if n == 1 else "换源"
+                    self.state["queue"].put(("upd_progress", "%s：从 %s 下载（%d/%d）…"
+                                             % (head, host, n, total)))
 
                 def on_retry(attempt, attempts, why):
                     # 重试必须说一句：否则进度会卡在某个百分比不动，
                     # 用户以为死机了就会再点一次 —— 那就并发下两份、还可能互相覆盖。
+                    #
+                    # 🔴 同时把进度状态**归零**（2026-10-08 修）：重试是从 0 重新下，
+                    #    而 `last` 还停在上一轮的最高百分比上，于是新的一轮
+                    #    0% ~ 上次那个百分比之间**一条进度都不会报**，界面停在
+                    #    比如 63% 不动 —— 看着就是死机。实测复现过。
+                    dl_progress_reset(prog)
                     self.state["queue"].put(("upd_progress", "网络中断，正在重试 %d/%d…"
                                              % (attempt, attempts)))
 
-                ok, reason = updater.download(
-                    info["url"], dest, sha256=info.get("sha256"),
-                    size=info.get("size"), on_progress=on_prog, on_retry=on_retry)
+                # 多源下载：清单里有几个源就试几个，先各测一下速度、从快的下。
+                # 老清单只有 url → candidate_urls 会退回成一项，行为跟以前一样。
+                ok, reason, used = updater.download_multi(
+                    updater.candidate_urls(info), dest, sha256=info.get("sha256"),
+                    size=info.get("size"), on_progress=on_prog,
+                    on_retry=on_retry, on_pick=on_pick)
                 if not ok:
                     # 下载失败时 download() 自己会清掉 `.part`，但 `.new` 可能
                     # 是上一轮留下的（下载成功、替换失败）。12 MB 的东西别留在盘上。
                     updater.discard(dest)
                     log("更新下载失败：%s" % reason)
-                    self.state["queue"].put(("upd_result", (
-                        updater.STATE_UNKNOWN, "下载失败：%s" % reason)))
+                    # 交给界面线程去问「要不要用浏览器下」—— messagebox 不能在
+                    # 后台线程弹。顺带把这次试过的源带上：浏览器下载支持断点续传，
+                    # 网络不稳时它比程序内下载可靠得多。
+                    self.state["queue"].put(("upd_download_failed", (
+                        reason, browser_fallback_url(info, used))))
                     return
-                log("更新包下载完成并校验通过：%s" % dest)
+                log("更新包下载完成并校验通过：%s（来自 %s）" % (dest, used))
 
                 self.state["queue"].put(("upd_progress", "正在替换…"))
                 # work_dir 必须一路传下去：`.old` 落在哪由它决定，
@@ -5678,6 +5842,10 @@ def main():
             "更新清单: %s" % updater.MANIFEST_URL,
             "更新兜底: %s" % updater.FALLBACK_MANIFEST_URL,
             "可自我更新: %s" % _self_update_desc(),
+            # 多源下载能不能解析出两个源（0.4.4）。**真跑一遍** evaluate →
+            # candidate_urls，不是打印写死的说明 —— 写死的那句在函数被删掉
+            # 之后照样打印，等于没有这个检查。见 download_source_desc()。
+            "下载源: %s" % download_source_desc(),
             # 更新临时文件（.new/.new.part）和旧版本备份（.old）落在哪个目录。
             # **这行是「更新不再污染桌面」这条修复唯一的验证通道** —— GUI 里那段
             # 路径计算脚本点不到，只能靠它报出来做断言（见 verify_exe.py）。

@@ -56,6 +56,13 @@ FAST = [
     # 用假 opener + 假时钟跑，不依赖网络；末尾那段真回环连不上会明说跳过。
     ("speed_probe_test.py", "测速：第 1 轮不计速 / 每轮 URL 唯一 / 每种失败都有中文"),
     ("ui_contrast_test.py", "按钮底色 ≠ 背景色（假控件树，不建 Tk）"),
+    # 更新功能的自检（2026-10-08 接进来）。`updater.py` 一直有 `_selftest()`，
+    # 但**从来没被任何入口跑到** —— 只能靠人记得敲 `python updater.py`。
+    # 「写了检查但没人跑」等于没有检查，所以接进 fast 档（它纯逻辑、不联网）。
+    ("updater.py", "更新逻辑自检（版本比较 / 清单判定 / 多源选路 / 文件清理）"),
+    # 多源下载与下载进度节流（0.4.4）。用**假 opener** 喂确定数据，不依赖网络。
+    ("updater_multisource_test.py",
+     "多源下载：测速选路 / 失败换源 / 进度重试后重置（假 opener）"),
     ("version_test.py", "版本号链路（纯函数部分；exe 那部分会自动跳过）"),
 ]
 
@@ -126,8 +133,11 @@ TIERS = {"fast": FAST, "env": ENV, "gate": GATE, "manual": MANUAL}
 
 # 不算测试的文件（库 / 数据 / 模板）。审计时会跳过它们，
 # 但**只要出现一个新的 *_test.py / *_probe.py 没被登记，审计就报错**。
+#
+# ⚠️ `updater.py` 2026-10-08 从这里挪出去了：它不只是库，`__main__` 里就是
+#    一整套自检（75 项），而且已经登记进 fast 档。留在这里会让人以为它不用跑。
 NOT_TESTS = {
-    "campus_login.py", "paths.py", "palette.py", "updater.py", "proc_tree.py",
+    "campus_login.py", "paths.py", "palette.py", "proc_tree.py",
     "datasafe.py", "shot.py", "build.py", "savepoint.py", "png_zoom.py",
     "stack_probe.py", "local_secrets.example.py",
 }

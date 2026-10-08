@@ -29,6 +29,7 @@ import json
 import os
 import ssl
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -40,12 +41,26 @@ import urllib.request
 # 改这里时记得同步改 make_manifest.py 的 BASE_URL。
 MANIFEST_URL = "https://hobson2233.dpdns.org/version.json"
 
+# GitHub 仓库。**三处副本**：这里、make_manifest.py（拼第二个下载源）、
+# make_site.py（页面上的 GitHub 链接）。repo/ 会被单独打包，不能 import 工作区
+# 根目录的东西，所以只能保留副本 —— 和站点域名同一个处理办法（见
+# domain_drift_test.py 的说明）。⚠️ 这里的值**必须**和那两个文件一致，
+# 写错不会报错，只会让第二个下载源静默 404（客户端会退回主站，看不出来）。
+GITHUB_REPO = "Hobson2233/Hobson-s-toys"
+
+# GitHub Release 里那个 exe 的**资产名**。注意它**不带版本号** ——
+# 是发布脚本上传时定的，别照主站 dl/ 的命名习惯想当然。
+GITHUB_ASSET = "campus-login.exe"
+
 # 兜底清单地址：主域名被回收 / 解析不了时还能查到版本号。
 # 只有 GitHub 的 api 域名在国内可用性还不错（raw.* 和 release 下载都实测过很差），
 # 这里只用来**查版本号**，下载仍旧走主域名 —— 所以这条兜底不需要下载能力。
 # 实测数据见 .workbuddy-ai/memory/2026-09-18.md「GitHub Release 下载基本不可用」一节。
-FALLBACK_MANIFEST_URL = ("https://api.github.com/repos/Hobson2233/"
-                         "Hobson-s-toys/releases/latest")
+#
+# ⚠️ 2026-10-08 起：**下载**也能走 GitHub 了（清单里的 urls 第二项），
+#    和这条兜底是两回事 —— 兜底只管查版本号、没有 sha256、永远不用于下载。
+FALLBACK_MANIFEST_URL = ("https://api.github.com/repos/%s/releases/latest"
+                         % GITHUB_REPO)
 
 # MANIFEST_URL 去掉 /version.json 之后的站点根，用来拼下载地址给用户看。
 BASE_URL_HINT = MANIFEST_URL.rsplit("/", 1)[0]
@@ -91,6 +106,30 @@ STALE_MIN_AGE = 10 * 60
 # 唯一不重试的是 HTTP 4xx：那是服务端明确说「没有 / 不给」，重试只是白白拖慢。
 #   新版发布后旧文件名就是 404，GitHub 兜底路径上尤其不该在这里耗时间。
 ATTEMPTS = 3
+
+# ---- 多源下载（2026-10-08 加，0.4.4）----------------------------------------
+#
+# 起因：用户反馈「室友在软件里检查更新，网络正常但下载超级慢」。
+# 查下来是两件事叠在一起：
+#   ① 主站是 Cloudflare Worker 的静态资源，**不支持 Range**（实测 Range 请求
+#      返回的是 200 + 完整文件，不是 206）→ 断了就得从 0 重来。
+#   ② 更新器显式不走系统代理（见模块开头第 1 条），用户如果靠代理/VPN 才快，
+#      程序偏偏直连 —— 慢是必然的。
+# 所以：给清单加第二个源（GitHub Release，**支持 Range**），下载前各测一下速度，
+# 从快的那个下，失败了自动换另一个。谁快完全取决于用户所在网络，猜不得。
+#
+# 🔴 探测**不需要服务端支持 Range**：只读开头一小段就主动断开，普通的 200
+#    响应也能测。别把「能不能续传」和「能不能测速」混成一件事。
+#
+# 为什么要有最小采样时长：一条 200 Mbps 的线路读 256 KB 只要 10 毫秒，
+#    这点时间全被 TCP 慢启动和调度抖动吃掉，量出来的数能差好几倍。
+#    所以「读满 PROBE_MAX_BYTES **或** 读够 PROBE_MIN_SECONDS」谁先满足就停。
+#    ⚠️ 握手时间不算进吞吐（t0 取在 open() 之后）—— 和 speed_probe 踩过的坑
+#       同源：把 TLS 握手算进去，16.8 Mbps 的线路会量成 2.4 Mbps，而两个数
+#       看着都「像正常数字」，根本发现不了。
+PROBE_MIN_SECONDS = 0.5
+PROBE_MAX_BYTES = 256 * 1024
+PROBE_TIMEOUT = 6
 
 # 检查结果的状态。调用方必须三种都处理，不能把 UNKNOWN 当 CURRENT。
 STATE_NEWER = "newer"       # 有新版，info 里带下载信息
@@ -184,6 +223,52 @@ def fetch_manifest(url=None, timeout=TIMEOUT):
     return STATE_NEWER, data
 
 
+def _clean_urls(raw, primary):
+    """把清单里的 `urls` 收拾成一个可用的列表。
+
+    - 缺失 / 不是列表 / 项不是字符串 → 跳过（老清单只有 `url` 字段，很正常）
+    - 只留 http(s) 开头的：清单是**从网上取回来的**，不该让它把我们引到
+      `file:///` 之类的本地协议上去。多一道过滤不亏。
+    - **`primary`（也就是 `url`）一定排第一**。老客户端只读 `url`、新客户端读
+      `urls`，两边必须从同一个源开始 —— 否则同一份清单在两种客户端上首选源
+      不同，出了事没法对照复现。
+    """
+    out = []
+    if isinstance(raw, list):
+        for u in raw:
+            if not isinstance(u, str):
+                continue
+            u = u.strip()
+            if not (u.startswith("http://") or u.startswith("https://")):
+                continue
+            if u not in out:
+                out.append(u)
+    if primary:
+        if primary in out:
+            out.remove(primary)
+        out.insert(0, primary)
+    return out
+
+
+def _host_of(url):
+    """从地址里取主机名，给用户看的（「从 github.com 下载」）。取不到就原样返回。"""
+    try:
+        rest = url.split("//", 1)[-1]
+        return rest.split("/", 1)[0] or url
+    except Exception:
+        return url
+
+
+def candidate_urls(info):
+    """从 `evaluate()` 给的 info 里取出全部下载源。返回列表，第一项是主源。
+
+    优先 `urls`（0.4.4 起的清单），没有就退回 `url`（老清单 / 老调用方）。
+    """
+    if not isinstance(info, dict):
+        return []
+    return _clean_urls(info.get("urls"), (info.get("url") or "").strip())
+
+
 def evaluate(manifest, current_version):
     """比对清单与当前版本。返回 (state, info)。
 
@@ -228,6 +313,8 @@ def evaluate(manifest, current_version):
     return STATE_NEWER, {
         "version": remote,
         "url": url,
+        # 多源列表。老清单里没有 urls → 这里就是 [url] 一项，调用方不必分情况。
+        "urls": _clean_urls(manifest.get("urls"), url),
         "sha256": sha,
         "size": size if isinstance(size, int) else None,
         "notes": (manifest.get("notes") or "").strip(),
@@ -435,6 +522,123 @@ def download(url, dest, sha256=None, size=None, timeout=TIMEOUT, on_progress=Non
         _unlink(tmp)
         return False, "写入失败：%s" % e
     return True, None
+
+
+def _probe(url, timeout=PROBE_TIMEOUT):
+    """读一小段来估这个源的吞吐。返回字节/秒；测不出来返回 None。
+
+    只读开头一小段就主动断开 —— **不需要服务端支持 Range**，普通 200 也能测。
+    """
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": UA})
+        with _opener().open(req, timeout=timeout) as r:
+            if r.status != 200:
+                return None
+            # ⚠️ 用 perf_counter 而不是 time.time()：后者在 Windows 上只有
+            #    ~15ms 的粒度，一个「秒回」的源两次读可能落在同一个刻度上，
+            #    dt 量成 0 —— 于是最快的源被判成「测不出来」、排到**最后**去试，
+            #    结果正好反了。perf_counter 是单调的高精度计数器，没有这个问题。
+            #    （这条是 2026-10-08 写测试时踩出来的，不是推理出来的。）
+            t0 = time.perf_counter()   # ⚠️ 取在 open() **之后**，握手不计入吞吐
+            got = 0
+            while got < PROBE_MAX_BYTES:
+                b = r.read(1 << 15)
+                if not b:
+                    break
+                got += len(b)
+                if time.perf_counter() - t0 >= PROBE_MIN_SECONDS:
+                    break
+            dt = time.perf_counter() - t0
+    except (OSError, ValueError):
+        # 探测失败**不是错误**，也不该让这个源出局 —— 可能只是一次抖动或一次
+        # 超时。调用方会把它排到最后去试（见 order_by_speed），而不是丢掉它。
+        # （OSError 已经覆盖 URLError / HTTPError / SSLError，不用逐个列。）
+        return None
+    if got <= 0:
+        return None
+    if dt <= 0:
+        # 计时器精度不够（极快的本地响应仍可能量到 0）→ 当成「非常快」。
+        # 返回 None 会让最快的那个源被排到最后，正好反了。
+        dt = 1e-6
+    return got / dt
+
+
+def probe_sources(urls, timeout=PROBE_TIMEOUT):
+    """**并发**探测每个源的吞吐。返回 [(url, 字节每秒或 None), ...]，顺序与输入一致。
+
+    为什么并发：串行的话总耗时是各源之和，而「连不上」在国内是常态
+    （连 github.com 超时很常见），一个源就要白等满 timeout 才轮到下一个 ——
+    用户点完「是」之后干等十几秒，看着就是卡死。并发时总耗时是**最慢的那个**。
+
+    线程都是 daemon、各自带 socket 超时，不会把进程吊住。
+    """
+    results = [None] * len(urls)
+
+    def one(i, u):
+        results[i] = _probe(u, timeout)
+
+    threads = []
+    for i, u in enumerate(urls):
+        t = threading.Thread(target=one, args=(i, u), daemon=True)
+        t.start()
+        threads.append(t)
+    # 统一给一个总期限，别一个线程一个期限地累加。
+    deadline = time.time() + timeout + 2
+    for t in threads:
+        t.join(max(0.05, deadline - time.time()))
+    return list(zip(urls, results))
+
+
+def order_by_speed(pairs):
+    """按速度从快到慢排。**测不出速度的一律排在最后，但不丢掉。**
+
+    丢掉就等于「另一个源本来能下，被我们主动排除了」。探测失败往往只是一次
+    抖动，重试一次可能就成了 —— 所以这里是**排序**，不是筛选。
+
+    全测不出来时保持原顺序（第一项仍是主源）。
+    """
+    known = sorted([p for p in pairs if p[1]], key=lambda p: p[1], reverse=True)
+    unknown = [p[0] for p in pairs if not p[1]]
+    return [p[0] for p in known] + unknown
+
+
+def download_multi(urls, dest, sha256=None, size=None, timeout=TIMEOUT,
+                   on_progress=None, on_retry=None, on_pick=None, probe=True):
+    """多源下载：先并发测速挑最快的，失败就换下一个源。
+
+    返回 `(ok, 原因, 用过的源)`。失败时第三项是**最后试的那个地址** ——
+    调用方拿它给用户一个「用浏览器打开下载页」的出口。
+
+    `on_pick(url, 第几个, 共几个)` 在**每次尝试之前**回调，让界面能说清
+    「现在从哪儿下」。回调抛异常会被吞掉：它只是提示，不该带崩下载。
+
+    🔴 只在**失败**时换源，不在**慢**的时候换源。
+       主站不支持 Range，换源 = 已下的字节全丢、从 0 重来。一个 60 KB/s 但
+       一直在走的连接，比「切来切去、每次下 10%」快得多。慢由测速那一步解决，
+       失败才由换源解决 —— 两件事别混在一起。
+    """
+    urls = [u for u in (urls or []) if u]
+    if not urls:
+        return False, "清单里没有可用的下载地址", ""
+
+    if len(urls) == 1 or not probe:
+        order = urls
+    else:
+        order = order_by_speed(probe_sources(urls, timeout))
+
+    tried = []
+    for i, u in enumerate(order):
+        if on_pick:
+            try:
+                on_pick(u, i + 1, len(order))
+            except Exception:
+                pass
+        ok, reason = download(u, dest, sha256, size, timeout=timeout,
+                              on_progress=on_progress, on_retry=on_retry)
+        if ok:
+            return True, None, u
+        tried.append("%s：%s" % (_host_of(u), reason))
+    return False, "所有下载源都失败（%s）" % "；".join(tried), order[-1]
 
 
 def _unlink(path):
@@ -711,7 +915,7 @@ def source_hint():
         由 help_check.py 拿这里的 BASE_URL_HINT 反算比对，防漂移。）
     """
     host = BASE_URL_HINT.split("//", 1)[-1]
-    return "更新源：%s（主站查不到版本号时回退 GitHub 查询，下载只走主站）" % host
+    return "更新源：%s 与 GitHub（下载前各测一下速度，从快的那个下）" % host
 
 
 def _selftest():
@@ -802,6 +1006,57 @@ def _selftest():
        STATE_UNKNOWN)
     ck("兜底：版本无法比较 → unknown",
        judge_fallback({"tag_name": "abc"}, "0.1.0")[0], STATE_UNKNOWN)
+
+    # --- 多源选路（2026-10-08 加，0.4.4）---
+    # 这一组全是**纯函数**，不联网。理由是「哪个源快」取决于用户所在网络，
+    # 本机测出来的结论对别人没用 —— 能测的是**规则**，不是结果。
+    # 真实选路那部分由 updater_test.py 的假服务覆盖（要真回环，MANUAL 档）。
+    ck("urls 缺失 → 退回 url", _clean_urls(None, "https://a/x"), ["https://a/x"])
+    ck("urls 不是列表 → 退回 url",
+       _clean_urls("https://a/x", "https://a/x"), ["https://a/x"])
+    ck("urls 去重保序",
+       _clean_urls(["https://a/x", "https://a/x"], "https://a/x"), ["https://a/x"])
+    # 清单是从网上取回来的，不该让它把我们引到本地协议上去。
+    ck("urls 只留 http(s)",
+       _clean_urls(["ftp://a/x", "file:///c:/x", "https://b/y"], "https://a/x"),
+       ["https://a/x", "https://b/y"])
+    ck("非字符串项丢掉",
+       _clean_urls([1, None, "https://b/y"], "https://a/x"),
+       ["https://a/x", "https://b/y"])
+    # 老客户端只读 url、新客户端读 urls，两边必须从同一个源开始。
+    ck("★ primary（url）一定排第一",
+       _clean_urls(["https://b/y", "https://a/x"], "https://a/x"),
+       ["https://a/x", "https://b/y"])
+
+    pairs = [("https://slow/x", 1000.0), ("https://fast/x", 900000.0),
+             ("https://dead/x", None)]
+    ck("按速度从快到慢排", order_by_speed(pairs),
+       ["https://fast/x", "https://slow/x", "https://dead/x"])
+    # 丢掉测不出来的源 = 「另一个源本来能下，被我们主动排除了」。
+    ck("★ 测不出速度的源不许被丢掉", len(order_by_speed(pairs)), 3)
+    ck("全测不出来 → 保持原顺序",
+       order_by_speed([("https://a/x", None), ("https://b/y", None)]),
+       ["https://a/x", "https://b/y"])
+
+    ck("candidate_urls 认 urls 字段",
+       candidate_urls({"url": "https://a/x",
+                       "urls": ["https://a/x", "https://b/y"]}),
+       ["https://a/x", "https://b/y"])
+    ck("candidate_urls 认老清单（只有 url）",
+       candidate_urls({"url": "https://a/x"}), ["https://a/x"])
+    ck("candidate_urls 空 info → 空列表", candidate_urls({}), [])
+    ck("candidate_urls 非字典 → 空列表", candidate_urls(None), [])
+
+    st, info = evaluate({"version": "0.2.0", "url": "https://a/x", "sha256": "a" * 64,
+                         "urls": ["https://b/y", "https://a/x"]}, "0.1.0")
+    ck("evaluate 透传 urls，并把 url 排第一", info["urls"],
+       ["https://a/x", "https://b/y"])
+    st, info = evaluate({"version": "0.2.0", "url": "https://a/x",
+                         "sha256": "a" * 64}, "0.1.0")
+    ck("老清单没有 urls → info 里也有一项", info["urls"], ["https://a/x"])
+
+    ck("_host_of 取主机名", _host_of("https://github.com/a/b"), "github.com")
+    ck("_host_of 对畸形串不炸", _host_of("乱七八糟"), "乱七八糟")
 
     # --- 源码运行时的 None 路径 ---
     # 这几条锁的是「传 None 不该炸」。源码运行时 exe 就是 None，
