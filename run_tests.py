@@ -67,6 +67,13 @@ FAST = [
     # 坏数据不许带崩流程、拉不到照常更新。假 _get 喂确定字节，不联网。
     ("mirrors_test.py",
      "附加源：主源不被顶掉 / 坏数据不崩 / 拉不到照常更新（假 _get）"),
+    # 增量更新（0.5.0）。核心不是「补丁能不能用」，而是**补丁不能用时会怎样** ——
+    # 五种失败（没补丁 / 没工具 / 下载失败 / 还原失败 / 哈希对不上）必须一律
+    # 安静退回完整下载，且**不许留下半成品**。用假 hpatchz 把每条路走一遍；
+    # 末尾还有一节真工具端到端：拿 dl_archive 的旧包 + site/patch 的真补丁
+    # 跑一遍，断言还原出来的 sha256 等于那一版发出去的哈希。
+    ("patch_test.py",
+     "增量更新：失败必降级 / 不留半成品 / 真补丁能还原（假工具 + 真补丁）"),
     ("version_test.py", "版本号链路（纯函数部分；exe 那部分会自动跳过）"),
 ]
 
@@ -139,7 +146,7 @@ TIERS = {"fast": FAST, "env": ENV, "gate": GATE, "manual": MANUAL}
 # 但**只要出现一个新的 *_test.py / *_probe.py 没被登记，审计就报错**。
 #
 # ⚠️ `updater.py` 2026-10-08 从这里挪出去了：它不只是库，`__main__` 里就是
-#    一整套自检（75 项），而且已经登记进 fast 档。留在这里会让人以为它不用跑。
+#    一整套自检（112 项），而且已经登记进 fast 档。留在这里会让人以为它不用跑。
 NOT_TESTS = {
     "campus_login.py", "paths.py", "palette.py", "proc_tree.py",
     "datasafe.py", "shot.py", "build.py", "savepoint.py", "png_zoom.py",

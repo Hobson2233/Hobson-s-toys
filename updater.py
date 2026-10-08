@@ -28,6 +28,7 @@ import hashlib
 import json
 import os
 import ssl
+import subprocess
 import sys
 import threading
 import time
@@ -155,6 +156,37 @@ PROBE_TIMEOUT = 6
 #      所以一个被污染的 mirrors.json 最坏只能让下载失败 —— 装不上坏东西。
 MIRRORS_URL = BASE_URL_HINT + "/mirrors.json"
 MIRRORS_TIMEOUT = 6
+
+# ---- 增量更新（2026-10-08 加，0.5.0）----------------------------------------
+#
+# 完整包 10.6 MB，而相邻版本之间**真正变动的字节只有 5%**（实测：0.4.4→0.4.5
+# 的补丁 551488 字节，占 5.0%）。所以改成：站点上放一份「补丁」，客户端只下
+# 这几百 KB，再用内嵌的 hpatchz 在本地把新程序还原出来。
+#
+# 用 HDiffPatch（MIT，v5.1.3）。为什么选它、以及为什么自己内嵌二进制而不装
+# Python 库，见 docs/DEVELOPMENT.md「增量更新」那一节 —— 一句话：它现成有
+# Windows 二进制，而纯 Python 的那几个要么要编译工具链、要么根本不存在。
+#
+# 🔴 四条必须守住的边界（每一条都有测试钉着）：
+#
+#   1) **补丁只是优化，不是必需品。** 没有补丁、补丁下不动、工具缺失、
+#      还原失败、还原出来的哈希对不上 —— 任何一种都只是**安静地退回完整下载**。
+#      用户永远不该因为「增量更新坏了」而更新不了。
+#
+#   2) **真正的安全网是「还原结果」的 sha256，不是补丁自己的。** 补丁的
+#      sha256 只用来尽早发现下载损坏；就算它被换掉，还原出来的 exe 也必须
+#      对得上清单里那个完整包的 sha256 —— 对不上就整个丢掉。
+#
+#   3) **补丁地址只认主站**（清单里给的那一个），不走多源、不接附加源。
+#      理由：补丁和某个**具体版本对**绑定，多一条源就多一种「源给错文件」的
+#      可能；而它本来就只有几百 KB，慢也慢不到哪去。
+#
+#   4) **补丁不许「几乎和完整包一样大」。** 服务端生成时就按比例筛过一遍，
+#      客户端这里再筛一次（`pick_patch`）：补丁超过完整包一半就不要它。
+#      两道筛是为了防「服务端规则被改坏」——客户端不该无条件相信清单。
+PATCH_TIMEOUT = 90          # 跑 hpatchz 的上限。实测 11 MB 只要 0.2 秒，
+                            # 给到 90 秒纯粹是防「卡死不返回」
+PATCH_NAME = "hpatchz.exe"  # 内嵌的补丁工具（--add-binary 打进 tools/）
 
 # 检查结果的状态。调用方必须三种都处理，不能把 UNKNOWN 当 CURRENT。
 STATE_NEWER = "newer"       # 有新版，info 里带下载信息
@@ -437,6 +469,10 @@ def evaluate(manifest, current_version):
         "sha256": sha,
         "size": size if isinstance(size, int) else None,
         "notes": (manifest.get("notes") or "").strip(),
+        # 增量更新的补丁表（0.5.0）。**原样透传、不在这里筛** —— 筛选规则
+        # （版本对不对得上、大小划不划算、地址合不合法）全在 pick_patch 里，
+        # 放在一处才好写测试。老清单没有这个字段 → None，调用方走完整下载。
+        "patches": manifest.get("patches") if isinstance(manifest.get("patches"), list) else None,
     }
 
 
@@ -766,6 +802,228 @@ def _unlink(path):
             os.remove(path)
     except OSError:
         pass
+
+
+# ---------------------------------------------------------------- 增量更新（0.5.0）
+
+def hpatchz_path():
+    """找内嵌的补丁工具。找不到返回 None —— 调用方据此**安静地退回完整下载**。
+
+    两个位置，按优先级：
+      ① 打包后：PyInstaller 把 `--add-binary` 的东西解到 `_MEIPASS/tools/`。
+         每次启动解包的目录名都不一样（`_MEIxxxxxx`），所以必须用 sys._MEIPASS
+         而不是猜路径。
+      ② 源码运行：`repo/tools/` 里那一份（打包时也正是从这儿取的，同一份文件）。
+
+    ⚠️ 返回 None 是**正常情况**，不是错误：没打包就运行源码、或者哪天打包漏了
+       这个文件，都不该让「更新」这件事整个不可用 —— 完整下载那条路照样能走。
+    """
+    name = PATCH_NAME
+    base = getattr(sys, "_MEIPASS", None)
+    if base:
+        p = os.path.join(base, "tools", name)
+        if os.path.isfile(p):
+            return p
+    p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tools", name)
+    if os.path.isfile(p):
+        return p
+    return None
+
+
+def pick_patch(info, current_version):
+    """从清单的 patches 里挑出「从 current_version 出发」的那一条。挑不到返回 None。
+
+    校验全部在这里做，一条不落地：
+      * `from` 必须**正好等于**当前版本 —— 差一点都不行，补丁只对某个确切
+        的旧文件有效（换个旧文件还原出来就是垃圾，虽然最后那道 sha256 会拦住，
+        但没必要白下一遍）。
+      * 地址必须是 http(s)（挡掉 `file://` 之类）。
+      * sha256 必须是 64 位十六进制 —— 补丁没有校验值就不下，和完整包同一条规矩。
+      * 补丁**不能超过完整包的一半**。服务端生成时已经按比例筛过，这里再筛一次：
+        客户端不该无条件相信清单，万一服务端的规则被改坏，这一句能兜住。
+    """
+    if not isinstance(info, dict):
+        return None
+    raw = info.get("patches")
+    if not isinstance(raw, list):
+        return None
+    want = (current_version or "").strip()
+    if not want:
+        return None
+
+    full = info.get("size")
+    if not isinstance(full, int) or full <= 0:
+        full = None
+
+    for it in raw:
+        if not isinstance(it, dict):
+            continue
+        if (it.get("from") or "").strip() != want:
+            continue
+        u = it.get("url")
+        if not isinstance(u, str) or not u.startswith(("http://", "https://")):
+            continue
+        sha = (it.get("sha256") or "").strip().lower()
+        if len(sha) != 64 or any(ch not in "0123456789abcdef" for ch in sha):
+            continue
+        size = it.get("size")
+        if not isinstance(size, int) or size <= 0:
+            continue
+        if full is not None and size * 2 > full:
+            continue
+        return {"url": u, "sha256": sha, "size": size}
+    return None
+
+
+def _no_window():
+    """跑子进程时别弹出控制台窗口。
+
+    我们的程序是 `--windowed` 打的，没有自己的控制台；这时再启动一个控制台
+    子进程（hpatchz.exe 就是），Windows 会**给它新建一个黑窗口**，
+    在用户屏幕上闪一下。CREATE_NO_WINDOW 就是干这个的。
+    """
+    return getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+
+
+def apply_patch(old_exe, patch_file, out_file, timeout=PATCH_TIMEOUT):
+    """用 hpatchz 把 old_exe + 补丁 还原成 out_file。返回 (True, None) 或 (False, 原因)。
+
+    ⚠️ 这里**只负责还原**，不校验结果 —— 校验在调用方（try_patch_update），
+       因为「期望的哈希」来自清单、不属于这个函数的职责。
+    """
+    hz = hpatchz_path()
+    if not hz:
+        return False, "找不到补丁工具"
+    _unlink(out_file)
+    try:
+        p = subprocess.run([hz, "-s-64m", old_exe, patch_file, out_file],
+                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                           timeout=timeout, creationflags=_no_window())
+    except subprocess.TimeoutExpired:
+        # 卡住的话进程可能还在写 out_file，先清掉再说。
+        _unlink(out_file)
+        return False, "应用补丁超时"
+    except OSError as e:
+        return False, "无法启动补丁工具：%s" % e
+
+    if p.returncode != 0:
+        _unlink(out_file)
+        # hpatchz 把原因写在 stdout（比如 oldPath 不匹配），最后一行通常最有信息量。
+        lines = (p.stdout or b"").decode("utf-8", "replace").strip().splitlines()
+        detail = lines[-1].strip() if lines else ""
+        return False, "应用补丁失败（退出码 %d）%s" % (p.returncode,
+                                                ("：" + detail) if detail else "")
+    if not os.path.isfile(out_file) or os.path.getsize(out_file) == 0:
+        _unlink(out_file)
+        return False, "补丁工具没有产出文件"
+    return True, None
+
+
+def try_patch_update(exe, info, current_version, work_dir=None, timeout=TIMEOUT,
+                     on_progress=None, on_retry=None, on_stage=None):
+    """用补丁把 exe 从 current_version 升到 info["version"]。
+
+    返回 (True, None, 补丁地址) 或 (False, 原因, None)。
+
+    🔴 **只在真正成功时返回 True。** 下面任何一条不满足都返回 False：
+         没有对应补丁 / 找不到补丁工具 / 当前程序文件不存在 / 补丁下载失败 /
+         还原失败 / **还原出来的文件哈希与清单对不上**。
+       调用方拿到 False 就**静默退回完整下载** —— 补丁是优化，不是必需品。
+
+    on_stage(text)：给界面用的一句话。下载阶段走 on_progress，
+    还原阶段没有百分比可报（实测只要 0.1~0.2 秒），但**得让界面知道
+    「现在不在下载、在本地还原」** —— 否则进度条停在 100% 不动，看着像卡住。
+
+    成功后 out_file（`<exe>.new`）留在原地等 apply_update 接手；
+    补丁文件本身用完即删（它没有复用价值，几百 KB 也没必要占着盘）。
+    """
+    if not isinstance(info, dict):
+        return False, "清单信息不对", None
+    patch = pick_patch(info, current_version)
+    if not patch:
+        return False, "没有从 %s 出发的补丁" % current_version, None
+    if not exe or not os.path.isfile(exe):
+        return False, "找不到当前程序文件", None
+    if not hpatchz_path():
+        return False, "找不到补丁工具", None
+
+    def _stage(t):
+        if on_stage:
+            try:
+                on_stage(t)
+            except Exception:
+                pass
+
+    d = work_dir_for(exe, work_dir)
+    base = os.path.basename(exe)
+    pf = os.path.join(d, base + ".hpatch")
+    out = os.path.join(d, base + ".new")
+    try:
+        ok, reason = download(patch["url"], pf, patch.get("sha256"),
+                              patch.get("size"), timeout=timeout,
+                              on_progress=on_progress, on_retry=on_retry)
+        if not ok:
+            return False, "补丁下载失败：%s" % reason, None
+
+        _stage("正在应用补丁…")
+        ok, reason = apply_patch(exe, pf, out)
+        if not ok:
+            return False, reason, None
+
+        # 🔴 这一步才是安全网。补丁的 sha256 只能说明「补丁没下坏」，
+        #    说明不了「还原出来的东西是我们想要的程序」—— 后者只有这一句能保证。
+        want = (info.get("sha256") or "").strip().lower()
+        got = sha256_file(out)
+        if not want or got != want:
+            _unlink(out)
+            return False, "补丁还原出的文件校验不过（%s…）" % got[:12], None
+        return True, None, patch["url"]
+    finally:
+        _unlink(pf)
+
+
+def download_update(exe, info, current_version, dest, work_dir=None, timeout=TIMEOUT,
+                    on_progress=None, on_retry=None, on_pick=None, on_stage=None,
+                    on_log=None):
+    """把这次更新要装的东西弄到 `dest`：**先试增量更新，不行再走多源下完整包**。
+
+    返回 (True, None, 来源地址) 或 (False, 原因, 最后试过的地址)。
+
+    为什么把这段「先补丁、失败降级」的判断抽到这一层：它是 0.5.0 的核心，
+    而它**只在补丁这条路上出岔子时**才走到降级分支 —— 靠点界面手动撞上太难了。
+    放在 updater 里就能用本地 HTTP 服务 + 假清单把两条路都跑一遍
+    （见 patch_test.py）。updater.py 存在的理由本来就是这个，见模块开头。
+
+    ⚠️ `exe` / `current_version` 传空（源码运行时）就**直接走完整下载**，
+       不去试补丁 —— 没有可替换的程序文件，补丁无从谈起。
+    """
+    def _log(t):
+        if on_log:
+            try:
+                on_log(t)
+            except Exception:
+                pass
+
+    if exe and current_version:
+        ok, why, url = try_patch_update(
+            exe, info, current_version, work_dir=work_dir, timeout=timeout,
+            on_progress=on_progress, on_retry=on_retry, on_stage=on_stage)
+        if ok:
+            _log("增量更新成功：只下了补丁 %s" % url)
+            return True, None, url
+        # 🔴 降级是**正常路径**，不是错误。原因写进日志就够了，别弹给用户 ——
+        #    他看到「更新失败」会以为程序坏了，而实际上只是多下一会儿。
+        _log("不用增量更新（%s），改下完整包" % why)
+
+    mirrors = fetch_mirrors()
+    base = candidate_urls(info)
+    urls = candidate_urls(info, mirrors)
+    _log("下载源 %d 个（附加源 %d 个）：%s"
+         % (len(urls), len(urls) - len(base), "、".join(urls)))
+    return download_multi(urls, dest, sha256=(info or {}).get("sha256"),
+                          size=(info or {}).get("size"), timeout=timeout,
+                          on_progress=on_progress, on_retry=on_retry,
+                          on_pick=on_pick)
 
 
 def _same_volume(a, b):
@@ -1214,6 +1472,71 @@ def _selftest():
        candidate_urls({"url": "https://a/x"}), ["https://a/x"])
     ck("candidate_urls 空 info → 空列表", candidate_urls({}), [])
     ck("candidate_urls 非字典 → 空列表", candidate_urls(None), [])
+
+    # --- 增量更新（2026-10-08 加，0.5.0）---
+    # 这一组锁的同样是**边界**：补丁只是优化，任何一条不满足都必须能
+    # **安静地退回完整下载**，而不是让更新失败。
+    FULL = 10 * 1024 * 1024
+    P = {"from": "0.4.4", "url": "https://hobson2233.dpdns.org/patch/x.hpatch",
+         "sha256": "b" * 64, "size": 500 * 1024}
+
+    def _info(**over):
+        d = {"version": "0.4.5", "sha256": "c" * 64, "size": FULL, "patches": [P]}
+        d.update(over)
+        return d
+
+    ck("补丁：能挑到对应版本",
+       pick_patch(_info(), "0.4.4"),
+       {"url": P["url"], "sha256": "b" * 64, "size": 500 * 1024})
+    ck("补丁：版本对不上 → 没有", pick_patch(_info(), "0.4.3"), None)
+    ck("补丁：当前版本为空 → 没有", pick_patch(_info(), ""), None)
+    ck("补丁：清单里没有 patches → 没有", pick_patch({"size": FULL}, "0.4.4"), None)
+    ck("补丁：patches 不是列表 → 没有", pick_patch({"patches": "垃圾"}, "0.4.4"), None)
+    ck("补丁：info 不是字典 → 没有", pick_patch(None, "0.4.4"), None)
+    ck("补丁：项不是字典 → 没有", pick_patch(_info(patches=[1, None]), "0.4.4"), None)
+    ck("补丁：地址不是 http(s) → 没有",
+       pick_patch(_info(patches=[dict(P, url="file:///c:/x")]), "0.4.4"), None)
+    ck("补丁：sha256 不合法 → 没有",
+       pick_patch(_info(patches=[dict(P, sha256="短")]), "0.4.4"), None)
+    ck("补丁：缺 size → 没有",
+       pick_patch(_info(patches=[dict(P, size=None)]), "0.4.4"), None)
+    ck("补丁：size 是 0 → 没有",
+       pick_patch(_info(patches=[dict(P, size=0)]), "0.4.4"), None)
+    # 🔴 这条是「客户端不信服务端」的那一道：补丁超过完整包一半就不要它。
+    ck("★ 补丁超过完整包一半 → 不要",
+       pick_patch(_info(patches=[dict(P, size=FULL // 2 + 1)]), "0.4.4"), None)
+    ck("补丁正好一半 → 要（边界不误伤）",
+       pick_patch(_info(patches=[dict(P, size=FULL // 2)]), "0.4.4") is not None, True)
+    ck("清单没有 size → 不按比例筛，仍然要",
+       pick_patch(_info(size=None), "0.4.4") is not None, True)
+    ck("补丁：多条里挑对的那条",
+       pick_patch(_info(patches=[dict(P, **{"from": "0.4.0"}),
+                                 dict(P, **{"from": "0.4.3"}), P]), "0.4.4")["url"],
+       P["url"])
+    ck("补丁：坏项在好项前面也不影响",
+       pick_patch(_info(patches=[{"from": "0.4.4"}, P]), "0.4.4")["url"], P["url"])
+
+    # evaluate 必须把 patches 透出来（挑不挑是 pick_patch 的事）。
+    _st, _inf = evaluate({"version": "0.2.0", "url": "https://a/x",
+                          "sha256": "a" * 64, "patches": [P]}, "0.1.0")
+    ck("evaluate 透传 patches", _inf["patches"], [P])
+    _st, _inf = evaluate({"version": "0.2.0", "url": "https://a/x",
+                          "sha256": "a" * 64}, "0.1.0")
+    ck("老清单没有 patches → None（不是空列表）", _inf["patches"], None)
+    _st, _inf = evaluate({"version": "0.2.0", "url": "https://a/x",
+                          "sha256": "a" * 64, "patches": "垃圾"}, "0.1.0")
+    ck("patches 不是列表 → 归一成 None", _inf["patches"], None)
+
+    # try_patch_update 的「安静失败」路径：源码运行时 exe 不存在，
+    # 必须返回 (False, 原因, None) 而不是抛异常 —— 调用方靠这个回退。
+    ok_p, why_p, url_p = try_patch_update("C:/不存在的路径/x.exe", _info(), "0.4.4")
+    ck("try_patch_update：找不到 exe → 失败且不抛", (ok_p, url_p), (False, None))
+    ck("try_patch_update：失败时给了原因", bool(why_p), True)
+    ok_p, why_p, url_p = try_patch_update(__file__, _info(), "0.4.3")
+    ck("try_patch_update：没有对应补丁 → 失败",
+       (ok_p, url_p, why_p), (False, None, "没有从 0.4.3 出发的补丁"))
+    ok_p, why_p, url_p = try_patch_update(__file__, {}, "0.4.4")
+    ck("try_patch_update：info 是空字典 → 失败", ok_p, False)
 
     st, info = evaluate({"version": "0.2.0", "url": "https://a/x", "sha256": "a" * 64,
                          "urls": ["https://b/y", "https://a/x"]}, "0.1.0")

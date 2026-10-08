@@ -63,7 +63,7 @@ APP_TITLE = "校园网自动登录"
 # ⚠️ 这里是**唯一来源**。界面标题、使用说明、--version、--selftest、
 #    以及 exe 文件属性里的版本，全部由它推导 —— 不要在别处另写一份，
 #    否则迟早漂移（改了一处忘了另一处，用户看到的版本号就是错的）。
-VERSION = "0.4.5"
+VERSION = "0.5.0"
 
 # ==================== 学校参数：换学校只改 config.json ====================
 #
@@ -2891,6 +2891,10 @@ HELP_TEXT = (("校园网自动登录 —— 使用说明（v%s）\n" % VERSION) 
 
   下载下来的文件会跟发布方公布的哈希值对一遍，对不上就直接丢掉。
 
+  相邻版本之间真正变动的部分通常只有百分之几，所以升级时多数情况只下载
+  变动的那一小块（几百 KB），不用每次重下整个程序。万一增量这条路走不通，
+  它会自动改成下载完整包，你不需要做任何选择。
+
   更新包有多个来源：本程序的发布站 hobson2233.dpdns.org、GitHub，
   以及发布站上另外列出的线路。
   下载前会各测一下速度，从快的那个下；一个下不动会自动换另一个。
@@ -3357,13 +3361,20 @@ def dl_progress_text(state, got, total, now=None):
     """下载进度的节流与文案。该推就返回字符串，不该推返回 None。
 
     `state` 是调用方持有的可变 dict：`{"last": 上次报的百分比, "t0": 本轮开始时刻}`。
-    ⚠️ **每轮重试都要 dl_progress_reset()** —— 忘了重置的表现是「新的一轮在
-       0% ~ 上次那个百分比之间**一条进度都不报**」，界面卡住不动，看着像死机。
-       2026-10-08 实测复现：第 1 轮报 3,6,…,60，第 2 轮只从 63 开始报。
-       （原来的实现把 `last` 挂在回调函数对象上，跨重试不重置，就是这个毛病。）
+
+    🔴 **进度回退 = 新的一轮，这个函数自己会认出来**（2026-10-08 补）。
+       「从头下」的地方有三处：重试、换源、以及 0.5.0 加的「补丁不行改下完整包」。
+       三处都会让 got 从 0 重新数，而 `last` 还停在上一轮的最高百分比上 ——
+       于是新一轮在 0% ~ 上次那个百分比之间**一条进度都不报**，界面卡住不动，
+       看着像死机。实测复现过：第 1 轮报 3,6,…,60，第 2 轮只从 63 开始报。
+
+       原来的修法是「每个重启点都记得调 dl_progress_reset()」——
+       而那正是这个 bug 的成因（漏一处就复发，换源那处就一直漏着）。
+       现在改成函数自己判断：**pct 比上次小**就说明换了一轮，就地归零 + 重置计时。
+       dl_progress_reset() 仍然留着，给「还没收到任何进度就想先重置」的调用方用。
 
     为什么抽成纯函数：闭包里的逻辑**脚本点不到**，只能靠点界面验证 ——
-    而这条 bug 恰恰只在「下载中途失败、然后重试」时才出现，最难手动撞上。
+    而这条 bug 恰恰只在「下载中途出岔子」时才出现，最难手动撞上。
 
     速度取的是**本轮平均**（从 state["t0"] 算），不是瞬时值 —— 瞬时值一抖就跳，
     反而让人以为出问题了。dt 太小时不给速度（除法会被抖动放大）。
@@ -3371,6 +3382,11 @@ def dl_progress_text(state, got, total, now=None):
     if now is None:
         now = time.perf_counter()
     pct = 0 if not total else int(got * 100 / total)
+    if pct < state["last"]:
+        # 新的一轮。计时也一起重置 —— 否则速度会拿「本轮的字节 ÷ 跨轮的时长」
+        # 去算，算出来偏小，而偏小的速度用户是会当真的。
+        state["last"] = -1
+        state["t0"] = now
     if pct < DL_STEP or pct == state["last"]:
         return None
     if pct < state["last"] + DL_STEP and pct != 100:
@@ -3478,6 +3494,53 @@ def mirror_merge_desc():
         return "可合并，主源仍在第一位"
     except Exception:
         log("附加源合并自检失败:\n%s" % traceback.format_exc())
+        return "解析失败（见日志）"
+
+
+def patch_tool_desc():
+    """`--selftest` 用：内嵌的补丁工具在不在、在哪、多大。
+
+    为什么要报这个：`--add-binary` 漏了或路径写错时，**打包不报错、程序照常跑**，
+    只是每次更新都静默退回「下 10 MB 完整包」—— 用户看不出任何异常，
+    只是觉得更新一直很慢。这种「功能悄悄退化」只有靠自检报出来 + gate 档
+    对真 exe 断言才拦得住（见 build.py 的 _check_tools，那道管的是「打进包里没有」，
+    这道管的是「运行期找得到没有」，缺一不可）。
+    """
+    p = updater.hpatchz_path()
+    if not p:
+        return "没找到（增量更新会退化成完整下载）"
+    try:
+        n = os.path.getsize(p)
+    except OSError as e:
+        return "找到了但读不到：%s（%s）" % (p, e)
+    return "%s（%d 字节）" % (os.path.basename(p), n)
+
+
+def patch_plan_desc():
+    """`--selftest` 用：拿一份**假的**清单，真跑一遍「挑补丁」这段逻辑。
+
+    和 download_source_desc / mirror_merge_desc 同一个理由：打印写死的说明
+    在那段逻辑被改坏之后照样会打印，等于没有这个检查。这里真跑一遍，
+    断言「版本对得上就挑得到、对不上就挑不到」—— 后者尤其重要，
+    挑错了会拿一个给别的旧版本的补丁去还原，结果是白下 500 KB 再回退。
+    """
+    try:
+        full = 10 * 1024 * 1024
+        entry = {"from": VERSION,
+                 "url": "https://example.invalid/patch/%s-to-9.9.9.hpatch" % VERSION,
+                 "sha256": "0" * 64, "size": 500 * 1024}
+        info = {"version": "9.9.9", "size": full, "patches": [entry]}
+        if not updater.pick_patch(info, VERSION):
+            return "版本对得上却挑不到（异常）"
+        if updater.pick_patch(info, "0.0.1"):
+            return "版本对不上却挑到了（异常）"
+        # 补丁比完整包一半还大时客户端要拒绝 —— 服务端已经筛过，这里再筛一次。
+        big = dict(entry, size=full // 2 + 1)
+        if updater.pick_patch({"version": "9.9.9", "size": full, "patches": [big]}, VERSION):
+            return "过大的补丁没被拒绝（异常）"
+        return "可挑选（版本对得上才用）"
+    except Exception:
+        log("补丁挑选自检失败:\n%s" % traceback.format_exc())
         return "解析失败（见日志）"
 
 
@@ -5218,29 +5281,23 @@ class LoginApp:
                     # 重试必须说一句：否则进度会卡在某个百分比不动，
                     # 用户以为死机了就会再点一次 —— 那就并发下两份、还可能互相覆盖。
                     #
-                    # 🔴 同时把进度状态**归零**（2026-10-08 修）：重试是从 0 重新下，
-                    #    而 `last` 还停在上一轮的最高百分比上，于是新的一轮
-                    #    0% ~ 上次那个百分比之间**一条进度都不会报**，界面停在
-                    #    比如 63% 不动 —— 看着就是死机。实测复现过。
+                    # 进度状态一并归零（2026-10-08 修）：重试是从 0 重新下，
+                    # 而 `last` 还停在上一轮的最高百分比上。⚠️ dl_progress_text
+                    # 现在自己也能认出来（进度回退 = 新的一轮），这里是显式说一遍
+                    # 意图 —— 那个自动判断是给「忘了调」的情况兜底的。
                     dl_progress_reset(prog)
                     self.state["queue"].put(("upd_progress", "网络中断，正在重试 %d/%d…"
                                              % (attempt, attempts)))
 
-                # 多源下载：清单里有几个源就试几个，先各测一下速度、从快的下。
-                # 老清单只有 url → candidate_urls 会退回成一项，行为跟以前一样。
-                #
-                # 附加源（0.4.5）：站点上那张 mirrors.json。**拉不到就当作没有**
-                # —— 它是锦上添花，不该让更新失败。主源永远来自清单第一项，
-                # 远程那张表只能往后追加（见 updater.merge_sources 的说明）。
-                mirrors = updater.fetch_mirrors()
-                base_urls = updater.candidate_urls(info)
-                urls = updater.candidate_urls(info, mirrors)
-                log("下载源 %d 个（附加源 %d 个）：%s"
-                    % (len(urls), len(urls) - len(base_urls), "、".join(urls)))
-                ok, reason, used = updater.download_multi(
-                    urls, dest, sha256=info.get("sha256"),
-                    size=info.get("size"), on_progress=on_prog,
-                    on_retry=on_retry, on_pick=on_pick)
+                # 下载这件事本身（先试增量、不行再走多源完整包）在 updater 里，
+                # 不在这儿 —— 那段判断只在补丁路上出岔子时才走到降级分支，
+                # 塞在闭包里就只能靠点界面撞运气，而它有完整的测试（patch_test.py）。
+                # 界面只负责：把进度转成消息、把失败转成「要不要用浏览器下」的询问。
+                ok, reason, used = updater.download_update(
+                    exe, info, VERSION, dest, work_dir=work_dir,
+                    on_progress=on_prog, on_retry=on_retry, on_pick=on_pick,
+                    on_stage=lambda t: self.state["queue"].put(("upd_progress", t)),
+                    on_log=log)
                 if not ok:
                     # 下载失败时 download() 自己会清掉 `.part`，但 `.new` 可能
                     # 是上一轮留下的（下载成功、替换失败）。12 MB 的东西别留在盘上。
@@ -5888,6 +5945,9 @@ def main():
             # 远程附加源（0.4.5）能不能被正确合并、主源有没有被顶掉。
             # 同样**真跑一遍** merge_sources，不是打印写死的说明。见 mirror_merge_desc()。
             "附加源: %s" % mirror_merge_desc(),
+            # 增量更新（0.5.0）的两件事：补丁工具在不在、挑补丁的逻辑对不对。
+            "补丁工具: %s" % patch_tool_desc(),
+            "补丁挑选: %s" % patch_plan_desc(),
             # 更新临时文件（.new/.new.part）和旧版本备份（.old）落在哪个目录。
             # **这行是「更新不再污染桌面」这条修复唯一的验证通道** —— GUI 里那段
             # 路径计算脚本点不到，只能靠它报出来做断言（见 verify_exe.py）。

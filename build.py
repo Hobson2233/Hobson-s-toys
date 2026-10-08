@@ -17,6 +17,13 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 APP = os.path.join(HERE, "campus_login.py")
 ICON = os.path.join(HERE, "设置.ico")
 NAME = "CampusLogin"
+
+# 增量更新要用的补丁工具（0.5.0）。它被 --add-binary 打进 exe 的 tools/ 子目录，
+# 运行期由 updater.hpatchz_path() 按 `_MEIPASS/tools/hpatchz.exe` 找。
+# ⚠️ 这个**子目录名不能改**：改了打包不报错，只是运行期找不到 → 更新静默
+#    退化成「每次都下 10 MB 完整包」，用户看不出任何异常。
+TOOL_SUBDIR = "tools"
+TOOL_NAME = "hpatchz.exe"
 # 交付目录 = 桌面根目录（exe 直接放桌面上，方便找到和发出去）。
 # 以前是桌面的一个子文件夹，改过一次 —— 挪动交付位置会**让开机自启失效**，
 # 因为启动文件夹里的 .lnk 存的是绝对路径。改这里就要重新设置一次自启。
@@ -334,6 +341,45 @@ def _check_modules(exe):
     return 0
 
 
+def _check_tools(exe):
+    """核对增量更新要用的 hpatchz.exe **真的按 tools/ 路径**打进了包里。
+
+    为什么要单独查：`--add-binary` 写错（源文件路径不对、分隔符写成 `:`）
+    时 PyInstaller **不报错**，只是东西没进去。而没进去的表现是
+    「更新时静默退回完整下载」—— 用户看不出任何异常，只是每次更新都下 10 MB。
+    这种「功能悄悄退化」正是这个项目最想避免的失败形态。
+
+    ⚠️ 比对的是**归档里的路径**（`tools/hpatchz.exe`），不是文件名 ——
+       塞到别的目录下，运行期 updater.hpatchz_path() 就找不到。
+    """
+    try:
+        from PyInstaller.archive.readers import CArchiveReader
+        r = CArchiveReader(exe)
+        names = set()
+        for nm in list(r.toc):
+            names.add(str(nm))
+            name = getattr(nm, "name", None)
+            if name:
+                names.add(str(name))
+    except Exception as e:
+        # 读不了归档 = 这个检查本身失效。必须报失败，不能放行。
+        print("  [失败] 无法读取归档，补丁工具检查没跑成：%s" % e)
+        return 1
+
+    want = "%s/%s" % (TOOL_SUBDIR, TOOL_NAME)
+    hit = [n for n in names if n.replace("\\", "/").endswith(want)]
+    if not hit:
+        near = sorted(n for n in names if "patchz" in n.lower() or "hdiffz" in n.lower())
+        print("  [失败] 包里没有 %s —— 增量更新会静默退化成完整下载" % want)
+        print("         ⇒ 检查 --add-binary 的参数：源文件在不在、分隔符对不对")
+        if near:
+            print("         ⇒ 包里倒是有这些相近的条目：%s" % "、".join(near))
+        return 1
+
+    print("  [OK] 补丁工具在包里：%s" % hit[0])
+    return 0
+
+
 def _read_exe_version(path):
     """从 exe 的 PE 资源里读回 FileVersion 字符串。读不到返回 ""。
 
@@ -417,6 +463,14 @@ def main():
         print("图标裁剪失败，改用原图标")
 
     hooks_dir = os.path.join(HERE, "hooks")
+    # 增量更新用的补丁工具（0.5.0）。**缺了就直接失败**，不要带着打下去 ——
+    # 打出来的包能正常跑，只是每次更新都退化成下 10 MB，属于最难发现的那类问题。
+    tool_src = os.path.join(HERE, TOOL_SUBDIR, TOOL_NAME)
+    if not os.path.isfile(tool_src):
+        print("找不到补丁工具：%s" % tool_src)
+        print("  ⇒ 它应该跟源码一起在仓库里（见 tools/README.md 的来源说明）")
+        return 1
+    print("补丁工具: %s（%d 字节）" % (TOOL_NAME, os.path.getsize(tool_src)))
     # exe 的版本资源：生成一份 VS_VERSIONINFO 文本喂给 PyInstaller。
     # 落在 HERE 而不是 work/ 里 —— 构建目录每次换新的，调试时想看一眼还得去翻。
     vf = _version_file(os.path.join(HERE, "version_info.txt"))
@@ -425,6 +479,7 @@ def main():
            "--onefile", "--windowed", "--name", NAME,
            "--icon", ICON, "--version-file", vf,
            "--add-data", "%s%s." % (small_icon, os.pathsep),
+           "--add-binary", "%s%s%s" % (tool_src, os.pathsep, TOOL_SUBDIR),
            "--distpath", dist,
            "--workpath", work,
            "--specpath", work,
@@ -447,6 +502,11 @@ def main():
     # 因 EXCLUDES 排除了 ssl，--selftest 45s 超时，查了很久才发现是缺模块）。
     # 这里用归档读取直接查，秒级出结果、且能指名道姓说缺哪个。
     rc = _check_modules(src)
+    if rc:
+        return rc
+
+    # 补丁工具在不在包里。和上面同理：放这儿才秒级出结果、且能指名道姓。
+    rc = _check_tools(src)
     if rc:
         return rc
 
