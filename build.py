@@ -48,11 +48,10 @@ HARD_FAIL_PHRASES = (WIRING_FAIL_PHRASE, UI_FAIL_PHRASE)
 import proc_tree  # noqa: E402  —— 收进程树（onefile 是父子两个进程，别只杀父）
 
 # 从包里剔掉的模块。每一项都有具体理由，别凭感觉往里加。
-#   ssl / _ssl / _hashlib
-#       本程序只用 http://（portal、1.1.1.1、msftconnecttest 全是明文），
-#       用不到 TLS。剔掉它们，PyInstaller 就不会再打进
-#       libcrypto-3.dll + libssl-3.dll —— 解压后合计约 5.8MB，是最大的一块可省项。
-#       已实测：urllib.request 在没有 ssl 时会把 _have_ssl 置 False，HTTP 照常工作。
+#   ⚠️ ssl / _ssl / _hashlib **不在**这份清单里，而且**不许加进来** ——
+#      理由（「检查更新」要从 https 下载）见下面 EXCLUDES 里那段注释。
+#      （这里原来写着「剔掉它们能省 5.8MB」，**那个前提 2026-09-18 就失效了**，
+#       但这段话一直留着没说清 —— 2026-10-10 发现并改掉。别再照它加。）
 #   requests / urllib3 / idna / charset_normalizer / certifi / chardet
 #       已改用标准库 urllib，这些一个都不再 import。
 #   其余

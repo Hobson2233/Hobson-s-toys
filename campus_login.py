@@ -62,7 +62,7 @@ APP_TITLE = "校园网自动登录"
 # ⚠️ 这里是**唯一来源**。界面标题、使用说明、--version、--selftest、
 #    以及 exe 文件属性里的版本，全部由它推导 —— 不要在别处另写一份，
 #    否则迟早漂移（改了一处忘了另一处，用户看到的版本号就是错的）。
-VERSION = "0.5.1"
+VERSION = "0.5.2"
 
 # ==================== 学校参数：换学校只改 config.json ====================
 #
@@ -112,17 +112,26 @@ DEFAULT_CAMPUS_SUBNETS = ("10.",)
 # 认证后要跳转到的目标 URL。**取值走 trigger_url()**（可被 config.json 的
 # `triggerUrl` 覆盖），不要直接引用这个名字 —— 直接引用就等于配置改不动。
 TRIGGER_URL = "http://1.1.1.1/"
-# 连通性检测目标：逐个试，任一通过即算「已联网」。**取值走 check_targets()**。
+# 连通性检测目标：**并发**试，任一通过即算「已联网」。**取值走 check_targets()**。
 #
 # 为什么不是一个地址就够：只认一个域名时，该域名一旦被校园网拦截或临时不可达，
 # 就会把「能上网」误判成「未连接」。实测首次 DNS 解析要 7.4 秒、之后只要 0.2 秒，
 # 所以冷启动那一次尤其容易超时。
 #   (url, 期望正文；None 表示只看状态码, 简短名字)
+#
+# 🔴 顺序 = **国内地址优先**（2026-10-10 实测后调）：微软那两个在国内实测
+#    **3.4~7.6 秒**才回，而国内这两个只要 **0.05 秒**（差 27 倍，实测数据见
+#    `_probe_race` 的说明）。并发之后顺序**不再是速度关键**（总耗时取决于最快
+#    的那个），留着这个顺序是为了两层：
+#      ① 代码即文档 —— 默认值该反映实测事实；
+#      ② 兜底 —— 万一将来并发被回退成串行，这个顺序仍然是对的。
+#    ⚠️ 改这个列表时**别依赖下标** —— 测试里已改成按特征挑目标（有正文校验的 /
+#       只看状态码的），不再写死 [0] / [2]。
 CHECK_TARGETS = (
-    ("http://www.msftconnecttest.com/connecttest.txt", "Microsoft Connect Test", "msftconnecttest"),
-    ("http://www.msftncsi.com/ncsi.txt", "Microsoft NCSI", "msftncsi"),
     ("http://connectivitycheck.platform.hicloud.com/generate_204", None, "hicloud"),
     ("http://connect.rom.miui.com/generate_204", None, "miui"),
+    ("http://www.msftconnecttest.com/connecttest.txt", "Microsoft Connect Test", "msftconnecttest"),
+    ("http://www.msftncsi.com/ncsi.txt", "Microsoft NCSI", "msftncsi"),
 )
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
 
@@ -914,6 +923,60 @@ def _probe(url, expect, timeout):
     return None
 
 
+def _probe_race(targets, per):
+    """**并发**探所有目标，谁先给出结论就用谁。返回 (verdict, name)。
+
+    verdict 的三态与 `_probe` 一致：True / False / None（**False 优先于 None**）。
+    name 是给出结论的那个目标名，只用于排障，不参与判定。
+
+    🔴 为什么改成并发（2026-10-10，用户报「开机后自动登录慢」）：
+        原来是一个个**串着**探、第一个成功的就返回 —— 于是**总耗时取决于「最靠前
+        的那个能通的目标有多快」**。而 `CHECK_TARGETS` 原先前两个是微软的地址，
+        在国内实测 3.4~7.6 秒才回（国内地址只要 0.05 秒）。
+        实测对比（同一分钟、同一台机器）：
+            微软优先  3.47 秒   ← 改之前
+            国内优先  0.13 秒   ← 改之后
+        并发之后**总耗时取决于「最快的那个目标有多快」**，与顺序无关；
+        最坏情况也从「N × per」（4 个目标 = 10 秒）收成「per」（约 2.5 秒）。
+        ⚠️ 顺带解决了可扩展性：以后往列表里加目标**不会让它变慢**。
+
+    ⚠️ 和 `updater.probe_sources()` 的区别（同一个理由，但**不能照抄**）：
+        那边要的是**每个源各自的速度**，所以必须 `join` 等全部跑完；
+        这边只要**一个「能通」的证据**，所以拿到第一个 True 就立刻返回 ——
+        等剩下几个跑完，等于把慢目标的时间又加回来了，白并发。
+        线程都是 daemon + 各自带超时，不会把进程吊住。
+
+    ⚠️ 用 `queue` 而不是 `concurrent.futures`：后者会引入额外模块，而打包体积是
+        项目的红线（见 build.py 的 EXCLUDES）；`threading` / `queue` 本来就 import 了。
+    """
+    q = queue.Queue()
+
+    def one(url, expect, name):
+        q.put((name, _probe(url, expect, per)))
+
+    for t in targets:
+        threading.Thread(target=one, args=t, daemon=True).start()
+
+    # 总期限：最坏情况 = 单个目标的超时 + 一点余量。
+    # 不这么兜底的话，DNS 解析一旦卡住（它**不受 socket timeout 约束**）就会在这里
+    # 无限等下去 —— 那正是「开机后慢」的另一个可能来源，别再引入。
+    deadline = time.time() + per + 0.5
+    blocked = None
+    for _ in targets:
+        remain = deadline - time.time()
+        if remain <= 0:
+            break
+        try:
+            name, r = q.get(timeout=remain)
+        except queue.Empty:
+            break
+        if r is True:
+            return True, name
+        if r is False and blocked is None:
+            blocked = name
+    return (False, blocked) if blocked is not None else (None, "")
+
+
 def test_internet(timeout=None, rounds=1):
     """检测「当前是否已能上网」，返回三态：
 
@@ -924,22 +987,25 @@ def test_internet(timeout=None, rounds=1):
     为什么要三态：调用方对「确定没认证」和「没测出来」的处理必须不同。把后者
     当成「没认证」，轻则状态显示错误，重则误触发登录、或在切换账号时跳过下线
     步骤（见 do_switch），所以宁可不给结论也不要给错结论。
+
+    ⚠️ 目标之间是**并发**探的（2026-10-10 起，见 `_probe_race`）—— 顺序不再影响
+       耗时，往列表里加目标也不会变慢。三态语义与函数签名都没变，调用方无需改动。
     """
     cfg = load_config()
     t = timeout or int(cfg.get("timeoutSec") or 8)
-    # 每个目标的超时上限：总时间不随目标数量线性膨胀，最坏约 4 × per。
-    # 上限给到 5 秒是为了扛住首次 DNS 解析慢（实测冷启动 7.4 秒、之后 0.2 秒）。
+    # 每个目标的超时上限。并发下**总耗时 ≈ per**（不再是「N × per」），
+    # 所以这个值现在只决定「最坏情况等多久」，不决定「加几个目标就慢几倍」。
+    # 下限 2.5 秒是为了扛住首次 DNS 解析慢（实测冷启动 7.4 秒、之后 0.2 秒）。
     per = min(5.0, max(2.5, t * 0.5))
     saw_blocked = False
     for i in range(max(1, rounds)):
         if i:
             time.sleep(0.4)
-        for url, expect, _name in check_targets(cfg):
-            r = _probe(url, expect, per)
-            if r is True:
-                return True
-            if r is False:
-                saw_blocked = True
+        verdict, _name = _probe_race(check_targets(cfg), per)
+        if verdict is True:
+            return True
+        if verdict is False:
+            saw_blocked = True
     # 「明确被拦截」的证据优先于「测不出来」：门户劫持整片流量时，有正文校验的
     # 目标会返回 200 + 认证页（判 False），而 generate_204 这类目标拿到的状态码
     # 不是 204（判 None）。要是让 None 盖过 False，就会把「确实没认证」误报成
@@ -4682,7 +4748,7 @@ class LoginApp:
         #    这里故意**不给兜底**：标题不在表里就抛异常（见下面的 sec）。
         #    新增分区必须来这里登记，这是有意的摩擦。
         #
-        # 🔴 2026-10-11（UI 方案 C）：**五个分区从五色收成一套蓝**。
+        # 🔴 2026-10-10（UI 方案 C）：**五个分区从五色收成一套蓝**。
         #    原来是紫 / 蓝 / 绿 / 红 / 青各一个 —— 和站点那边六色图标是同一个毛病：
         #    颜色太多、太平均，反而成了「AI 生成」的观感。
         #    ⚠️ 但「单调」这个老问题（2026-10-04 用户提过）依然要防 ——
