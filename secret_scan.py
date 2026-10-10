@@ -84,8 +84,17 @@ def _git_names(args):
     踩过一次：34 个暂存文件只扫了 33 个，少的正是 `设置.ico`。
     同时用 -c core.quotePath=false 双保险。
     """
-    r = subprocess.run(["git", "-c", "core.quotePath=false"] + args + ["-z"],
-                       cwd=HERE, capture_output=True)
+    try:
+        r = subprocess.run(["git", "-c", "core.quotePath=false"] + args + ["-z"],
+                           cwd=HERE, capture_output=True)
+    except FileNotFoundError:
+        # git 不在 PATH 上（本机是便携版，普通 cmd 里没有）。
+        # 🔴 必须报人话 + 非 0 退出：这是隐私闸门，git 缺席时**不能**静默放行，
+        #    也不能甩一个 FileNotFoundError 的 traceback 让人去猜。
+        sys.stderr.write(
+            "secret_scan: 找不到 git —— 列出待扫描文件需要它。\n"
+            "  把 git 加进 PATH 再跑（或改用带 git 的终端，如 Git Bash）。\n")
+        sys.exit(2)
     if r.returncode != 0:
         return None
     out = r.stdout.decode("utf-8", "surrogateescape")

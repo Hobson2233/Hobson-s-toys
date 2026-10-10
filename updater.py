@@ -88,9 +88,9 @@ OLD_SUFFIX = ".old"
 # 为什么是 10 分钟：12 MB 的包正常几十秒就下完，连上重试 3 次也远用不到 10 分钟。
 # 所以「比 10 分钟还新」几乎必然是**正在下载**，不是残骸。
 #
-# ⚠️ 只对 `.new` / `.part` 生效。`.old` 不设门槛：它只可能是「替换已经完成」留下的
-#    废料（替换前 apply_update 自己会先 _unlink 一遍），而且替换进行中它是被
-#    当前进程占用的、本来也删不掉。
+# ⚠️ 只对 `.new` / `.hpatch`（含各自的 `.part`）生效。`.old` 不设门槛：它只可能是
+#    「替换已经完成」留下的废料（替换前 apply_update 自己会先 _unlink 一遍），
+#    而且替换进行中它是被当前进程占用的、本来也删不掉。
 STALE_MIN_AGE = 10 * 60
 
 # 下载最多尝试几次。为什么必须有重试（2026-09-19 实测）：
@@ -1100,7 +1100,8 @@ def cleanup_stale_all(exe, work_dir=None, min_age=STALE_MIN_AGE):
     调用方没法知道**还剩什么** —— 而后台重试恰恰需要这个信息。
     （同类的坑：把「没报错」当成「清干净了」。）
 
-    🔴 `.new` / `.new.part` 加**年龄门槛**：比 `min_age` 新的不动。
+    🔴 `.new` / `.new.part` / `.hpatch` / `.hpatch.part` 加**年龄门槛**：比 `min_age`
+       新的不动。
        理由见 STALE_MIN_AGE —— 那可能是另一个实例正在下载的文件，
        删掉它会让那次更新直接失败（2026-09-20 实测）。
     ⚠️ `.old` 不设门槛：它只可能是替换完成后的废料，见 STALE_MIN_AGE。
@@ -1122,9 +1123,14 @@ def cleanup_stale_all(exe, work_dir=None, min_age=STALE_MIN_AGE):
             is_old = name.startswith(base + OLD_SUFFIX)
             # 老版本（≤0.3.2）的下载文件叫 `campus-login-<版本>.new`，不含 exe 名，
             # 单独扫一遍，把这些历史残留也收掉。
-            is_download = name.startswith(base + ".new") or (
-                name.startswith("campus-login-")
-                and (name.endswith(".new") or name.endswith(".new.part")))
+            # 🔴 `.hpatch`（0.5.0 的补丁临时文件，try_patch_update 落的
+            #    `<exe名>.hpatch` / `.hpatch.part`）也得收：正常路径 finally 会删，
+            #    但进程中途死掉（断电 / 被杀）就留下了 —— 没这条的话，每次
+            #    「补丁下到一半崩」都在数据目录里漏几百 KB，没人清。
+            is_download = (name.startswith(base + ".new")
+                           or name.startswith(base + ".hpatch")
+                           or (name.startswith("campus-login-")
+                               and (name.endswith(".new") or name.endswith(".new.part"))))
             if not (is_old or is_download):
                 continue
             p = os.path.join(d, name)
@@ -1650,6 +1656,27 @@ def _selftest():
            ["app.exe.new", "app.exe.new.part"])
         ck("  .new / .new.part 都没了",
            [x for x in os.listdir(work) if ".new" in x], [])
+
+        # 0.5.0 的补丁临时文件同样受年龄门槛管（2026-10-10 补）：
+        # 新的可能是另一个实例正在下的补丁；旧的是「补丁下到一半进程死了」的残骸，
+        # 没人收的话每次都在数据目录里漏几百 KB。
+        fresh_hp = os.path.join(work, "app.exe.hpatch")
+        with open(fresh_hp, "wb") as f:
+            f.write(b"x")
+        ck("★ 刚下到一半的 .hpatch 不许被清掉（可能正在下载补丁）",
+           cleanup_stale(fake, work), None)
+        ck("  它确实还在", os.path.isfile(fresh_hp), True)
+        for nm in ("app.exe.hpatch", "app.exe.hpatch.part"):
+            p = os.path.join(work, nm)
+            with open(p, "wb") as f:
+                f.write(b"x")
+            _backdate(p)
+        rem_hp, _left_hp = cleanup_stale_all(fake, work)
+        ck("cleanup_stale 收掉过期的 .hpatch / .hpatch.part 残骸",
+           sorted(os.path.basename(x) for x in rem_hp),
+           ["app.exe.hpatch", "app.exe.hpatch.part"])
+        ck("  .hpatch 都没了",
+           [x for x in os.listdir(work) if ".hpatch" in x], [])
 
         # 老版本（≤0.3.2）的下载文件名不含 exe 名，落在 exe 同目录 ——
         # 那些用户升级后还躺在桌面上，必须一并收掉，否则等于没修。

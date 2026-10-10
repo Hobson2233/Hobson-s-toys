@@ -49,8 +49,7 @@ import updater
 # 和 updater 同理：顶层 import，**打包时必须让 PyInstaller 看见它**。
 from palette import (BG, CARD, FG, SUB, LINE, FIELD, SEC_FG,
                      BLUE, BLUE_DARK, BLUE_SOFT,
-                     OK, OK_SOFT, DANGER, DANGER_SOFT, WARN,
-                     VIOLET, VIOLET_SOFT, CYAN, CYAN_SOFT)
+                     OK, OK_SOFT, DANGER, DANGER_SOFT, WARN)
 
 APP_NAME = "CampusLogin"
 APP_TITLE = "校园网自动登录"
@@ -63,7 +62,7 @@ APP_TITLE = "校园网自动登录"
 # ⚠️ 这里是**唯一来源**。界面标题、使用说明、--version、--selftest、
 #    以及 exe 文件属性里的版本，全部由它推导 —— 不要在别处另写一份，
 #    否则迟早漂移（改了一处忘了另一处，用户看到的版本号就是错的）。
-VERSION = "0.5.0"
+VERSION = "0.5.1"
 
 # ==================== 学校参数：换学校只改 config.json ====================
 #
@@ -1836,6 +1835,61 @@ GUARD_WAIT = "wait"          # 测不出来，再观察一次
 GUARD_RELOGIN = "relogin"    # 确认掉线，重连
 
 
+def _pid_alive(pid):
+    """pid 对应的进程还活着吗（Windows）。True / False；判不出来返回 None。
+
+    为什么不用 psutil：它**不在打包清单里**（只有 bench.py 这个测量端工具用它），
+    exe 里 `import psutil` 必然 ImportError —— 于是那个「进程存活检查」
+    在生产环境从来没跑过，guard.json 一有新鲜残留就一律「保守当作在跑」。
+    ctypes 是标准库、跟着程序走，exe 和源码里行为一致。（2026-10-10 修。）
+
+    判定口径：
+      * OpenProcess 成功 → GetExitCodeProcess：STILL_ACTIVE(259) = 还在跑。
+        （退出码恰好等于 259 的进程概率忽略不计，psutil 同款口径。）
+      * 打不开 + ERROR_ACCESS_DENIED → 当作活着（不让看 ≈ 还在）。
+      * 打不开 + ERROR_INVALID_PARAMETER → 系统里没这个 pid = 已退出。
+      * 其它 → None，调用方按「判不出来」保守处理。
+
+    🔴 句柄必须声明 restype（64 位下不声明按 c_int 会截断 —— 项目的老坑），
+       句柄在 finally 里 CloseHandle，别漏。
+    """
+    try:
+        import ctypes
+        pid = int(pid)
+        if pid <= 0:
+            return None
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    except Exception:
+        return None
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    STILL_ACTIVE = 259
+    k32.OpenProcess.restype = ctypes.c_void_p
+    k32.OpenProcess.argtypes = (ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32)
+    k32.GetExitCodeProcess.restype = ctypes.c_int
+    k32.GetExitCodeProcess.argtypes = (ctypes.c_void_p,
+                                       ctypes.POINTER(ctypes.c_uint32))
+    k32.CloseHandle.argtypes = (ctypes.c_void_p,)
+    try:
+        h = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False,
+                            pid & 0xFFFFFFFF)
+    except Exception:
+        return None
+    if not h:
+        err = ctypes.get_last_error()
+        if err == 5:          # ERROR_ACCESS_DENIED：进程在，只是不让看
+            return True
+        if err == 87:         # ERROR_INVALID_PARAMETER：没有这个进程
+            return False
+        return None
+    try:
+        code = ctypes.c_uint32(0)
+        if not k32.GetExitCodeProcess(h, ctypes.byref(code)):
+            return None
+        return code.value == STILL_ACTIVE
+    finally:
+        k32.CloseHandle(h)
+
+
 def guard_running():
     """已经有一个守护在跑吗。返回 (bool, 说明)。"""
     info = read_json(GUARD_FLAG)
@@ -1856,10 +1910,8 @@ def guard_running():
     pid = info.get("pid")
     if not pid:
         return False, "记录里没有 pid"
-    try:
-        import psutil
-        alive = psutil.pid_exists(int(pid))
-    except Exception:
+    alive = _pid_alive(pid)
+    if alive is None:
         # 判不了就保守当作在跑：宁可少起一个守护，也不要起两个 ——
         # 两个守护会同时重连，反而更容易被 BRAS 踢。
         return True, "无法确认进程 %s 是否还在（保守当作在跑）" % pid
@@ -4629,12 +4681,21 @@ class LoginApp:
         #    而且新增分区时**很容易忘了配色**，于是它默默变成灰字 —— 静默退化。
         #    这里故意**不给兜底**：标题不在表里就抛异常（见下面的 sec）。
         #    新增分区必须来这里登记，这是有意的摩擦。
+        #
+        # 🔴 2026-10-11（UI 方案 C）：**五个分区从五色收成一套蓝**。
+        #    原来是紫 / 蓝 / 绿 / 红 / 青各一个 —— 和站点那边六色图标是同一个毛病：
+        #    颜色太多、太平均，反而成了「AI 生成」的观感。
+        #    ⚠️ 但「单调」这个老问题（2026-10-04 用户提过）依然要防 ——
+        #       现在靠**图标形状**（list / user / power / lock / globe 五个不同图形）
+        #       和浅底徽章本身提供层次，不再靠色相。
+        #    ⚠️ 「网络状态」保留绿色：那是**真的语义色**（在线 / 离线），
+        #       和「装饰用的彩色」不是一回事。别顺手也改成蓝。
         self.SEC_STYLE = {
-            "已保存的账号": (VIOLET, VIOLET_SOFT, "list"),
+            "已保存的账号": (BLUE, BLUE_SOFT, "list"),
             "账号信息":     (BLUE, BLUE_SOFT, "user"),
-            "开机自启":     (OK, OK_SOFT, "power"),
-            "隐私":         (DANGER, DANGER_SOFT, "lock"),
-            "网络状态":     (CYAN, CYAN_SOFT, "globe"),
+            "开机自启":     (BLUE, BLUE_SOFT, "power"),
+            "隐私":         (BLUE, BLUE_SOFT, "lock"),
+            "网络状态":     (OK, OK_SOFT, "globe"),
         }
 
         holder.bind("<Configure>",

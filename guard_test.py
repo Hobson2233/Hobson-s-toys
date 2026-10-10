@@ -232,6 +232,18 @@ def test_guard_running():
         got = C.guard_running()
         ck("D4 新鲜标记 + 死进程 → 没在跑", got[0], False)
 
+        # D4b 存活判不出来（_pid_alive 返回 None）→ 保守当作在跑。
+        #    「宁可少起一个守护，也不要起两个」这条原则的落点 —— 别让哪次
+        #    重构把它悄悄改成 False（那等于鼓励起两个守护互踢）。
+        real_alive = C._pid_alive
+        C._pid_alive = lambda pid: None
+        try:
+            C.write_json(C.GUARD_FLAG, {"pid": os.getpid(), "started": time.time()})
+            got = C.guard_running()
+            ck("D4b 存活判不出来 → 保守当作在跑", got[0], True)
+        finally:
+            C._pid_alive = real_alive
+
         # D5 时钟倒退（记录时刻在未来）→ 当作没在跑，别把守护永久锁死
         C.write_json(C.GUARD_FLAG, {"pid": os.getpid(),
                                     "started": time.time() + 99999})
