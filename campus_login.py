@@ -62,7 +62,7 @@ APP_TITLE = "校园网自动登录"
 # ⚠️ 这里是**唯一来源**。界面标题、使用说明、--version、--selftest、
 #    以及 exe 文件属性里的版本，全部由它推导 —— 不要在别处另写一份，
 #    否则迟早漂移（改了一处忘了另一处，用户看到的版本号就是错的）。
-VERSION = "0.5.2"
+VERSION = "0.5.3"
 
 # ==================== 学校参数：换学校只改 config.json ====================
 #
@@ -3725,6 +3725,31 @@ def stale_leftover_desc():
     return "、".join(left) if left else "无"
 
 
+class _SilentBox:
+    """自检用的**假弹窗**：所有方法立刻返回，不真的弹出来。
+
+    为什么需要（2026-10-11）：`--guitest` 是无人值守的，而模态弹窗会**一直等用户点**。
+    以前自检路径不会弹框 —— `update_wiring_check` 特意挑 CURRENT 这条「不弹确认框」的
+    最短路径走。给 CURRENT 加了 info 框之后这条前提就失效了：不换假框的话，自检会
+    卡在弹窗上直到超时，而报出来的是「自检没通过」，指不到真实原因。
+
+    ⚠️ `askyesno` 返回 **False**：自检里遇到「要不要做某个有副作用的动作」时，
+       安全的默认是「不做」。返回 True 会让自检去执行真实操作（下载 / 替换自己）。
+    """
+
+    def showinfo(self, *a, **k):
+        return "ok"
+
+    def showwarning(self, *a, **k):
+        return "ok"
+
+    def showerror(self, *a, **k):
+        return "ok"
+
+    def askyesno(self, *a, **k):
+        return False
+
+
 def update_wiring_check(btn_ver):
     """在真实界面里验证「版本号小字 → 检查更新」这条接线真的通了。
 
@@ -5347,11 +5372,22 @@ class LoginApp:
                     self.show("升级完成，正在重新启动…", "ok")
                     self.root.update_idletasks()
                     self.restart_self()
+                elif st == updater.STATE_CURRENT:
+                    # 「已是最新」也**明确告诉用户**（2026-10-11 用户反馈：点完只在
+                    # 状态栏看到一行小字，以为「什么都没发生」，进而怀疑功能坏了）。
+                    # 用弹框而不是只改状态栏：用户是**主动点**的，不算打扰；
+                    # 而这一条恰恰是「点完没反应」的重灾区 —— 弹窗是唯一看漏不了的反馈。
+                    # 顺序：先写好状态栏、解除忙碌，最后弹框（弹框会阻塞在这里等用户点）。
+                    self.show(updater.describe(st, info), "ok")
+                    self.set_busy(False)
+                    self.messagebox.showinfo(
+                        APP_TITLE,
+                        "已是最新版本 v%s。\n\n%s" % (VERSION, updater.source_hint()))
                 else:
                     # 结果里带上更新源：用户是自己点「检查更新」才看到这行的，
                     # 不存在打扰；而他有权知道这程序在跟哪个地址说话。
                     self.show(updater.describe(st, info) + "\n" + updater.source_hint(),
-                              "ok" if st in (updater.STATE_CURRENT,) else "info")
+                              "info")
                     self.set_busy(False)
             except Exception:
                 # 任何意外都不能让界面卡在忙碌态。
@@ -5514,11 +5550,21 @@ class LoginApp:
         self.show("正在检查更新…", "info")
 
         def work():
+            t0 = time.perf_counter()
             try:
                 st, info = updater.check(VERSION)
             except Exception:
                 log("检查更新异常:\n%s" % traceback.format_exc())
                 st, info = updater.STATE_UNKNOWN, "检查更新时出错"
+            # 🔴 这条日志以前**根本没有**（2026-10-11 用户报「检查更新很慢」时才发现）：
+            #    成功路径一行都不写 ⇒ 事后完全无法取证，只能靠外部复现，
+            #    而「慢」这种问题恰恰只在用户那台机器、那条线路上才显形。
+            #    记四件事：本机版本 / 结果 / 耗时 / 取的哪个地址 ——
+            #    一眼能分出是「网络慢」还是「程序卡住」。
+            log("检查更新：本机 v%s → %s，耗时 %.1f 秒（%s）"
+                % (VERSION, st, time.perf_counter() - t0, updater.MANIFEST_URL))
+            if st == updater.STATE_UNKNOWN:
+                log("  没拿到清单的原因：%s" % (info,))
             self.state["queue"].put(("upd_result", (st, info)))
         threading.Thread(target=work, daemon=True).start()
 
@@ -5767,18 +5813,28 @@ class LoginApp:
         self.root.minsize(*minsize_for(sw, sh))
         if self.smoke:
             self.root.update_idletasks()
-            # 密码框接线自检：确认界面里读到的是真密码、看到的是打码。
-            # 只有真建了窗口、拿到 run_gui 里那个实例才测得到（见 pwd_wiring_check）。
-            # 失败就抛出去 —— 让 --guitest 落成 GUI_FAIL，别静默放过。
-            wiring = pwd_wiring_check(self.pwd_field,
-                                      (load_config().get("passwd") or None))
-            log(wiring)
-            # 更新入口接线自检：真给版本号小字发一个点击，确认整条链通。
-            # 同 pwd_wiring_check —— 光看代码证明不了「点下去真的会跑」。
-            log(update_wiring_check(self.btn_ver))
-            # 按钮配色自检：确认没有哪个按钮的底色和它坐的背景同色
-            # （同色 = 按钮隐形。这类错不抛异常，只有放大截图才看得见）。
-            log(ui_contrast_check(self.root))
+            # 🔴 自检里所有模态弹窗都要换成**自动返回**的假框（2026-10-11）。
+            #    下面 update_wiring_check 会真发一次点击、走完整条链；而「已是最新版本」
+            #    那条路现在会弹 info 框 —— 模态框会**一直等用户点**，无人值守的
+            #    --guitest 就会卡死在那儿直到超时。报出来是「自检没通过」，
+            #    真实原因却是「没人点那个框」，差得十万八千里。
+            real_mb = self.messagebox
+            self.messagebox = _SilentBox()
+            try:
+                # 密码框接线自检：确认界面里读到的是真密码、看到的是打码。
+                # 只有真建了窗口、拿到 run_gui 里那个实例才测得到（见 pwd_wiring_check）。
+                # 失败就抛出去 —— 让 --guitest 落成 GUI_FAIL，别静默放过。
+                wiring = pwd_wiring_check(self.pwd_field,
+                                          (load_config().get("passwd") or None))
+                log(wiring)
+                # 更新入口接线自检：真给版本号小字发一个点击，确认整条链通。
+                # 同 pwd_wiring_check —— 光看代码证明不了「点下去真的会跑」。
+                log(update_wiring_check(self.btn_ver))
+                # 按钮配色自检：确认没有哪个按钮的底色和它坐的背景同色
+                # （同色 = 按钮隐形。这类错不抛异常，只有放大截图才看得见）。
+                log(ui_contrast_check(self.root))
+            finally:
+                self.messagebox = real_mb
             # 顺便把说明弹窗也建一次，确认它能起来（不显示，建完就销毁）
             try:
                 hv = self.show_help()

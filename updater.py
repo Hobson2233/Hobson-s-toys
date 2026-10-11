@@ -69,6 +69,16 @@ BASE_URL_HINT = MANIFEST_URL.rsplit("/", 1)[0]
 UA = "CampusLogin-Updater/1.0"
 TIMEOUT = 10
 
+# 拉**清单**用的超时，和上面那个**刻意分开**（2026-10-11）。
+#
+# 为什么分开：`TIMEOUT` 是给**下载**用的 —— 它是「单次 socket 读」的上限，必须留足
+#   余量（实测读间隔中位几十毫秒、最大 1.55s，见 ATTEMPTS 那段），下 12 MB 靠它兜着。
+#   而拉清单是**一次性小请求**（version.json 只有 2 KB），用户点完「检查更新」就坐在
+#   那儿等结果 —— 10 秒太久了。实测那次全程 5~6 秒（网络抖），这里把最坏情况从
+#   10 秒收到 6 秒：宁可快速失败、给个明确结论，也不要让人干等。
+#   ⚠️ 别把这个值用到下载上 —— 6 秒对下载是**收紧**，会凭空多出重试。
+MANIFEST_TIMEOUT = 6
+
 # 允许的最大安装包体积。防的是「清单被改坏 / 指向了一个几百 MB 的文件」
 # 这种把用户流量耗光的情况 —— 我们的 exe 一直稳定在 10 MB 上下。
 MAX_SIZE = 60 * 1024 * 1024
@@ -239,8 +249,12 @@ def is_newer(remote, current):
     return a > b
 
 
-def _get(url, timeout=TIMEOUT):
-    """取一个 URL 的原始字节。成功 (True, bytes)，失败 (False, 原因)。"""
+def _get(url, timeout=MANIFEST_TIMEOUT):
+    """取一个 URL 的原始字节。成功 (True, bytes)，失败 (False, 原因)。
+
+    默认超时用 `MANIFEST_TIMEOUT`（不是 TIMEOUT）—— 本函数只用来取**小 JSON**
+    （version.json / mirrors.json），两个调用方本来也都显式传了自己的值。
+    """
     try:
         req = urllib.request.Request(url, headers={"User-Agent": UA})
         with _opener().open(req, timeout=timeout) as r:
@@ -262,7 +276,7 @@ def _get(url, timeout=TIMEOUT):
         return False, "%s: %s" % (type(e).__name__, e)
 
 
-def fetch_manifest(url=None, timeout=TIMEOUT):
+def fetch_manifest(url=None, timeout=MANIFEST_TIMEOUT):
     """拉发布清单。返回 (state, data_or_reason)。
 
     拿不到就返回 (STATE_UNKNOWN, 原因) —— 调用方必须把它和「已是最新」区分开。
@@ -550,7 +564,8 @@ def judge_fallback(release, current_version):
         rel["version"], rel.get("notes") or "无说明", BASE_URL_HINT)
 
 
-def check(current_version, url=None, timeout=TIMEOUT, allow_fallback=True):
+def check(current_version, url=None, timeout=MANIFEST_TIMEOUT,
+          allow_fallback=True):
     """一步到位：拉清单 + 比对。返回 (state, info_or_reason)。
 
     主域名查不通时会自动尝试兜底地址（GitHub Releases API）。**但兜底成功
