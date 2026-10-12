@@ -45,6 +45,11 @@ from urllib.parse import urlparse, parse_qs, urlencode
 #    但**打包时必须让 PyInstaller 看见它** —— 藏在函数里的 import 容易被漏掉。
 import updater
 
+# 「上网数据」功能（郑航自助服务）的取数层。**和 updater 同理**：
+# 顶层 import，打包时必须让 PyInstaller 看见它 —— 藏在函数里的 import 容易被漏掉。
+# 它只 import 标准库（base64/hashlib/http.cookiejar/json/urllib），不引入新依赖。
+import self_service
+
 # 界面配色。**和站点 CSS 共用一份**（2026-10-05 抽出，理由见 palette.py）。
 # 以前这 19 个常量长在本文件里，而站点那边另有一份手工同步的副本 ——
 # 实测两边重合 15 个，改配色要记得改两处，迟早会漏。
@@ -64,7 +69,7 @@ APP_TITLE = "校园网自动登录"
 # ⚠️ 这里是**唯一来源**。界面标题、使用说明、--version、--selftest、
 #    以及 exe 文件属性里的版本，全部由它推导 —— 不要在别处另写一份，
 #    否则迟早漂移（改了一处忘了另一处，用户看到的版本号就是错的）。
-VERSION = "0.5.4"
+VERSION = "0.5.5"
 
 # ==================== 学校参数：换学校只改 config.json ====================
 #
@@ -5270,6 +5275,487 @@ def show_text_window(title, text, width=780, height=640):
         return False
 
 
+# ---------------------------------------------------------------------------
+# 「上网数据」面板（郑航自助服务）
+# ---------------------------------------------------------------------------
+
+# 🔴 登录请求的次数上限。密码连错可能被学校风控锁号，所以**必须**有这道闸门。
+#    ⚠️ 验证码错**也算一次** —— 宁可让用户关掉重开，也不拿账号去赌。
+#    （服务端返回的 errmsg 能区分「验证码错」和「密码错」，见 self_service.SelfError）
+SELF_LOGIN_MAX = 3
+
+# 验证码图的放大倍数和原始尺寸（学校那边实测是 130x40）。
+# 🔴 这几个数**和窗口宽度绑在一起**，见 `SelfServiceWindow.__init__` 里的 minsize。
+CAPTCHA_W, CAPTCHA_H = 130, 40
+CAPTCHA_ZOOM = 4
+
+
+def self_service_available(cfg=None):
+    """当前学校有没有「自助服务」（`/self/`）。
+
+    实测确认**只有郑航**有：`202.196.169.166/self/`，和郑航的 `portalHost`
+    是**同一台机器**（所以不算新增外部依赖）。
+    嘉兴那套是深澜 Srun（`wlan.zjxu.edu.cn`），没有这个入口。
+    """
+    return school_key(cfg) == "zua"
+
+
+class SelfServiceWindow(object):
+    """「上网数据」面板：显示这个账号的状态 / 套餐 / 余额 / 流量 / 时长 / 在线设备。
+
+    数据来自学校自己的自助服务系统，**只读**（`self_service.py` 里写死了只调查询接口）。
+
+    🔴 三条硬要求：
+      1. **独立 Toplevel + 自带 worker 线程和自己的队列** —— 不走
+         `LoginApp.state["queue"]`：那条队列的消息类型是给主窗口用的，
+         塞新类型进去要改 `handle_msg`，改动面和风险都大得多。
+         面板关掉之后它自己的队列就没人用了，对主窗口零影响。
+      2. **网络请求绝不跑在 Tk 主线程**（会卡界面）。tkinter 也不是线程安全的，
+         所以子线程**只往队列里放结果**，界面一律由 `after()` 轮询着改。
+      3. 🔴 **cookie 只在内存**（`self_service.py` 里就是这么写的）——
+         窗口一关会话就结束，下次点开要重新输验证码。这是**故意**的：
+         会话 cookie 等价于一次登录态，落盘等于多存一份凭据。
+    """
+
+    def __init__(self, root, tk, fam, base, account, password, base_url):
+        self.root = root
+        self.tk = tk
+        self.fam = fam
+        self.base = base
+        self.account = account
+        # 🔴 `self.password` 这一行**不能少**（2026-10-12 被 selfwin_test 抓出来的）：
+        #    原来只把 `password` 收进参数、没存成属性，而 `_job_login` 里写的是
+        #    `self.svc.login(self.account, self.password, code)` —— 于是用户
+        #    一提交验证码，子线程立刻 `AttributeError` 崩掉。表现是：
+        #    界面永远停在「正在登录…」，日志里一行异常，**界面上一句提示都没有**
+        #    （异常发生在子线程，没人接）。而且这条路是**必走**的，
+        #    也就是说这个功能当时是「一用就废」。
+        #    ⚠️ 这类「少存一个属性」的错误 py_compile 和 AST 扫描都看不见。
+        self.password = password
+        self.svc = self_service.SelfService(base=base_url)
+        self.q = queue.Queue()
+        self.tries = 0            # 已发出的登录请求次数（防锁号闸门）
+        self.closed = False
+        # 🔴 验证码图片**必须留引用**（存成属性）—— 只放在局部变量里会被 GC 掉，
+        #    症状是 Label 一片空白，而且**不报任何错**。这是 tkinter 的经典坑。
+        self._cap_small = None
+        self._cap_big = None
+        self._entry = None
+
+        self.win = tk.Toplevel(root)
+        self.win.title("上网数据 · %s" % APP_TITLE)
+        # 窗口底色 = **页面底色**（不是卡片底色）—— 正文是圆角卡片，
+        # 同色的话圆角就看不出来了。和 show_help 同一个理由。
+        self.win.configure(bg=BG)
+        self.win.transient(root)          # 跟随主窗口，不单独占任务栏项
+        ico = icon_path()
+        if ico:
+            try:
+                self.win.iconbitmap(default=ico)
+            except Exception:
+                pass
+        self.win.protocol("WM_DELETE_WINDOW", self.close)
+
+        # 🔴 **必须给窗口一个宽度下限**（2026-10-12 截图量出来的）。
+        #
+        #    验证码图放大 4 倍是 130*4 = 520px，是这个面板里最宽的东西。
+        #    但窗口不会自己长到能放下它 —— 因为正文卡片是 `round_panel` 返回的
+        #    **Canvas**，而 **Canvas 的 `reqwidth` 只等于它自己的 `width` 选项，
+        #    跟里面塞了什么完全无关**（和那边文档里讲的「高度得自己补」是同一个
+        #    毛病，只是高度那边已经补了、宽度没补）。
+        #    于是窗口停在标题行撑出来的 ~406px，卡片可用宽度只有 350px ——
+        #    验证码图右边 1/3 被**静默裁掉**，用户根本读不全 4 个字符，
+        #    整个功能等于不可用。而 Tk 一声不吭。
+        #
+        #    ⚠️ 别指望「图被裁了会报错」或者「看图能看出来」：截图里那张棋盘格
+        #       缺了一角也还是棋盘格，只有**量**（reqwidth vs 图宽）才看得出来。
+        #    ⚠️ 改了 CAPTCHA_ZOOM 就必须同步这里，否则又会裁。
+        self.win.minsize(CAPTCHA_W * CAPTCHA_ZOOM + 2 * OUTER_PAD + 2 * 14, 0)
+
+        head = tk.Frame(self.win, bg=BG)
+        head.pack(fill="x", padx=OUTER_PAD, pady=(OUTER_PAD, 6))
+        tk.Label(head, text="上网数据", bg=BG, fg=FG,
+                 font=(fam, base + 4, "bold")).pack(side="left")
+        round_chip(head, tk, "学校自助服务 · 只读", (fam, base - 2), SUB,
+                   "#e9edf3", page=BG).pack(side="left", padx=(10, 0))
+
+        self.body = tk.Frame(self.win, bg=BG)
+        self.body.pack(fill="both", expand=True, padx=OUTER_PAD)
+
+        bar = tk.Frame(self.win, bg=BG)
+        bar.pack(fill="x", padx=OUTER_PAD, pady=OUTER_PAD)
+        h = base * 2 + 16
+        round_button(bar, "关闭", self.close, (fam, base),
+                     bg="#dbe1eb", fg="#475569", hover="#ccd5e3",
+                     active="#bfc9da", parent_bg=BG, height=h,
+                     radius=pill_radius(h)).pack(side="right")
+
+        self._place()
+        self.win.after(80, self._pump)
+        self._busy("正在读取…")
+        self._run(self._job_session)
+
+    # ------------------------------------------------------------ 窗口
+
+    def _place(self):
+        """把窗口摆在主窗口上方偏中间的位置。"""
+        try:
+            self.win.update_idletasks()
+            x = self.root.winfo_rootx() + 60
+            y = self.root.winfo_rooty() + 60
+            self.win.geometry("+%d+%d" % (max(0, x), max(0, y)))
+            self.win.lift()
+        except Exception:
+            # 定位失败不是致命问题（窗口会用系统默认位置），但要留痕 ——
+            # 万一定位算错把窗口甩到屏幕外，这条日志就是唯一线索。
+            log("上网数据面板定位失败:\n%s" % traceback.format_exc())
+
+    def close(self):
+        """关窗。置 `closed` 之后子线程再往队列里放东西也没人处理了。
+
+        ⚠️ **不主动清空 `self.svc`** —— 它持有内存里的会话 cookie，
+        对象没人引用时跟着被回收，正是我们想要的（不落盘、不显式持久化）。
+        """
+        if self.closed:
+            return
+        self.closed = True
+        try:
+            self.win.destroy()
+        except Exception:
+            log("关闭上网数据面板异常:\n%s" % traceback.format_exc())
+
+    # ------------------------------------------------------------ 线程 / 队列
+
+    def _run(self, fn):
+        """起一个后台线程跑 `fn`。
+
+        🔴 **兜底 catch 是必须的**（2026-10-12 加）：`_job_*` 只接 `SelfError`，
+           别的异常（比如少存了一个属性 → `AttributeError`）会直接从线程里漏出去。
+           那种情况下**界面永远停在「正在登录…」**，用户看到的是「点了没反应」，
+           日志里才有线索 —— 这是最糟的一种失败：既不报错也不结束。
+           现在一律变成界面上的提示，并且明说「已记日志」。
+        """
+        def _wrapped():
+            try:
+                fn()
+            except Exception as e:
+                log("上网数据面板后台任务异常:\n%s" % traceback.format_exc())
+                self._put("fail", "内部错误（已记日志）：%s: %s"
+                          % (type(e).__name__, e))
+
+        threading.Thread(target=_wrapped, daemon=True).start()
+
+    def _put(self, kind, payload=None):
+        if not self.closed:
+            self.q.put((kind, payload))
+
+    def _pump(self):
+        """主线程里轮询队列。**所有界面改动都只在这里发生。**"""
+        try:
+            while True:
+                kind, payload = self.q.get_nowait()
+                try:
+                    self._handle(kind, payload)
+                except Exception:
+                    # 单条消息处理失败不能中断整批，也不能让窗口卡在"忙碌"
+                    log("上网数据面板处理消息异常:\n%s" % traceback.format_exc())
+        except queue.Empty:
+            pass
+        if not self.closed:
+            self.win.after(80, self._pump)
+
+    def _handle(self, kind, payload):
+        if kind == "load":
+            self._busy("正在读取…")
+            self._run(self._job_load)
+        elif kind == "captcha":
+            self._draw_captcha(payload)
+        elif kind == "captcha_err":
+            # 🔴 `note=True` 是**显式**的，不能靠 `payload` 顺手当标志位。
+            #    2026-10-12 读代码时发现的 bug：原来写的是 `note=payload`，
+            #    而「验证码错了、但新图没取到」时 payload 就是 `None` ——
+            #    于是提示**整个消失**，用户只看到一张新验证码（或者一片空白），
+            #    完全不知道刚才那次为什么失败，还以为是自己点错了。
+            self._draw_captcha(payload, note=True)
+        elif kind == "login_err":
+            self._draw_login_err(payload)
+        elif kind == "data":
+            self._draw_data(payload)
+        elif kind == "fail":
+            self._draw_fail(payload)
+
+    # ------------------------------------------------------------ 后台任务
+
+    def _job_session(self):
+        """先看会话还在不在。在就直接取数，不在就取验证码。"""
+        try:
+            if self.svc.has_session(self.account):
+                self._put("load")
+            else:
+                self._job_captcha()
+        except self_service.SelfError as e:
+            self._put("fail", e.msg)
+
+    def _job_captcha(self):
+        try:
+            png, logged = self.svc.fetch_captcha()
+        except self_service.SelfError as e:
+            self._put("fail", e.msg)
+            return
+        if logged:
+            self._put("load")
+            return
+        self._put("captcha", png)
+
+    def _job_load(self):
+        try:
+            self._put("data", self.svc.load(self.account))
+        except self_service.SelfError as e:
+            if e.kind == "session":
+                # 会话在取数途中过期了 —— 退回验证码流程，不算失败
+                self._job_captcha()
+            else:
+                self._put("fail", e.msg)
+
+    def _job_login(self, code):
+        self.tries += 1
+        try:
+            self.svc.login(self.account, self.password, code)
+        except self_service.SelfError as e:
+            if e.kind == "captcha":
+                # 验证码错 ⇒ **安全的重试**：换一张就行
+                try:
+                    png, _ = self.svc.fetch_captcha()
+                except self_service.SelfError:
+                    png = None
+                self._put("captcha_err", png)
+            elif e.kind == "login":
+                # 🔴 **不许重试**（可能是密码错 / 账号不存在 / 被锁）
+                self._put("login_err", e.msg)
+            else:
+                self._put("fail", e.msg)
+            return
+        self._job_load()
+
+    # ------------------------------------------------------------ 渲染
+
+    def _clear(self):
+        for w in list(self.body.winfo_children()):
+            w.destroy()
+        # 🔴 顺手把 `_entry` 清掉：它指向的控件刚被 destroy 了，留着一个
+        #    「已经死掉」的 widget 引用，下次 `.get()` 会抛 TclError。
+        #    这类错误只在特定点击顺序下出现（比如验证码界面还没画完就按了回车），
+        #    平时测不出来 —— 与其等它偶发，不如在这里断掉。
+        self._entry = None
+
+    def _card(self, title):
+        """一张圆角卡片，返回往里塞控件的 Frame。"""
+        if title:
+            self.tk.Label(self.body, text=title, bg=BG, fg=SUB,
+                          font=(self.fam, self.base - 1)
+                          ).pack(anchor="w", pady=(8, 4))
+        cv, inner = round_panel(self.body, self.tk, 14, 12, 11)
+        cv.pack(fill="x")
+        return inner
+
+    def _row(self, parent, name, value, fg=None, bold=False):
+        f = self.tk.Frame(parent, bg=CARD)
+        f.pack(fill="x", pady=2)
+        self.tk.Label(f, text=name, bg=CARD, fg=SUB,
+                      font=(self.fam, self.base)).pack(side="left")
+        self.tk.Label(f, text=value, bg=CARD, fg=fg or FG,
+                      font=(self.fam, self.base, "bold" if bold else "normal")
+                      ).pack(side="right")
+
+    def _busy(self, text):
+        self._clear()
+        inner = self._card(None)
+        self.tk.Label(inner, text=text, bg=CARD, fg=SUB,
+                      font=(self.fam, self.base)).pack(anchor="w")
+
+    def _draw_fail(self, msg):
+        self._clear()
+        inner = self._card(None)
+        self.tk.Label(inner, text="读不到数据", bg=CARD, fg=DANGER,
+                      font=(self.fam, self.base, "bold")).pack(anchor="w")
+        self.tk.Label(inner, text=msg, bg=CARD, fg=FG, wraplength=380,
+                      justify="left", font=(self.fam, self.base)
+                      ).pack(anchor="w", pady=(6, 0))
+        self.tk.Label(inner,
+                      text="（这个功能要连上校园网、并且学校自助服务能访问才行）",
+                      bg=CARD, fg=SUB, wraplength=380, justify="left",
+                      font=(self.fam, self.base - 1)).pack(anchor="w", pady=(6, 0))
+
+    def _draw_captcha(self, png, note=None):
+        """画验证码输入界面。`note` 非空时显示成一行红色提示（验证码错了）。"""
+        self._clear()
+        inner = self._card(None)
+
+        if png:
+            import base64
+            try:
+                # 🔴 Tk 8.6 原生支持 PNG，**不需要 PIL**（已实测）。
+                #    data= 接受 base64 字符串。
+                self._cap_small = self.tk.PhotoImage(
+                    data=base64.b64encode(png).decode("ascii"))
+                # 130x40 → 520x160（放大倍数见 CAPTCHA_ZOOM，和窗口 minsize 绑定）
+                self._cap_big = self._cap_small.zoom(CAPTCHA_ZOOM)
+            except Exception:
+                log("验证码图片渲染失败:\n%s" % traceback.format_exc())
+                self._cap_small = self._cap_big = None
+        else:
+            # 🔴 **没有新图时必须把旧图丢掉。**
+            #    2026-10-12 读代码时发现的真 bug：原来是「png 为空就什么都不做」，
+            #    于是 `_cap_big` 还是**上一张**验证码 —— 界面一边显示旧图，
+            #    一边写着「换了一张，请重新输入」。用户照着旧图输，必然再错一次，
+            #    还会以为是自己眼花了。宁可不显示图，也不能显示错的图。
+            self._cap_small = self._cap_big = None
+
+        if self._cap_big is not None:
+            self.tk.Label(inner, image=self._cap_big, bg=CARD).pack(pady=(2, 8))
+        else:
+            self.tk.Label(inner, text="（验证码图片显示不出来）", bg=CARD,
+                          fg=WARN, font=(self.fam, self.base)).pack(pady=(2, 8))
+
+        self.tk.Label(inner, text="请输入图片里的 4 个字符", bg=CARD, fg=SUB,
+                      font=(self.fam, self.base - 1)).pack()
+        e = self.tk.Entry(inner, font=(self.fam, self.base + 8), width=8,
+                          justify="center", bg=FIELD, fg=FG, relief="flat",
+                          insertbackground=FG)
+        e.pack(pady=(6, 2), ipady=4)
+        e.focus_set()
+        e.bind("<Return>", lambda _ev: self._submit())
+        self._entry = e
+
+        if note:
+            # 提示文字要跟「到底有没有换到新图」一致 —— 说「换了一张」却
+            # 显示旧图（或者根本没图）就是在骗用户，见上面那段说明。
+            self.tk.Label(inner,
+                          text=("验证码不对，换了一张，请重新输入"
+                                if self._cap_big is not None else
+                                "验证码不对，而且新的没取到 ——\n"
+                                "点「换一张」再试一次"),
+                          bg=CARD, fg=DANGER, justify="left",
+                          font=(self.fam, self.base - 1)).pack(pady=(4, 0))
+
+        left = self.tries >= SELF_LOGIN_MAX
+        if left:
+            self.tk.Label(inner,
+                          text="已经试了 %d 次。为避免账号被锁，这里停下来了 ——\n"
+                               "请确认密码没错，然后关掉窗口重开。" % self.tries,
+                          bg=CARD, fg=DANGER, justify="left",
+                          font=(self.fam, self.base - 1)).pack(pady=(6, 0))
+
+        btns = self.tk.Frame(inner, bg=CARD)
+        btns.pack(pady=(10, 2))
+        h = self.base * 2 + 8
+        if not left:
+            round_button(btns, "确定", self._submit, (self.fam, self.base),
+                         bg=BLUE, fg="#ffffff", hover=BLUE_DARK,
+                         active="#1e40af", parent_bg=CARD, height=h,
+                         radius=pill_radius(h)).pack(side="left", padx=(0, 8))
+        round_chip(btns, self.tk, "换一张", (self.fam, self.base),
+                   BLUE_DARK, BLUE_SOFT, page=CARD, height=h,
+                   command=self._renew).pack(side="left")
+
+    def _draw_login_err(self, msg):
+        """🔴 非验证码类的登录失败 —— **不许重试**。"""
+        self._clear()
+        inner = self._card(None)
+        self.tk.Label(inner, text="登录不上自助服务", bg=CARD, fg=DANGER,
+                      font=(self.fam, self.base, "bold")).pack(anchor="w")
+        self.tk.Label(inner, text=msg, bg=CARD, fg=FG, wraplength=380,
+                      justify="left", font=(self.fam, self.base)
+                      ).pack(anchor="w", pady=(6, 0))
+        self.tk.Label(inner,
+                      text="这不是验证码的问题。\n"
+                           "如果提示密码不对，请先在主界面把密码改对再试。\n"
+                           "（这里**故意不再重试** —— 反复登录失败可能被学校锁号）",
+                      bg=CARD, fg=SUB, wraplength=380, justify="left",
+                      font=(self.fam, self.base - 1)).pack(anchor="w", pady=(6, 0))
+
+    def _submit(self):
+        if self.tries >= SELF_LOGIN_MAX:
+            return
+        e = self._entry
+        if e is None:
+            return
+        code = (e.get() or "").strip()
+        if not code:
+            return
+        e.configure(state="disabled")
+        self._busy("正在登录…")
+        self._run(lambda: self._job_login(code))
+
+    def _renew(self):
+        """换一张验证码。**不计入登录次数**（没发登录请求）。"""
+        self._busy("正在取新验证码…")
+        self._run(self._job_captcha)
+
+    def _draw_data(self, d):
+        self._clear()
+        f, t = d.get("flow") or {}, d.get("time") or {}
+
+        inner = self._card("账号")
+        self._row(inner, "账号状态", d.get("status") or "-")
+        self._row(inner, "上网套餐", d.get("plan") or "-")
+        self._row(inner, "套餐到期", d.get("expire") or "-")
+        self._row(inner, "计费日", d.get("billing_day") or "-")
+        # 余额只在按金额扣费（chargeType == "1"）时才有意义 ——
+        # 和学校网页的显示条件一致，别在套餐制下显示一个恒为 0 的"余额"。
+        if str(d.get("charge_type")) == "1":
+            self._row(inner, "余额", "%.2f 元" % (d.get("balance") or 0.0))
+
+        inner = self._card("用量")
+        tbl = self.tk.Frame(inner, bg=CARD)
+        tbl.pack(fill="x")
+        for col, txt in enumerate(("", "今日", "本月", "累计")):
+            self.tk.Label(tbl, text=txt, bg=CARD, fg=SUB,
+                          font=(self.fam, self.base - 1)
+                          ).grid(row=0, column=col, sticky="w", padx=(0, 14))
+        for row, (name, k) in enumerate((("流量", "flow"), ("时长", "time")), 1):
+            src = f if k == "flow" else t
+            fmt = self_service.fmt_flow if k == "flow" else self_service.fmt_hours
+            self.tk.Label(tbl, text=name, bg=CARD, fg=SUB,
+                          font=(self.fam, self.base)).grid(row=row, column=0,
+                                                           sticky="w")
+            for col, key in enumerate(("today", "month", "total"), 1):
+                self.tk.Label(tbl, text=fmt(src.get(key)), bg=CARD, fg=FG,
+                              font=(self.fam, self.base, "bold")
+                              ).grid(row=row, column=col, sticky="w",
+                                     padx=(0, 14))
+        lim = []
+        if f.get("limit"):
+            lim.append("流量 %s" % f["limit"])
+        if t.get("limit"):
+            lim.append("时长 %s" % t["limit"])
+        if lim:
+            self.tk.Label(inner, text="限额：" + "　".join(lim), bg=CARD, fg=SUB,
+                          font=(self.fam, self.base - 1)
+                          ).pack(anchor="w", pady=(6, 0))
+
+        dev = d.get("devices") or []
+        inner = self._card("在线设备（%d 台）" % len(dev))
+        if not dev:
+            self.tk.Label(inner, text="当前没有设备在线", bg=CARD, fg=SUB,
+                          font=(self.fam, self.base)).pack(anchor="w")
+        for x in dev:
+            self.tk.Label(inner, text="%s　%s" % (x.get("ip") or "-",
+                                                  x.get("mac") or "-"),
+                          bg=CARD, fg=FG,
+                          font=(self.fam, self.base, "bold")).pack(anchor="w")
+            self.tk.Label(inner,
+                          text="%s　%s 上线" % (x.get("os") or "-",
+                                                x.get("since") or "-"),
+                          bg=CARD, fg=SUB,
+                          font=(self.fam, self.base - 1)).pack(anchor="w")
+
+        self.tk.Label(self.body,
+                      text="数据来自学校自助服务，只读；本窗口关掉后不会保存任何东西。",
+                      bg=BG, fg=SUB, font=(self.fam, self.base - 2)
+                      ).pack(anchor="w", pady=(8, 0))
+
+
 class LoginApp:
     """设置窗口。原来是 `run_gui()` 里一个约 1000 行的函数，里面套着 25 个嵌套闭包。
 
@@ -5479,6 +5965,27 @@ class LoginApp:
             height=self.SMALL + 14, hover="#d3e0ff",
             command=lambda: self.on_speed_probe())
         self.btn_probe.pack(side="right")
+
+        # 「上网数据」入口（2026-10-12 加，郑航自助服务）。
+        #
+        # 🔴 为什么不新开一张卡：和上面「测一下速度」**完全同一个理由** ——
+        #    内容高度 827px、上限 906px，加一张卡（约 90px）就压线了。
+        #    放进状态卡右侧既不动高度、语义也对（它也是"网络状态"这件事）。
+        # 🔴 为什么不新增主按钮：**主按钮固定三个是界面铁律**（`set_busy` 的
+        #    控件元组就是那三个）。这里和「测一下速度」一样是状态卡里的圆角片，
+        #    不进那个元组；忙碌拦截由 `on_self_service` 自己做。
+        # ⚠️ 高度**必须**和上面那个圆角片一模一样（`self.SMALL + 14`）——
+        #    这一行的高度由最高的子控件决定，只要一样高，整卡高度**一个像素不变**。
+        #    改这个数就必须重跑 `content_h_probe.py`。
+        # ⚠️ 只有郑航有自助服务；嘉兴（深澜 Srun）没有这个入口，所以这里要判一下。
+        #    对嘉兴用户来说等于没加东西（同一行、同高，宽度也够）。
+        self.btn_self = None
+        if self_service_available():
+            self.btn_self = round_chip(
+                status_body, tk, "上网数据", (self.fam, self.SMALL), BLUE_DARK,
+                BLUE_SOFT, height=self.SMALL + 14, hover="#d3e0ff",
+                command=lambda: self.on_self_service())
+            self.btn_self.pack(side="right", padx=(0, 6))
 
         self.draw_status_icon(NET_UNKNOWN)
 
@@ -6308,6 +6815,36 @@ class LoginApp:
                         "也会失败）" % info)
         host = urlparse(updater.BASE_URL_HINT).netloc
         return (0, "测速完成（到 %s 的下载速度）\n%s" % (host, speed_describe(info)))
+
+    def on_self_service(self):
+        """点「上网数据」触发（郑航自助服务）。
+
+        🔴 用的是**界面上填的那份账号密码**（没填就退回已保存的那份）——
+           自助服务要用同一份凭据去登录，不该再问用户要一遍。
+           这也意味着：**界面上填的是哪个账号，看到的就是哪个账号的数据**。
+
+        ⚠️ 和 `on_speed_probe` 不同，这里不走 `start_job` ——
+           它要弹一个**带验证码输入框的窗口**，而 `start_job` 收尾时只会
+           改状态栏文字。窗口自己管自己的线程和队列（见 `SelfServiceWindow`）。
+           忙碌拦截因此要自己做（这个入口不在 `set_busy` 的控件元组里）。
+        """
+        if self.state["busy"]:
+            self.show("正在处理上一个操作，请稍候", "info")
+            return
+        cfg = load_config()
+        uid = (self.var_uid.get() or "").strip() or (cfg.get("userId") or "")
+        pwd = self.pwd_field.get() or (cfg.get("passwd") or "")
+        if not uid or not pwd:
+            self.show("「上网数据」要用账号密码登录学校自助服务。\n"
+                      "请先在上面把账号密码填好（或保存一个账号）再点。", "err")
+            return
+        base = (cfg.get("portalHost") or DEFAULTS["portalHost"]).rstrip("/")
+        try:
+            SelfServiceWindow(self.root, self.tk, self.fam, self.BASE,
+                              uid, pwd, base)
+        except Exception:
+            log("打开上网数据面板失败:\n%s" % traceback.format_exc())
+            self.show("打不开「上网数据」面板。", "err")
 
     def form(self):
         uid = self.var_uid.get().strip()
