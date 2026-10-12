@@ -13,8 +13,10 @@
     跑完打印一堆高度数字，看起来完全正常，磁盘上的用户数据已经被改了。
 
 三道闸（缺一不可，各拦各的）：
-    1) **重定向**：把 `_DATA_DIR` 和 5 个路径常量一起指到临时目录。
+    1) **重定向**：把 `_DATA_DIR` 和 `_PATH_ATTRS` 里**每一个**路径常量一起指到临时目录。
        ⚠️ 光改 `_DATA_DIR` 不够 —— `CONFIG_FILE` 等在**导入期**就已经算好了。
+       ⚠️ 新增一个「落在数据目录里的文件」时，**必须**把它加进 `_PATH_ATTRS`，
+          否则沙箱盖不住那条路径（`sandbox()` 末尾的自检就是为了逼你加）。
     2) **写拦截**：把 `write_json` 包一层，目标不在沙箱里就**当场抛异常**。
        前一道只是「让它写到别处」，这一道才是「让它根本写不出去」。
     3) **事后核对**：记住真实数据文件的 md5，收尾时比对。
@@ -40,7 +42,14 @@ if HERE not in sys.path:
 import campus_login as C      # noqa: E402
 
 # 会被重定向的路径常量。和 campus_login 里的 5 个一一对应。
-_PATH_ATTRS = ("CONFIG_FILE", "ACCOUNTS_FILE", "LOG_FILE", "RESULT_FILE")
+_PATH_ATTRS = ("CONFIG_FILE", "ACCOUNTS_FILE", "LOG_FILE", "RESULT_FILE",
+               # 2026-10-12 加：上网数据的本地流量历史。
+               # ⚠️ 它**必须**在这里 —— 否则探针/测试一同步就会把历史写到
+               #    **真实**数据目录里去（沙箱盖不住这条路径），
+               #    而 `sandbox()` 末尾那条自检正是为了防这种事。
+               # ⚠️ 注意它**不在** `PRIVATE_FILES` 里（清凭据不删它，见那边的说明），
+               #    这两件事是分开的：一个是「沙箱要盖住」，一个是「purge 要不要删」。
+               "SELF_FLOW_FILE")
 
 _state = {"dir": None, "real": None, "snap": None}
 _orig_write_json = C.write_json
@@ -239,7 +248,8 @@ def _self_check():
 
     # 1) 四个常量都指到沙箱里了
     bad = [a for a in _PATH_ATTRS if not _inside(getattr(C, a), d)]
-    check("4 个路径常量都重定向到沙箱", bad == [], "  漏的: %s" % bad if bad else "")
+    check("%d 个路径常量都重定向到沙箱" % len(_PATH_ATTRS), bad == [],
+          "  漏的: %s" % bad if bad else "")
 
     # 2) 正向：走程序自己的 save_accounts 写，必须落在沙箱里
     C.save_accounts({"accounts": {"x": {"passwd": "p", "lastSuccess": "",

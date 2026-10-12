@@ -227,6 +227,138 @@ def test_fmt():
     check("3355.498325 小时", S.fmt_hours(3355.498325), "3355.50 小时")
 
 
+# ------------------------------------- 3b. 每日明细解析（2026-10-12 加）
+#
+# 这里的数据**照抄真实返回的形状**（2026-10-12 实测那份 dump.json），
+# 尤其保留两个坑：日期有缺口、今天不在数组里。
+
+# 真实那天的数（2026-10-11，实测）：up + down 正好等于 flow，分毫不差
+REAL_20261011 = (3936.1761, 973.9739, 2962.2022, 20)
+
+
+def fake_chart(dates, flows, ups, downs, hours, use=None):
+    c = {
+        "errcode": "0", "errmsg": "操作成功", "success": True,
+        "baseChartVo": {"dates": dates, "allFlows": flows,
+                        "uploadFlows": ups, "downloadFlows": downs,
+                        "allUseTime": hours},
+    }
+    if use is not None:
+        c["baseUseVo"] = use
+    return c
+
+
+def test_parse_days():
+    print("\n--- 3b. 每日明细解析（日期有缺口 / 今天不在数组里） ---")
+    TODAY = "2026-10-12"
+
+    # ① 正常：三天，且**照实测那样** up + down == flow
+    f, u, d, h = REAL_20261011
+    c = fake_chart(["2026-10-09", "2026-10-10", "2026-10-11"],
+                   [3906.4059, 3463.7843, f],
+                   [683.3043, 1186.5343, u],
+                   [3223.1016, 2277.2500, d],
+                   [22, 18, h])
+    days, summary = S.parse_days(c, today=TODAY)
+    check("解析出 3 天", len(days), 3)
+    check("按日期升序", [x["date"] for x in days],
+          ["2026-10-09", "2026-10-10", "2026-10-11"])
+    check("最后一天的值", (days[-1]["flow"], days[-1]["up"], days[-1]["down"]),
+          (3936.1761, 973.9739, 2962.2022))
+    check("时长也解析了", days[-1]["hours"], 20.0)
+    # 🔴 实测结论：上下行和合计同一口径
+    for x in days:
+        check_true("%s 上行+下行 == 合计" % x["date"],
+                   abs(x["up"] + x["down"] - x["flow"]) < 0.01,
+                   "%.4f vs %.4f" % (x["up"] + x["down"], x["flow"]))
+
+    # ② 日期乱序 ⇒ 排好
+    c2 = fake_chart(["2026-10-11", "2026-10-09"], [3, 1], [1, 1], [2, 0], [1, 1])
+    check("乱序也能排好", [x["date"] for x in S.parse_days(c2, today=TODAY)[0]],
+          ["2026-10-09", "2026-10-11"])
+
+    # ③ 🔴 日期有缺口（实测：9-30 直接跳到 10-07）⇒ **不许补**成中间那些天
+    c3 = fake_chart(["2026-09-30", "2026-10-07"], [1, 2], [1, 1], [0, 1], [1, 1])
+    got3 = S.parse_days(c3, today=TODAY)[0]
+    check("缺口不补（只有服务端给的那两天）", [x["date"] for x in got3],
+          ["2026-09-30", "2026-10-07"])
+    check_true("没有凭空多出 10-01~10-06",
+               all(x["date"] not in ("2026-10-01", "2026-10-06") for x in got3), "")
+
+    # ④ 平行数组不等长 ⇒ 按最短的截断（**不能**错位）
+    c4 = fake_chart(["2026-10-01", "2026-10-02", "2026-10-03"],
+                    [10, 20, 30], [1, 2], [9, 18], [1, 2, 3])
+    got4 = S.parse_days(c4, today=TODAY)[0]
+    check("不等长时按最短的截断", len(got4), 2)
+    check("截断后没串位", [(x["date"], x["flow"], x["up"]) for x in got4],
+          [("2026-10-01", 10.0, 1.0), ("2026-10-02", 20.0, 2.0)])
+
+    # ⑤ 单个数读不动 ⇒ 只有那一个字段受影响
+    c5 = fake_chart(["2026-10-01"], ["abc"], ["x"], [None], [""])
+    got5 = S.parse_days(c5, today=TODAY)[0][0]
+    check("合计读不动 → 0（合计必须有个数）", got5["flow"], 0.0)
+    check("上行读不动 → None（不是 0）", got5["up"], None)
+    check("下行 null → None", got5["down"], None)
+    check("时长读不动 → None", got5["hours"], None)
+
+    # ⑥ 今天：从 baseUseVo 补，且**上下行是 None**
+    c6 = fake_chart(["2026-10-11"], [3936.1761], [973.9739], [2962.2022], [20],
+                    use={"sameDayFlow": 2428.691523, "sameDayTime": 14.002222,
+                         "sameMonthFlow": 18454.782751, "sameMonthTime": 104.017223,
+                         "cumulativeFlow": 690876.003675,
+                         "cumulativeTime": 3355.498325,
+                         "limtFlows": "不限制", "limtTimes": "不限制"})
+    days6, s6 = S.parse_days(c6, today=TODAY)
+    check("今天那条的日期用的是传进来的 today", s6["today"]["date"], TODAY)
+    check("今天的合计来自 sameDayFlow", s6["today"]["flow"], 2428.691523)
+    check("今天的时长", s6["today"]["hours"], 14.002222)
+    check("🔴 今天的上行是 None（服务端不给，不是 0）", s6["today"]["up"], None)
+    check("🔴 今天的下行是 None", s6["today"]["down"], None)
+    check("今天不在 days 里（和实测一致）",
+          all(x["date"] != TODAY for x in days6), True)
+    check("本月合计", s6["month"]["flow"], 18454.782751)
+    check("累计合计", s6["total"]["flow"], 690876.003675)
+    check("限额", s6["limit"]["flow"], "不限制")
+
+    # ⑦ today 不传时取本机当天（只验格式，不验具体值 —— 验具体值会「今天绿明天红」）
+    days7, s7 = S.parse_days(c6)
+    check_true("不传 today 也能给出一个日期", bool(s7["today"]["date"]), s7["today"]["date"])
+    check_true("且长得像 YYYY-MM-DD",
+               len(s7["today"]["date"]) == 10 and s7["today"]["date"][4] == "-", "")
+
+    # ⑧ 空 / 坏输入一律不崩，而且**两条路径的形状必须一致**
+    #    （第一版就是「坏输入」那条路少了几层，被这条断言抓出来的）
+    empty_days, empty_sum = S.parse_days(None, today=TODAY)
+    check("坏输入 → 没有明细", empty_days, [])
+    check("坏输入 → today 是 None", empty_sum["today"], None)
+    check("空汇总的键一个都不少", sorted(empty_sum),
+          ["limit", "month", "today", "total"])
+    check("两条路径形状一致（空 dict 和 None 走的是同一条）",
+          S.parse_days({}, today=TODAY), (empty_days, empty_sum))
+    check("空汇总里 total 的键也在", sorted(empty_sum["total"]), ["flow", "hours"])
+    check("空汇总里 month 的键也在", sorted(empty_sum["month"]), ["flow", "hours"])
+    check("空汇总里 limit 的键也在", sorted(empty_sum["limit"]), ["flow", "hours"])
+    check("baseChartVo 是字符串", S.parse_days({"baseChartVo": "x"}, today=TODAY)[0], [])
+    check("dates 是字符串", S.parse_days(
+        {"baseChartVo": {"dates": "x"}}, today=TODAY)[0], [])
+    check("没有 baseUseVo ⇒ 今天为空", S.parse_days(
+        {"baseChartVo": {"dates": []}}, today=TODAY)[1]["today"], None)
+
+    # ⑨ 同一天出现两次 ⇒ 后写的赢（别让重复把图表搞出两根柱子）
+    c9 = fake_chart(["2026-10-01", "2026-10-01"], [1, 9], [1, 1], [0, 8], [1, 1])
+    check("同一天去重（后写的赢）", S.parse_days(c9, today=TODAY)[0],
+          [{"date": "2026-10-01", "flow": 9.0, "up": 1.0, "down": 8.0,
+            "hours": 1.0}])
+
+    # ⑩ `chart()` **只调一个接口** —— 假数据里没准备 getindexinfo，
+    #    真去调了就会抛「测试没准备这个接口的假数据」
+    svc = make({S.EP_CHART: c6})
+    out = svc.chart("2507210230", today=TODAY)
+    check("chart() 拿得到 days", len(out["days"]), 1)
+    check("chart() 拿得到 summary", out["summary"]["today"]["date"], TODAY)
+
+
+
 # --------------------------------------------------------------- 4. 失败要分类
 
 def test_error_kinds():
@@ -345,9 +477,12 @@ def test_no_write_endpoints():
     for n in ast_walk_imports(tree):
         mods.add(n)
     check("没有引入 logging", [m for m in sorted(mods) if "log" in m], [])
+    # ⚠️ `datetime` 是 2026-10-12 加进来的（每日明细要标「今天是哪一天」）。
+    #    它**不碰文件系统**，所以不破坏下面那条「不落盘」的断言 ——
+    #    但它是**唯一**允许的例外，别顺手再加别的（尤其 os / pathlib / shutil）。
     check("用到的标准库模块", sorted(mods),
-          ["base64", "hashlib", "http.cookiejar", "json", "urllib.error",
-           "urllib.request"])
+          ["base64", "datetime", "hashlib", "http.cookiejar", "json",
+           "urllib.error", "urllib.request"])
 
     # ⑤ cookie 必须是**内存** jar，不能落盘。
     #    ⚠️ 这条**必须走 AST**，不能搜源码原文 —— 源码的注释里**故意**写着
@@ -384,6 +519,7 @@ def main():
     test_md5()
     test_no_sensitive_leak()
     test_fmt()
+    test_parse_days()
     test_error_kinds()
     test_no_write_endpoints()
     print()

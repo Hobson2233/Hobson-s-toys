@@ -33,9 +33,16 @@
 
   4. 🔴 **验证码只能人工输。** 登录要图片验证码（4 位），所以这个功能
      **没法无人值守**，只能交互式。别试图绕过或自动识别。
+
+  5. 🔴 **「本地历史」不在这个模块里。** 每日流量明细要存到本机、下次不登录
+     也能看 —— 那部分在 `self_history.py`。本模块**继续保持不碰磁盘**
+     （`self_service_test.py` 里有断言钉着「没用到 os / pathlib」）。
+     ⚠️ 别为了图省事在这里加 `open()` / `write_json()` —— 那条断言保护的是
+     「这个模块不会偷偷把响应落盘」，而响应里**带身份证号和明文密码**。
 """
 
 import base64
+import datetime
 import hashlib
 import http.cookiejar
 import json
@@ -106,6 +113,20 @@ def _num(v, default=0.0):
         return default
 
 
+def _num_or_none(v):
+    """转 float；转不了给 `None`。
+
+    🔴 **和 `_num` 不是一回事，别互相替代**：`_num` 的 `0.0` 意思是
+    「这个数就是 0」（比如今天确实没流量）；这里的 `None` 意思是
+    「**接口没给这个数**」（比如今天的上行/下行，服务端真的不提供）。
+    把后者写成 0，界面上就会显示「上行 0 MB」——那是**编出来的**。
+    """
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
 def fmt_flow(mb):
     """流量（**MB**）→ 给人看的字符串。
 
@@ -126,6 +147,22 @@ def fmt_flow(mb):
     return "%.2f TB" % (v / 1024.0 / 1024.0)
 
 
+def fmt_flow_short(mb):
+    """流量（MB）→ **紧凑**字符串，给图表柱顶的数值标签用。
+
+    ⚠️ 和 `fmt_flow` 的区别只是「短」：`fmt_flow(3936.18)` → `"3.84 GB"`，
+    `fmt_flow_short(3936.18)` → `"3.84G"`。柱顶标签在窄柱子上放不下
+    「12.34 GB」这种带空格的长串（一个月 31 根柱子时每根只有十几像素宽），
+    所以另开一个短格式 —— **不是**要取代 `fmt_flow`，正文里还是用长的。
+    """
+    v = _num(mb)
+    if v < 1024:
+        return "%.0fM" % v
+    if v < 1024 * 1024:
+        return "%.2fG" % (v / 1024.0)
+    return "%.2fT" % (v / 1024.0 / 1024.0)
+
+
 def fmt_hours(h):
     """时长（**小时**）→ 给人看的字符串。单位实测确认（图表 yAxis `(单位/小时)`）。
 
@@ -139,6 +176,135 @@ def fmt_hours(h):
 def _looks_like_captcha(msg):
     """errmsg 是不是在说「验证码不对」。"""
     return any(h in (msg or "") for h in _CAPTCHA_HINTS)
+
+
+# ---------------------------------------------------------------- 每日明细
+#
+# 这一段是纯函数（**不联网**），因为它要处理的全是「服务端给的数据长什么样」
+# 这类**容易出错又不好复现**的问题：数组不等长、日期不连续、今天不在里面……
+
+def _empty_summary():
+    """空汇总。**两条返回路径共用一份** —— 形状必须完全一致。
+
+    ⚠️ 2026-10-12 被自己的测试抓出来的：第一版「坏输入」那条路返回的是
+    `{"total": {}, "month": {}, ...}`，而正常路径返回的是
+    `{"total": {"flow": 0.0, "hours": None}, ...}` —— **同一个函数两种形状**。
+    调用方就得同时处理「有键但值是 0」和「键根本没有」，迟早漏一个，
+    而漏的那次表现是 `KeyError` 崩在界面上、或者更糟：`{}` 被当成「没数据」
+    而其实是「有数据但都是 0」。
+    """
+    return {
+        "today": None,
+        "total": {"flow": 0.0, "hours": None},
+        "month": {"flow": 0.0, "hours": None},
+        "limit": {"flow": "", "hours": ""},
+    }
+
+
+def parse_days(chart, today=None):
+    """把 `getindexchart.do` 的返回解析成**按日期的明细**。**纯函数，不联网。**
+
+    返回 `(days, summary)`：
+
+      · `days`    —— 按日期升序的列表，每条是
+        `{"date": "YYYY-MM-DD", "flow": MB, "up": MB|None,
+          "down": MB|None, "hours": 小时|None}`
+      · `summary` —— `{"today": 一条|None, "total": {...}, "month": {...},
+                       "limit": {...}}`
+
+    `today` 是「今天算哪一天」（`YYYY-MM-DD`）。**不传就取本机当天** ——
+    测试里**必须显式传**，否则跑出来的结果依赖运行日期，今天绿明天红。
+
+    🔴 字段与单位的实测结论（2026-10-12，见 `郑航自助服务-接口清单.md`）：
+
+      · `baseChartVo` 里 `dates` / `allFlows` / `uploadFlows` / `downloadFlows` /
+        `allUseTime` 是**五个等长的平行数组**（实测各 24 条）。
+        单位：MB / MB / MB / 小时。
+      · 🔴 实测 `uploadFlows[i] + downloadFlows[i] == allFlows[i]`，**分毫不差**
+        （24 天逐条验过）⇒ 上下行和合计是同一口径，可以放心一起显示。
+
+    ⚠️ 三个**不能想当然**的地方（都是实测出来的）：
+
+      1. **`dates` 不连续。** 服务端只给「有记录的日子」：实测 2026-09-30
+         直接跳到 2026-10-07（国庆那几天没有记录）。
+         ⇒ **绝不能假设「连续 N 天」**，一切都按日期做键。
+         ⚠️ 也别把缺失的日子补成 0 —— 那是**猜**。补 0 意味着「那天确实用了 0」，
+         而真实原因可能是「服务端没这条记录」，两者在界面上必须能区分。
+      2. **今天不在 `dates` 里。** 实测 2026-10-12 晚上抓的包，最后一天是 10-11。
+         今天的数只能从 `baseUseVo.sameDayFlow` / `sameDayTime` 拿。
+      3. 🔴 **今天的上行/下行服务端不给**（`baseUseVo` 里只有 `sameDayFlow`
+         这个合计）⇒ 存 `None`。这是 `_num_or_none` 存在的唯一理由。
+         ⚠️ 等明天再同步时，今天变成「过去的一天」，就会从 `dates` 里拿到真的
+         上下行 —— 所以**明天那次同步会把这天的 up/down 补上**（覆盖规则天然处理）。
+
+    ⚠️ 坏数据一律**不抛异常**，能取多少取多少：数组不等长时按最短的截断，
+    单个数转不动就那一个字段给 `None`。理由 —— 这是**给人看的历史数据**，
+    为了一条脏记录把整个界面搞崩（还看不出原因）是最差的处理方式。
+    """
+    if not isinstance(chart, dict):
+        return [], _empty_summary()
+    bc = chart.get("baseChartVo")
+    use = chart.get("baseUseVo")
+    bc = bc if isinstance(bc, dict) else {}
+    use = use if isinstance(use, dict) else {}
+
+    def _arr(key):
+        v = bc.get(key)
+        return v if isinstance(v, list) else []
+
+    dates, flows = _arr("dates"), _arr("allFlows")
+    ups, downs = _arr("uploadFlows"), _arr("downloadFlows")
+    hours = _arr("allUseTime")
+
+    # 平行数组**按最短的截断** —— 不等长说明服务端那边出了状况，
+    # 硬按下标取会 IndexError，或者更糟：把 A 天的流量记到 B 天上。
+    n = min(len(dates), len(flows), len(ups), len(downs), len(hours))
+
+    days = []
+    for i in range(n):
+        d = str(dates[i] or "").strip()
+        if not d:
+            continue          # 日期都读不出来，这条没法用（也没法当键）
+        days.append({
+            "date": d,
+            "flow": _num(flows[i], 0.0),
+            "up": _num_or_none(ups[i]),
+            "down": _num_or_none(downs[i]),
+            "hours": _num_or_none(hours[i]),
+        })
+
+    # 按日期升序 —— 服务端目前是升序的，但**别依赖它**（顺序变了我们的
+    # 图表就会乱，而且不报错）。同一天出现两次时保留最后一条（后写的赢）。
+    merged = {}
+    for d in days:
+        merged[d["date"]] = d
+    days = [merged[k] for k in sorted(merged)]
+
+    # 今天：只有合计和时长，上下行是 None（见上面第 3 条）
+    today = None
+    if "sameDayFlow" in use:
+        today = {
+            "date": today or datetime.date.today().isoformat(),
+            "flow": _num(use.get("sameDayFlow"), 0.0),
+            "up": None,
+            "down": None,
+            "hours": _num_or_none(use.get("sameDayTime")),
+        }
+    return days, {
+        "today": today,
+        "total": {
+            "flow": _num(use.get("cumulativeFlow"), 0.0),
+            "hours": _num_or_none(use.get("cumulativeTime")),
+        },
+        "month": {
+            "flow": _num(use.get("sameMonthFlow"), 0.0),
+            "hours": _num_or_none(use.get("sameMonthTime")),
+        },
+        "limit": {
+            "flow": use.get("limtFlows") or "",
+            "hours": use.get("limtTimes") or "",
+        },
+    }
 
 
 class SelfService(object):
@@ -258,44 +424,36 @@ class SelfService(object):
 
     # ------------------------------------------------------------ 取数
 
+    def _fetch(self, account):
+        """取两个接口的原始返回：`getindexinfo.do` + `getindexchart.do`。
+
+        ⚠️ 抽出来是为了让 `overview()` 和每日明细**共用同一次请求** ——
+           两次分别请求的话，两个返回可能落在不同秒上，界面上就会出现
+           「汇总和明细对不上」，而且**不报错**（这种最难查）。
+        """
+        info = self._post(EP_INDEX, {"accountId": account}).get("data")
+        chart = self._post(EP_CHART, {"accountId": account})
+        return (info if isinstance(info, dict) else {},
+                chart if isinstance(chart, dict) else {})
+
     def overview(self, account):
-        """状态 + 用量。**返回的每个字段都是这里手写拼出来的**（见模块文档规矩 2）。
+        """状态 + 用量汇总（不含每日明细）。
 
         只调两个接口：`getindexinfo.do`（状态/套餐/余额/到期）
         + `getindexchart.do`（用量汇总）。
         """
-        info = self._post(EP_INDEX, {"accountId": account}).get("data") or {}
-        chart = self._post(EP_CHART, {"accountId": account})
-        use = chart.get("baseUseVo") or {}
-        if not isinstance(info, dict):
-            info = {}
-        if not isinstance(use, dict):
-            use = {}
+        info, chart = self._fetch(account)
+        return _overview(info, chart)
 
-        return {
-            # --- 账号状态（来自 getindexinfo） ---
-            "status": info.get("accountStatus") or use.get("accountStatus") or "",
-            "plan": info.get("internetTacticsName") or "",
-            "area": info.get("areaName") or "",
-            "expire": info.get("expirationDate") or "",
-            "billing_day": info.get("billingcycletime") or "",
-            "charge_type": str(info.get("chargeType") or ""),
-            # 余额单位「元」是实测确认的（模板里 `remainMoney + "元"`）
-            "balance": _num(info.get("remainMoney")),
-            # --- 用量（来自 getindexchart） ---
-            "flow": {
-                "today": _num(use.get("sameDayFlow")),
-                "month": _num(use.get("sameMonthFlow")),
-                "total": _num(use.get("cumulativeFlow")),
-                "limit": use.get("limtFlows") or "",
-            },
-            "time": {
-                "today": _num(use.get("sameDayTime")),
-                "month": _num(use.get("sameMonthTime")),
-                "total": _num(use.get("cumulativeTime")),
-                "limit": use.get("limtTimes") or "",
-            },
-        }
+    def chart(self, account, today=None):
+        """每日流量明细 + 汇总。**只调 `getindexchart.do` 一个接口。**
+
+        返回 `{"days": [...], "summary": {...}}`，字段含义见 `parse_days()`。
+        """
+        chart = self._post(EP_CHART, {"accountId": account})
+        days, summary = parse_days(chart if isinstance(chart, dict) else {},
+                                   today)
+        return {"days": days, "summary": summary}
 
     def online(self, account):
         """当前在线的设备列表。**只保留展示需要的字段。**
@@ -323,8 +481,51 @@ class SelfService(object):
             })
         return out
 
-    def load(self, account):
-        """一次拿全（状态 + 用量 + 在线设备）。"""
-        d = self.overview(account)
+    def load(self, account, today=None):
+        """一次拿全（状态 + 用量汇总 + 每日明细 + 在线设备）。
+
+        ⚠️ `getindexchart.do` **只调一次**（`_fetch` 里），汇总和每日明细共用
+           同一个返回 —— 见 `_fetch` 的说明。
+        """
+        info, chart = self._fetch(account)
+        d = _overview(info, chart)
+        days, summary = parse_days(chart, today)
+        d["days"] = days
+        d["summary"] = summary
         d["devices"] = self.online(account)
         return d
+
+
+def _overview(info, chart):
+    """把两个接口的返回拼成「状态 + 用量汇总」。**纯函数，不联网。**
+
+    🔴 **返回的每个字段都是手写拼出来的**（模块文档规矩 2）——
+    不是「把响应拷过来再删几个键」。学校一加字段，黑名单就会漏。
+    """
+    use = chart.get("baseUseVo") if isinstance(chart, dict) else None
+    info = info if isinstance(info, dict) else {}
+    use = use if isinstance(use, dict) else {}
+    return {
+        # --- 账号状态（来自 getindexinfo） ---
+        "status": info.get("accountStatus") or use.get("accountStatus") or "",
+        "plan": info.get("internetTacticsName") or "",
+        "area": info.get("areaName") or "",
+        "expire": info.get("expirationDate") or "",
+        "billing_day": info.get("billingcycletime") or "",
+        "charge_type": str(info.get("chargeType") or ""),
+        # 余额单位「元」是实测确认的（模板里 `remainMoney + "元"`）
+        "balance": _num(info.get("remainMoney")),
+        # --- 用量（来自 getindexchart） ---
+        "flow": {
+            "today": _num(use.get("sameDayFlow")),
+            "month": _num(use.get("sameMonthFlow")),
+            "total": _num(use.get("cumulativeFlow")),
+            "limit": use.get("limtFlows") or "",
+        },
+        "time": {
+            "today": _num(use.get("sameDayTime")),
+            "month": _num(use.get("sameMonthTime")),
+            "total": _num(use.get("cumulativeTime")),
+            "limit": use.get("limtTimes") or "",
+        },
+    }

@@ -47,8 +47,16 @@ import updater
 
 # 「上网数据」功能（郑航自助服务）的取数层。**和 updater 同理**：
 # 顶层 import，打包时必须让 PyInstaller 看见它 —— 藏在函数里的 import 容易被漏掉。
-# 它只 import 标准库（base64/hashlib/http.cookiejar/json/urllib），不引入新依赖。
+# 它只 import 标准库（base64/datetime/hashlib/http.cookiejar/json/urllib），不引入新依赖。
 import self_service
+
+# 「上网数据」的**本地流量历史**（存本机，下次不登录也能看）。
+# ⚠️ 它和 self_service 是**故意分开**的两个模块：self_service 有一条被测试钉死的
+#    性质 —— **它不碰磁盘**（不 import os / pathlib、没有 open）。那条性质保护的是
+#    「取数层不会把响应偷偷落盘」，而响应里带身份证号和明文密码。
+#    所以：取数归取数，存盘归存盘。
+# 同样顶层 import（PyInstaller 才看得见）。
+import self_history
 
 # 界面配色。**和站点 CSS 共用一份**（2026-10-05 抽出，理由见 palette.py）。
 # 以前这 19 个常量长在本文件里，而站点那边另有一份手工同步的副本 ——
@@ -69,7 +77,7 @@ APP_TITLE = "校园网自动登录"
 # ⚠️ 这里是**唯一来源**。界面标题、使用说明、--version、--selftest、
 #    以及 exe 文件属性里的版本，全部由它推导 —— 不要在别处另写一份，
 #    否则迟早漂移（改了一处忘了另一处，用户看到的版本号就是错的）。
-VERSION = "0.5.5"
+VERSION = "0.5.6"
 
 # ==================== 学校参数：换学校只改 config.json ====================
 #
@@ -361,6 +369,17 @@ LEGACY_DIR = r"C:\tools"          # 最老的 PowerShell 版部署位置，首�
 # 本机保存过的隐私文件清单（--purge 用；显式列举，不用通配符）
 PRIVATE_FILES = ("config.json", "accounts.json", "last-result.json",
                  "campus-login.log", "selftest.txt", "guitest.txt")
+
+# 「上网数据」的本地流量历史。
+#
+# 🔴 **故意不放进 `PRIVATE_FILES`** —— 也就是说「清除本机保存的账号密码」
+#    **不会**删它。理由：用户要的就是「以后不登录也能看过去的流量」
+#    （2026-10-12 明确提的需求），清凭据顺手把历史清掉就等于把这个功能废了。
+#    ⚠️ 但**必须让用户知道**：清除确认框里会写明「流量历史会保留」，
+#       面板里另有一个「清掉本机历史」的入口（`clear_flow_history`）。
+#    ⚠️ 它里面**只有账号 + 每天几个流量数字**，没有密码、没有 cookie ——
+#       见 `self_history.py` 的模块文档。
+SELF_FLOW_FILE = os.path.join(data_dir(), "self-flow.json")
 
 # 「用户清过凭据」的标记。
 # ⚠️ **故意不放进 PRIVATE_FILES** —— purge 自己不能删它，否则下次启动
@@ -5284,10 +5303,40 @@ def show_text_window(title, text, width=780, height=640):
 #    （服务端返回的 errmsg 能区分「验证码错」和「密码错」，见 self_service.SelfError）
 SELF_LOGIN_MAX = 3
 
-# 验证码图的放大倍数和原始尺寸（学校那边实测是 130x40）。
-# 🔴 这几个数**和窗口宽度绑在一起**，见 `SelfServiceWindow.__init__` 里的 minsize。
+# 验证码图的原始尺寸（学校那边实测 130x40）和放大倍数。
+# 🔴 这几个数和**窗口宽度**绑在一起：面板宽度就是按「放下放大后的验证码」定的，
+#    改放大倍数必须同时改 `PANEL_W`（下面几行就是按这个算出来的）。
 CAPTCHA_W, CAPTCHA_H = 130, 40
 CAPTCHA_ZOOM = 4
+
+# 卡片的内边距（和 `round_panel(pad_x=14, pad_y=12, radius=11)` 对应）。
+# 放在这里是为了让下面的宽度算式**只有一处** —— 面板宽度、画布宽度、
+# 验证码放不放得下，全从这几个数推出来。
+_PANEL_PAD = 14
+_CARD_PAD_X = 14
+
+# 面板宽度：**至少**放得下放大后的验证码。
+# ⚠️ 为什么要给下限：正文卡片是 `round_panel` 返回的 **Canvas**，而
+#    Canvas 的 `reqwidth` 只等于它自己的 `width` 选项、**不跟内容长**
+#    （和那边文档里讲的「高度得自己补」是同一个毛病）。不给下限的话，
+#    窗口会停在标题行撑出来的 ~406px，验证码图右边 1/3 被**静默裁掉** ——
+#    用户读不全 4 个字符，功能等于不可用，而 Tk 一声不吭。
+#    （2026-10-12 靠 `selfwin_test.py` 量 `winfo_width` 才发现的。）
+PANEL_W = CAPTCHA_W * CAPTCHA_ZOOM + 2 * OUTER_PAD + 2 * _CARD_PAD_X
+
+# 右侧给滚动条留的**固定**列宽。
+#
+# 🔴 为什么是「固定预留」而不是「用到了才显示」：滚动条一出现就会从画布里
+#    挤掉约 17px，而画布的宽度又决定 `holder` 的宽度 —— 于是「内容长得够不够
+#    滚动」会反过来改变「图表放不放得下」。那是个**循环依赖**：内容多一点 ⇒
+#    出滚动条 ⇒ 画布变窄 ⇒ 图表被裁 ⇒ 更难看。预留一个固定列就把这个环切断了：
+#    画布宽度**恒定**，图表永远放得下，代价只是没滚动条时右边多一点留白。
+_SCROLL_COL = 18
+
+# 图表画布的宽度 = 面板宽 - 两侧外层留白 - 滚动条列 - body 的右边距 - 卡片两侧内边距。
+# （从 PANEL_W 推出来，别写死一个数 —— 写死的话改了面板宽度就对不齐。）
+CHART_W = PANEL_W - 2 * OUTER_PAD - _SCROLL_COL - 2 - 2 * _CARD_PAD_X
+CHART_H = 190                     # 柱状图区高度（不含底下的日期刻度）
 
 
 def self_service_available(cfg=None):
@@ -5295,26 +5344,31 @@ def self_service_available(cfg=None):
 
     实测确认**只有郑航**有：`202.196.169.166/self/`，和郑航的 `portalHost`
     是**同一台机器**（所以不算新增外部依赖）。
-    嘉兴那套是深澜 Srun（`wlan.zjxu.edu.cn`），没有这个入口。
+    嘉兴那套是深澜 Srun（`wlan.zju.edu.cn`），没有这个入口。
     """
     return school_key(cfg) == "zua"
 
 
 class SelfServiceWindow(object):
-    """「上网数据」面板：显示这个账号的状态 / 套餐 / 余额 / 流量 / 时长 / 在线设备。
+    """「上网数据」面板：状态 / 套餐 / 流量图表 / 在线设备。
 
-    数据来自学校自己的自助服务系统，**只读**（`self_service.py` 里写死了只调查询接口）。
+    🔴 **离线优先**（2026-10-12 用户提的改法）。打开面板**不联网、不要验证码**，
+    先把本机攒下来的历史画出来；只有点「同步数据」才会取验证码 → 登录 → 拉数 →
+    合并写盘 → 重画。理由：验证码得人肉读，每次想看历史都要读一遍码太蠢了。
 
-    🔴 三条硬要求：
+    🔴 三条硬要求（从上一版继承）：
+
       1. **独立 Toplevel + 自带 worker 线程和自己的队列** —— 不走
          `LoginApp.state["queue"]`：那条队列的消息类型是给主窗口用的，
          塞新类型进去要改 `handle_msg`，改动面和风险都大得多。
-         面板关掉之后它自己的队列就没人用了，对主窗口零影响。
       2. **网络请求绝不跑在 Tk 主线程**（会卡界面）。tkinter 也不是线程安全的，
          所以子线程**只往队列里放结果**，界面一律由 `after()` 轮询着改。
       3. 🔴 **cookie 只在内存**（`self_service.py` 里就是这么写的）——
-         窗口一关会话就结束，下次点开要重新输验证码。这是**故意**的：
-         会话 cookie 等价于一次登录态，落盘等于多存一份凭据。
+         窗口一关会话就结束。这是**故意**的：会话 cookie 等价于一次登录态。
+
+    ⚠️ 和上一版的一处**行为变化**：`_draw_data` 以前是「把整屏换成数据」，
+       现在数据只是面板的一部分 —— 面板是「账号卡 + 图表卡 + 设备卡」三块，
+       没有数据时（没同步过）只画图表卡（可能有本地历史）。
     """
 
     def __init__(self, root, tk, fam, base, account, password, base_url):
@@ -5327,9 +5381,8 @@ class SelfServiceWindow(object):
         #    原来只把 `password` 收进参数、没存成属性，而 `_job_login` 里写的是
         #    `self.svc.login(self.account, self.password, code)` —— 于是用户
         #    一提交验证码，子线程立刻 `AttributeError` 崩掉。表现是：
-        #    界面永远停在「正在登录…」，日志里一行异常，**界面上一句提示都没有**
-        #    （异常发生在子线程，没人接）。而且这条路是**必走**的，
-        #    也就是说这个功能当时是「一用就废」。
+        #    界面永远停在「正在登录…」，日志里一行异常，**界面上一句提示都没有**。
+        #    而且这条路是**必走**的 ⇒ 这个功能当时是「一用就废」。
         #    ⚠️ 这类「少存一个属性」的错误 py_compile 和 AST 扫描都看不见。
         self.password = password
         self.svc = self_service.SelfService(base=base_url)
@@ -5342,12 +5395,27 @@ class SelfServiceWindow(object):
         self._cap_big = None
         self._entry = None
 
+        # --- 本地历史（只读盘、不联网） ---
+        self.store = {}
+        self.store_why = ""       # 读库没读成时的原因（记日志用）
+        # --- 联网同步到的数据；没同步过就是 None ---
+        self.data = None
+        self.syncing = False
+        # --- 图表视图状态 ---
+        self.view = "day"         # "day"（按天）/ "month"（按月）
+        self.ym = ""              # 按天视图当前看的是哪个月 "YYYY-MM"
+        # 确认框。测试里替换成 `lambda *a: True`，免得模态框把自动化挂住。
+        self.ask = None
+        # 上一次操作的结果提示（同步完了 / 清完了），画在正文末尾
+        self.note = ""
+
         self.win = tk.Toplevel(root)
-        self.win.title("上网数据 · %s" % APP_TITLE)
+        self.win.title("上网数据 · %s · %s" % (account, APP_TITLE))
         # 窗口底色 = **页面底色**（不是卡片底色）—— 正文是圆角卡片，
         # 同色的话圆角就看不出来了。和 show_help 同一个理由。
         self.win.configure(bg=BG)
         self.win.transient(root)          # 跟随主窗口，不单独占任务栏项
+        self.win.resizable(False, False)  # 尺寸由内容算（见 _autosize），别让用户拖着变形
         ico = icon_path()
         if ico:
             try:
@@ -5356,54 +5424,136 @@ class SelfServiceWindow(object):
                 pass
         self.win.protocol("WM_DELETE_WINDOW", self.close)
 
-        # 🔴 **必须给窗口一个宽度下限**（2026-10-12 截图量出来的）。
-        #
-        #    验证码图放大 4 倍是 130*4 = 520px，是这个面板里最宽的东西。
-        #    但窗口不会自己长到能放下它 —— 因为正文卡片是 `round_panel` 返回的
-        #    **Canvas**，而 **Canvas 的 `reqwidth` 只等于它自己的 `width` 选项，
-        #    跟里面塞了什么完全无关**（和那边文档里讲的「高度得自己补」是同一个
-        #    毛病，只是高度那边已经补了、宽度没补）。
-        #    于是窗口停在标题行撑出来的 ~406px，卡片可用宽度只有 350px ——
-        #    验证码图右边 1/3 被**静默裁掉**，用户根本读不全 4 个字符，
-        #    整个功能等于不可用。而 Tk 一声不吭。
-        #
-        #    ⚠️ 别指望「图被裁了会报错」或者「看图能看出来」：截图里那张棋盘格
-        #       缺了一角也还是棋盘格，只有**量**（reqwidth vs 图宽）才看得出来。
-        #    ⚠️ 改了 CAPTCHA_ZOOM 就必须同步这里，否则又会裁。
-        self.win.minsize(CAPTCHA_W * CAPTCHA_ZOOM + 2 * OUTER_PAD + 2 * 14, 0)
-
-        head = tk.Frame(self.win, bg=BG)
-        head.pack(fill="x", padx=OUTER_PAD, pady=(OUTER_PAD, 6))
-        tk.Label(head, text="上网数据", bg=BG, fg=FG,
+        # --- 顶部：标题 + 账号 + 「同步数据」 ---
+        self.head = tk.Frame(self.win, bg=BG)
+        self.head.pack(fill="x", padx=OUTER_PAD, pady=(OUTER_PAD, 6))
+        tk.Label(self.head, text="上网数据", bg=BG, fg=FG,
                  font=(fam, base + 4, "bold")).pack(side="left")
-        round_chip(head, tk, "学校自助服务 · 只读", (fam, base - 2), SUB,
-                   "#e9edf3", page=BG).pack(side="left", padx=(10, 0))
+        # 🔴 账号**必须显示出来**：这个面板看的是「界面上那个账号」的数据，
+        #    而本机历史是按账号存的 —— 不写清楚是哪个账号，用户会以为看的是
+        #    另一个（而且两边数据都「看着正常」，看不出错）。
+        round_chip(self.head, tk, account, (fam, base - 2), SUB, "#e9edf3",
+                   page=BG).pack(side="left", padx=(10, 0))
+        round_chip(self.head, tk, "学校自助服务 · 只读", (fam, base - 2), SUB,
+                   "#e9edf3", page=BG).pack(side="left", padx=(6, 0))
+        h = base * 2 + 14
+        self.btn_sync = round_button(
+            self.head, "同步数据", self.start_sync, (fam, base),
+            bg=BLUE, fg="#ffffff", hover=BLUE_DARK, active="#1e40af",
+            parent_bg=BG, height=h, radius=pill_radius(h))
+        self.btn_sync.pack(side="right")
 
-        self.body = tk.Frame(self.win, bg=BG)
-        self.body.pack(fill="both", expand=True, padx=OUTER_PAD)
+        # --- 中间：可滚动正文 ---
+        # ⚠️ 面板现在有三块（账号 / 图表 / 设备），矮屏上一定放不下，
+        #    所以必须能滚 —— 主窗口也是这么做的。
+        outer = tk.Frame(self.win, bg=BG)
+        outer.pack(fill="both", expand=True, padx=OUTER_PAD)
+        # 滚动条坐在一个**宽度固定**的列里（`_SCROLL_COL`），不用时只是空着。
+        # 这样画布宽度恒定，图表不会被「滚动条出现/消失」挤到裁掉 —— 见常量那边的说明。
+        self.scroll_col = tk.Frame(outer, bg=BG, width=_SCROLL_COL)
+        self.scroll_col.pack(side="right", fill="y")
+        self.scroll_col.pack_propagate(False)
+        self.canvas = tk.Canvas(outer, bg=BG, highlightthickness=0, bd=0)
+        self.vsb = tk.Scrollbar(self.scroll_col, command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=self._on_scroll)
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.holder = tk.Frame(self.canvas, bg=BG)
+        self.body = tk.Frame(self.holder, bg=BG)
+        self.body.pack(fill="both", expand=True, padx=(0, 2))
+        self._holder_id = self.canvas.create_window((0, 0), window=self.holder,
+                                                    anchor="nw")
+        self.holder.bind("<Configure>", self._on_holder)
+        # 🔴 让 holder 始终和 canvas 一样宽（主窗口也有一句一模一样的）。
+        #    **漏了这句的后果是内容被静默裁掉**：图表画布是 520px，而 holder
+        #    会停在卡片 Canvas 的默认宽度（378px）—— 2026-10-12 实测，
+        #    一个月 6 天的柱子**只画出来 4 根**，右边两根直接没了，
+        #    而且不报任何错。（和「Canvas 的 reqwidth 不跟内容长」是同一个家族。）
+        self.canvas.bind("<Configure>",
+                         lambda e: self.canvas.itemconfigure(self._holder_id,
+                                                             width=e.width))
 
-        bar = tk.Frame(self.win, bg=BG)
-        bar.pack(fill="x", padx=OUTER_PAD, pady=OUTER_PAD)
+        # --- 底部 ---
+        self.foot = tk.Frame(self.win, bg=BG)
+        self.foot.pack(fill="x", padx=OUTER_PAD, pady=OUTER_PAD)
         h = base * 2 + 16
-        round_button(bar, "关闭", self.close, (fam, base),
+        round_button(self.foot, "关闭", self.close, (fam, base),
                      bg="#dbe1eb", fg="#475569", hover="#ccd5e3",
                      active="#bfc9da", parent_bg=BG, height=h,
                      radius=pill_radius(h)).pack(side="right")
+        # 「清掉本机历史」：**故意和主界面的「清除本机保存的账号密码」分开** ——
+        # 那个不删流量历史（用户要的就是「以后不登录也能看」），所以这里给一个
+        # 单独的入口，让想删的人删得掉。
+        round_chip(self.foot, tk, "清掉本机历史", (fam, base - 1), SUB,
+                   "#e9edf3", page=BG, height=h, hover="#dbe1eb",
+                   command=self.clear_history).pack(side="right", padx=(0, 10))
 
-        self._place()
         self.win.after(80, self._pump)
-        self._busy("正在读取…")
-        self._run(self._job_session)
+        self._load_local()
+        self._render()
+        # ⚠️ 定位只做**这一次**（在第一次渲染之后）—— 放在 `_render()` 里的话，
+        #    每次同步完窗口都会跳一下，很烦。
+        self._place()
 
     # ------------------------------------------------------------ 窗口
 
-    def _place(self):
-        """把窗口摆在主窗口上方偏中间的位置。"""
+    def _on_holder(self, _e=None):
+        """正文大小变了 ⇒ 更新滚动范围。
+
+        ⚠️ 滚动条的**显示/隐藏交给 `_on_scroll()`**，这里只管范围 ——
+           两处都管的话会互相打架（这边刚藏起来、那边又显示出来），
+           表现是滚动条一闪一闪。
+        """
+        try:
+            self.canvas.configure(scrollregion=(0, 0, 0,
+                                                self.holder.winfo_reqheight()))
+        except Exception:
+            pass
+
+    def _on_scroll(self, first, last):
+        """滚动条回调。**内容装得下时把滚动条藏起来** —— 一直挂着一根空滚动条
+        看着像界面没做完（主窗口那边也是按需显示的）。"""
+        try:
+            if float(first) <= 0.0 and float(last) >= 1.0:
+                if self.vsb.winfo_ismapped():
+                    self.vsb.pack_forget()
+            elif not self.vsb.winfo_ismapped():
+                self.vsb.pack(fill="both", expand=True)
+            self.vsb.set(first, last)
+        except Exception:
+            pass
+
+    def _autosize(self):
+        """按内容算窗口高度（宽度固定 = `PANEL_W`）。
+
+        ⚠️ 高度**必须封顶**：内容比屏幕还高时窗口会伸出屏幕外，
+          底下的「关闭」按钮就点不到了（而那正是唯一的退出方式）。
+          封顶之后正文自己会滚。
+        """
         try:
             self.win.update_idletasks()
-            x = self.root.winfo_rootx() + 60
-            y = self.root.winfo_rooty() + 60
-            self.win.geometry("+%d+%d" % (max(0, x), max(0, y)))
+            h = (self.head.winfo_reqheight() + self.foot.winfo_reqheight()
+                 + self.holder.winfo_reqheight() + 3 * OUTER_PAD + 12)
+            limit = int(self.win.winfo_screenheight() * 0.86)
+            h = max(320, min(h, limit))
+            self.win.geometry("%dx%d" % (PANEL_W, h))
+            self._on_holder()
+        except Exception:
+            log("上网数据面板定尺寸失败:\n%s" % traceback.format_exc())
+
+    def _place(self):
+        """把窗口摆在主窗口附近偏中间的位置。"""
+        try:
+            self.win.update_idletasks()
+            x = self.root.winfo_rootx() + 40
+            y = self.root.winfo_rooty() + 30
+            sw = self.win.winfo_screenwidth()
+            sh = self.win.winfo_screenheight()
+            w = self.win.winfo_width() or PANEL_W
+            hh = self.win.winfo_height() or 400
+            # 别让它跑出屏幕（右上角那块尤其容易）
+            x = max(0, min(x, sw - w - 8))
+            y = max(0, min(y, sh - hh - 40))
+            self.win.geometry("+%d+%d" % (x, y))
             self.win.lift()
         except Exception:
             # 定位失败不是致命问题（窗口会用系统默认位置），但要留痕 ——
@@ -5466,7 +5616,7 @@ class SelfServiceWindow(object):
 
     def _handle(self, kind, payload):
         if kind == "load":
-            self._busy("正在读取…")
+            self._busy_note("正在读取数据…")
             self._run(self._job_load)
         elif kind == "captcha":
             self._draw_captcha(payload)
@@ -5480,7 +5630,7 @@ class SelfServiceWindow(object):
         elif kind == "login_err":
             self._draw_login_err(payload)
         elif kind == "data":
-            self._draw_data(payload)
+            self._on_synced(payload)
         elif kind == "fail":
             self._draw_fail(payload)
 
@@ -5509,7 +5659,9 @@ class SelfServiceWindow(object):
 
     def _job_load(self):
         try:
-            self._put("data", self.svc.load(self.account))
+            # ⚠️ `today=` 显式传进去：让「今天算哪一天」和写盘用的是同一个日期，
+            #    也免得 `parse_days` 去读时钟（那样测试就不是确定性的了）。
+            self._put("data", self.svc.load(self.account, today=self._today()))
         except self_service.SelfError as e:
             if e.kind == "session":
                 # 会话在取数途中过期了 —— 退回验证码流程，不算失败
@@ -5537,6 +5689,81 @@ class SelfServiceWindow(object):
             return
         self._job_load()
 
+    def _today(self):
+        """今天算哪一天（`YYYY-MM-DD`）。抽出来是为了测试能替换掉。"""
+        return datetime.now().strftime("%Y-%m-%d")
+
+    # ------------------------------------------------------------ 同步流程
+
+    def start_sync(self):
+        """点「同步数据」：这时候才去联网、才要验证码。"""
+        if self.syncing:
+            return
+        self.syncing = True
+        self._set_sync_button()
+        self._busy_note("正在连接学校自助服务…")
+        self._run(self._job_session)
+
+    def _on_synced(self, payload):
+        """同步成功：合并进本地历史 → 写盘 → 重画。
+
+        🔴 合并规则是**用户明确要求的**（2026-10-12）：同一天数据不同就
+        远端覆盖本地，本地没有的日期直接存 —— 具体在 `self_history.merge()`。
+        """
+        self.data = payload
+        days = payload.get("days") or []
+        today = (payload.get("summary") or {}).get("today")
+        added, updated = self_history.merge(self.store, self.account, days, today)
+        self_history.mark_updated(self.store, self.account,
+                                  datetime.now().strftime("%Y-%m-%d %H:%M"))
+        ok, why = self_history.save(SELF_FLOW_FILE, self.store)
+        if not ok:
+            log("本地流量历史写盘失败：%s" % why)
+        self.note = ("已同步：新增 %d 天、更新 %d 天%s"
+                     % (added, updated, "" if ok else "（但本地存不下，见日志）"))
+        self.syncing = False
+        self._render()
+
+    # ------------------------------------------------------------ 本地历史
+
+    def _load_local(self):
+        """只读本地历史（**不联网**）。"""
+        self.store, self.store_why = self_history.load(SELF_FLOW_FILE)
+        if self.store_why:
+            log("上网数据面板：%s" % self.store_why)
+
+    def clear_history(self):
+        """清掉**当前账号**的本机历史（只删这个账号，不动别人的）。"""
+        if not self_history.days_of(self.store, self.account):
+            self.note = "本机没有 %s 的流量历史" % self.account
+            self._render()
+            return
+        if not self._ask_yes_no("清掉本机保存的 %s 的流量历史吗？\n"
+                                "（清掉之后就只剩学校那边最近 30 天的数据了）"
+                                % self.account):
+            return
+        n = self_history.clear(self.store, self.account)
+        ok, why = self_history.save(SELF_FLOW_FILE, self.store)
+        if not ok:
+            log("本地流量历史写盘失败：%s" % why)
+        self.note = "已清掉 %s 的本机历史（%d 个账号）" % (self.account, n)
+        self._render()
+
+    def _ask_yes_no(self, msg):
+        """确认框。`self.ask` 被测试替换掉时就不弹模态框了。
+
+        ⚠️ 模态框会把无人值守的自动化**挂住**（项目里 `--guitest` 吃过这个亏），
+           所以凡是新增模态框，都要留一条能被替换掉的路。
+        """
+        if self.ask is not None:
+            return bool(self.ask(msg))
+        try:
+            from tkinter import messagebox
+            return bool(messagebox.askyesno(APP_TITLE, msg, parent=self.win))
+        except Exception:
+            log("上网数据面板确认框失败:\n%s" % traceback.format_exc())
+            return False
+
     # ------------------------------------------------------------ 渲染
 
     def _clear(self):
@@ -5554,7 +5781,7 @@ class SelfServiceWindow(object):
             self.tk.Label(self.body, text=title, bg=BG, fg=SUB,
                           font=(self.fam, self.base - 1)
                           ).pack(anchor="w", pady=(8, 4))
-        cv, inner = round_panel(self.body, self.tk, 14, 12, 11)
+        cv, inner = round_panel(self.body, self.tk, _CARD_PAD_X, 12, 11)
         cv.pack(fill="x")
         return inner
 
@@ -5567,24 +5794,373 @@ class SelfServiceWindow(object):
                       font=(self.fam, self.base, "bold" if bold else "normal")
                       ).pack(side="right")
 
-    def _busy(self, text):
+    def _busy_note(self, text):
+        """把正文换成一句「正在…」。**只用在同步过程中**（那时没有别的东西可看）。"""
         self._clear()
         inner = self._card(None)
         self.tk.Label(inner, text=text, bg=CARD, fg=SUB,
                       font=(self.fam, self.base)).pack(anchor="w")
+        self._autosize()
+
+    def _set_sync_button(self):
+        """同步中把按钮禁用 —— 否则用户会连点，每次都发一次登录请求，
+        把 3 次闸门白白耗掉。
+
+        ⚠️ **只改 state，不改文字**：`round_button` 的兼容性契约里只有
+           `state`（见它的文档），`configure(text=...)` 会抛 TclError。
+           2026-10-12 实测过：写在 `try/except` 里的话它**静默失败**，
+           按钮看着还是「同步数据」—— 但 `state` 是同一个调用里先处理的，
+           所以「变灰」是生效的。
+           「正在进行到哪一步」由正文的提示文字负责（正在连接 / 正在登录），
+           比按钮上三个点清楚得多，所以这里不折腾文字。
+        """
+        try:
+            self.btn_sync.configure(state="disabled" if self.syncing else "normal")
+        except Exception:
+            log("上网数据面板按钮状态失败:\n%s" % traceback.format_exc())
+
+    def _render(self):
+        """按当前状态把整个面板重画一遍。**所有界面改动只从主线程调这里。**"""
+        if self.closed:
+            return
+        self._set_sync_button()
+        self._clear()
+        if self.data is not None:
+            self._card_account(self.data)
+        self._card_flow()
+        if self.data is not None:
+            self._card_devices(self.data.get("devices") or [])
+        self._foot_note()
+        self._autosize()
+
+    def _foot_note(self):
+        days = self_history.days_of(self.store, self.account)
+        stamp = self_history.updated_at(self.store, self.account)
+        if days:
+            span = "%s ~ %s，共 %d 天" % (days[0]["date"], days[-1]["date"], len(days))
+            txt = "本机存了 %s。上次同步：%s。" % (span, stamp or "（没有记录）")
+        else:
+            txt = ("本机还没存过 %s 的流量数据 —— 点右上角「同步数据」读一次，"
+                   "以后不登录也能看。" % self.account)
+        if self.store_why:
+            txt += "\n⚠️ %s" % self.store_why
+        self.tk.Label(self.body, text=txt, bg=BG, fg=SUB, justify="left",
+                      wraplength=CHART_W, font=(self.fam, self.base - 2)
+                      ).pack(anchor="w", pady=(8, 0))
+        if getattr(self, "note", ""):
+            self.tk.Label(self.body, text=self.note, bg=BG, fg=BLUE_DARK,
+                          justify="left", wraplength=CHART_W,
+                          font=(self.fam, self.base - 2)).pack(anchor="w", pady=(2, 0))
+
+    # ------------------------------------------------------------ 账号卡
+
+    def _card_account(self, d):
+        f, t = d.get("flow") or {}, d.get("time") or {}
+        inner = self._card("账号")
+        self._row(inner, "账号状态", d.get("status") or "-")
+        self._row(inner, "上网套餐", d.get("plan") or "-")
+        self._row(inner, "套餐到期", d.get("expire") or "-")
+        self._row(inner, "计费日", d.get("billing_day") or "-")
+        # 余额只在按金额扣费（chargeType == "1"）时才有意义 ——
+        # 和学校网页的显示条件一致，别在套餐制下显示一个恒为 0 的"余额"。
+        if str(d.get("charge_type")) == "1":
+            self._row(inner, "余额", "%.2f 元" % (d.get("balance") or 0.0))
+        lim = []
+        if f.get("limit"):
+            lim.append("流量 %s" % f["limit"])
+        if t.get("limit"):
+            lim.append("时长 %s" % t["limit"])
+        if lim:
+            self.tk.Label(inner, text="限额：" + "　".join(lim), bg=CARD, fg=SUB,
+                          font=(self.fam, self.base - 1)
+                          ).pack(anchor="w", pady=(6, 0))
+        # 累计是**学校那边**的数（本机历史里没有它 —— 我们只攒每日明细，
+        # 而每日明细只覆盖服务端给的那 30 天窗口）。
+        # 明确写「学校」二字，免得和上面图表里的「共计」混淆 ——
+        # 那两个数**本来就该不一样**（一个是全部历史、一个是本机攒下来的）。
+        self.tk.Label(inner,
+                      text="学校记录：累计 %s　时长 %s"
+                           % (self_service.fmt_flow(f.get("total")),
+                              self_service.fmt_hours(t.get("total") or 0)),
+                      bg=CARD, fg=SUB, font=(self.fam, self.base - 2)
+                      ).pack(anchor="w", pady=(6, 0))
+
+    # ------------------------------------------------------------ 设备卡
+
+    def _card_devices(self, dev):
+        inner = self._card("在线设备（%d 台）" % len(dev))
+        if not dev:
+            self.tk.Label(inner, text="当前没有设备在线", bg=CARD, fg=SUB,
+                          font=(self.fam, self.base)).pack(anchor="w")
+            return
+        for i, x in enumerate(dev):
+            if i:
+                self.tk.Frame(inner, bg=LINE, height=1).pack(fill="x", pady=6)
+            # 🔴 排版顺序是**用户要求的**（2026-10-12）：
+            #    ① 设备类型（Windows / Android…）② 上线时间 ③ 其余写小字。
+            #    原来第一行是 IP + MAC，一眼看不出「这是哪台设备」。
+            top = self.tk.Frame(inner, bg=CARD)
+            top.pack(fill="x")
+            # `osInfo` 实测是 "Windows" 这种人类可读的串；空的话**不许猜**
+            # （`terminalType` 是 "a" 这种代码，含义没验证过）。
+            self.tk.Label(top, text=(x.get("os") or "未知设备"), bg=CARD, fg=FG,
+                          font=(self.fam, self.base + 1, "bold")).pack(side="left")
+            since = x.get("since") or ""
+            if since:
+                self.tk.Label(top, text="%s 上线" % since, bg=CARD, fg=SUB,
+                              font=(self.fam, self.base - 1)).pack(side="right")
+            extra = [x.get("ip") or "-", x.get("mac") or "-"]
+            if x.get("nas"):
+                extra.append(x["nas"])
+            # ⚠️ **故意不显示 `kind`（`terminalType`）**：实测那个字段是 "a"
+            #    这种**代码**，含义没验证过。显示成「类型 a」对用户毫无意义，
+            #    而猜它的含义（1=电脑 2=手机…）就是编 —— 两条都不能要。
+            #    ⚠️ 数据层**仍然保留**这个字段（白名单里），只是界面不用。
+            self.tk.Label(inner, text="　".join(extra), bg=CARD, fg=SUB,
+                          justify="left", wraplength=CHART_W - 20,
+                          font=(self.fam, self.base - 2)).pack(anchor="w")
+
+    # ------------------------------------------------------------ 图表卡
+
+    def _card_flow(self):
+        """流量图表卡：按天/按月 + 月份导航 + 柱状图 + 汇总行。
+
+        数据来自**本机历史**（`self_history`），不来自这次联网 ——
+        所以没同步过也能看（只要以前同步过）。
+        """
+        days = self_history.days_of(self.store, self.account)
+        inner = self._card("数据流量")
+        bar = self.tk.Frame(inner, bg=CARD)
+        bar.pack(fill="x")
+        for key, label in (("day", "按天"), ("month", "按月")):
+            on = (self.view == key)
+            round_chip(bar, self.tk, label, (self.fam, self.base - 1),
+                       "#ffffff" if on else SUB,
+                       BLUE if on else "#eef1f6", page=CARD, height=22,
+                       hover=None if on else "#e2e8f0",
+                       command=(lambda k=key: self.set_view(k))).pack(
+                side="left", padx=(0, 6))
+        if self.view == "day" and days:
+            self._month_nav(bar, days)
+        self.tk.Label(bar, text="单位：MB / GB", bg=CARD, fg=SUB,
+                      font=(self.fam, self.base - 3)).pack(side="right")
+
+        if not days:
+            cv = self.tk.Canvas(inner, bg=CARD, highlightthickness=0, bd=0,
+                                width=CHART_W, height=110)
+            cv.pack(fill="x")
+            cv.create_text(CHART_W / 2, 50, text="（本机还没有流量数据）",
+                           fill=SUB, font=(self.fam, self.base))
+            cv.create_text(CHART_W / 2, 74,
+                           text="点右上角「同步数据」读一次，以后不登录也能看",
+                           fill=SUB, font=(self.fam, self.base - 2))
+            return
+
+        bars = self._series(days)
+        self._draw_bars(inner, bars)
+        self._summary_rows(inner, bars)
+
+    def _month_nav(self, parent, days):
+        """‹ 10月 › —— 只在按天视图出现，切的是「看哪个月」。"""
+        months = sorted({d["date"][:7] for d in days})
+        if not self.ym or self.ym not in months:
+            self.ym = months[-1]
+        i = months.index(self.ym)
+        nav = self.tk.Frame(parent, bg=CARD)
+        nav.pack(side="left", padx=(6, 0))
+        prev = "‹" if i > 0 else " "
+        nxt = "›" if i < len(months) - 1 else " "
+        for sym, delta, enabled in ((prev, -1, i > 0),
+                                    (nxt, +1, i < len(months) - 1)):
+            if sym == " ":
+                continue
+            round_chip(nav, self.tk, sym, (self.fam, self.base), BLUE_DARK,
+                       BLUE_SOFT, page=CARD, height=20, hover="#d3e0ff",
+                       command=(lambda d=delta: self.shift_month(d))
+                       ).pack(side="left", padx=(0, 4))
+        self.tk.Label(nav, text="%s 年 %s 月" % (self.ym[:4], int(self.ym[5:])),
+                      bg=CARD, fg=FG, font=(self.fam, self.base - 1, "bold")
+                      ).pack(side="left", padx=(4, 0))
+
+    def set_view(self, key):
+        if key not in ("day", "month") or key == self.view:
+            return
+        self.view = key
+        self.note = ""
+        self._render()
+
+    def shift_month(self, delta):
+        days = self_history.days_of(self.store, self.account)
+        months = sorted({d["date"][:7] for d in days})
+        if self.ym in months:
+            i = months.index(self.ym) + delta
+            if 0 <= i < len(months):
+                self.ym = months[i]
+                self._render()
+
+    def _series(self, days):
+        """当前视图要画的柱子：`[{"label":…, "value": MB, "tip":…}, …]`。"""
+        if self.view == "month":
+            return [{"label": "%d月" % int(m["month"][5:]),
+                     "value": m["flow"],
+                     "tip": "%s（%d 天）" % (m["month"], m["n"])}
+                    for m in self_history.group_by_month(days)]
+        ym = self.ym or days[-1]["date"][:7]
+        return [{"label": str(int(d["date"][8:10])),
+                 "value": d["flow"],
+                 "tip": d["date"]}
+                for d in days if d["date"][:7] == ym]
+
+    def _draw_bars(self, parent, bars):
+        """自绘柱状图。
+
+        ⚠️ 三条「不这么写就会难看/看不懂」的规矩：
+
+          1. **柱顶数值标签要自动避让。** 一个月最多 31 根柱子，`CHART_W`
+             放不下 31 个「12.34 GB」。所以按可用间距决定「每隔几根标一个」，
+             但**最高的那根永远标** —— 那是用户最想看的一个数。
+          2. **日期刻度同理**，挤不下就隔几根标一个。
+          3. **`None` 不是 0。** 服务端没给某天就是没这根柱子（画成空位），
+             而「确实用了 0」要画成一根 0 高度的柱子。两者不能混
+             （`self_history` 那边已经把 `None` 保住了，这里别把它当 0）。
+        """
+        cv = self.tk.Canvas(parent, bg=CARD, highlightthickness=0, bd=0,
+                            width=CHART_W, height=CHART_H + 30)
+        cv.pack(fill="x")
+        n = len(bars)
+        if not n:
+            cv.create_text(CHART_W / 2, CHART_H / 2, text="这个月没有数据",
+                           fill=SUB, font=(self.fam, self.base - 1))
+            return
+
+        top_pad = 30                      # 柱顶标签要占的高度
+        base_y = CHART_H                  # x 轴（柱子从这里往上长）
+        plot_h = base_y - top_pad
+        vmax = max(float(b["value"] or 0.0) for b in bars) or 1.0
+        slot = float(CHART_W) / n
+        # 柱宽：跟着间距走，但**上下都夹住** ——
+        # 下限 4px（一个月 31 根时还能看见），上限 44px
+        # （只画 2 个月时不然会变成两根巨大的色块）。
+        bw = max(4.0, min(44.0, slot * 0.56))
+
+        # x 轴
+        cv.create_line(0, base_y, CHART_W, base_y, fill=LINE)
+
+        # 日均线（虚线）。**它算的是「本图这几根柱子」的平均**，
+        # 和下面汇总里那个「日均」是**同一个口径**（2026-10-12 实测发现：
+        # 原来一个按图算、一个按全部历史算，同屏出现两个不同的「日均」，
+        # 看着就像算错了）。所以两处的标签必须能对上。
+        total = sum(float(b["value"] or 0.0) for b in bars)
+        avg = total / n
+        if avg > 0:
+            ay = base_y - plot_h * (avg / vmax)
+            cv.create_line(0, ay, CHART_W, ay, fill="#c7d2fe", dash=(4, 3))
+            cv.create_text(CHART_W - 2, ay - 7, anchor="e",
+                           text="日均 %s" % self_service.fmt_flow_short(avg),
+                           fill=SUB, font=(self.fam, self.base - 4))
+
+        # 柱顶标签要隔几根标一个（最高的那根永远标）
+        lab_w = 62.0
+        step = max(1, int(lab_w / slot) + (1 if slot < lab_w else 0))
+        day_step = max(1, int(16.0 / slot) + (1 if slot < 16.0 else 0))
+        imax = max(range(n), key=lambda i: float(bars[i]["value"] or 0.0))
+
+        for i, b in enumerate(bars):
+            cx = slot * (i + 0.5)
+            v = float(b["value"] or 0.0)
+            hgt = plot_h * (v / vmax)
+            if hgt > 0:
+                cv.create_rectangle(cx - bw / 2, base_y - hgt, cx + bw / 2,
+                                    base_y, fill=BLUE, outline="")
+            else:
+                # 确实用了 0 ⇒ 画一小段浅色，和「没有这根柱子」区分开
+                cv.create_rectangle(cx - bw / 2, base_y - 2, cx + bw / 2,
+                                    base_y, fill="#cbd5e1", outline="")
+            if i == imax or i % step == 0:
+                cv.create_text(cx, base_y - hgt - 11,
+                               text=self_service.fmt_flow_short(v),
+                               fill=FG if i == imax else SUB,
+                               font=(self.fam, self.base - 4,
+                                     "bold" if i == imax else "normal"))
+            if i % day_step == 0 or i == n - 1:
+                cv.create_text(cx, base_y + 14, text=b["label"], fill=SUB,
+                               font=(self.fam, self.base - 3))
+
+    def _summary_rows(self, parent, bars):
+        """图表下面那几行汇总。
+
+        🔴 **口径必须写在界面上**（2026-10-12 实测踩出来的）：第一版里
+        「共计」按**全部本机历史**算、「日均」按**本图这几根柱子**算，
+        同屏出现两个不同口径的数，看着就像算错了。
+        现在分两段写清楚：一段「本机全部（N 天）」，一段「本图 N 天」，
+        而且图上那条日均虚线 = 下面「本图」的日均（**同一个口径**）。
+
+        🔴 上行/下行是**「知道的那几天」的和**，并且把天数写出来
+        （`8/9 天`）—— 因为**今天的上下行服务端不给**（实测），
+        而今天几乎总在明细里。写成「一天不知道就显示 —」的话，
+        用户要看的这个数就永远看不到（见 `self_history.summarize` 的说明）。
+        """
+        days = self_history.days_of(self.store, self.account)
+        s = self_history.summarize(days)
+        grid = self.tk.Frame(parent, bg=CARD)
+        grid.pack(fill="x", pady=(10, 0))
+
+        def cell(r, c, name, value, bold=False):
+            self.tk.Label(grid, text=name, bg=CARD, fg=SUB,
+                          font=(self.fam, self.base - 1)
+                          ).grid(row=r, column=c * 2, sticky="w", padx=(0, 4))
+            self.tk.Label(grid, text=value, bg=CARD, fg=FG,
+                          font=(self.fam, self.base - 1,
+                                "bold" if bold else "normal")
+                          ).grid(row=r, column=c * 2 + 1, sticky="w",
+                                 padx=(0, 18))
+
+        def part(v, known, n):
+            """带「算了几天的」后缀 —— 全部都有值时就不加，免得啰嗦。"""
+            if v is None:
+                return "—"
+            txt = self_service.fmt_flow(v)
+            if known < n:
+                txt += "（%d/%d 天）" % (known, n)
+            return txt
+
+        self.tk.Label(grid, text="本机全部（%d 天）" % s["n"], bg=CARD, fg=SUB,
+                      font=(self.fam, self.base - 1, "bold")
+                      ).grid(row=0, column=0, columnspan=4, sticky="w")
+        cell(1, 0, "共计", self_service.fmt_flow(s["flow"]), True)
+        cell(1, 1, "时长",
+             self_service.fmt_hours(s["hours"]) if s["hours"] is not None else "—")
+        cell(2, 0, "上行", part(s["up"], s["up_days"], s["n"]))
+        cell(2, 1, "下行", part(s["down"], s["down_days"], s["n"]))
+
+        if bars:
+            got = sum(float(b["value"] or 0.0) for b in bars)
+            scope = ("本图 %d 天" % len(bars)) if self.view == "day" \
+                else ("本图 %d 个月" % len(bars))
+            self.tk.Label(grid, text="%s：共计 %s　日均 %s"
+                          % (scope, self_service.fmt_flow(got),
+                             self_service.fmt_flow(got / len(bars))),
+                          bg=CARD, fg=SUB, font=(self.fam, self.base - 2)
+                          ).grid(row=3, column=0, columnspan=4, sticky="w",
+                                 pady=(4, 0))
+
+    # ------------------------------------------------------------ 验证码 / 失败
 
     def _draw_fail(self, msg):
         self._clear()
         inner = self._card(None)
         self.tk.Label(inner, text="读不到数据", bg=CARD, fg=DANGER,
                       font=(self.fam, self.base, "bold")).pack(anchor="w")
-        self.tk.Label(inner, text=msg, bg=CARD, fg=FG, wraplength=380,
+        self.tk.Label(inner, text=msg, bg=CARD, fg=FG, wraplength=CHART_W - 20,
                       justify="left", font=(self.fam, self.base)
                       ).pack(anchor="w", pady=(6, 0))
         self.tk.Label(inner,
-                      text="（这个功能要连上校园网、并且学校自助服务能访问才行）",
-                      bg=CARD, fg=SUB, wraplength=380, justify="left",
+                      text="（这个功能要连上校园网、并且学校自助服务能访问才行。\n"
+                           "　本机已经存下来的流量历史不受影响，下次点「同步数据」再试）",
+                      bg=CARD, fg=SUB, wraplength=CHART_W - 20, justify="left",
                       font=(self.fam, self.base - 1)).pack(anchor="w", pady=(6, 0))
+        self._back_row(inner)
+        self._autosize()
 
     def _draw_captcha(self, png, note=None):
         """画验证码输入界面。`note` 非空时显示成一行红色提示（验证码错了）。"""
@@ -5598,7 +6174,7 @@ class SelfServiceWindow(object):
                 #    data= 接受 base64 字符串。
                 self._cap_small = self.tk.PhotoImage(
                     data=base64.b64encode(png).decode("ascii"))
-                # 130x40 → 520x160（放大倍数见 CAPTCHA_ZOOM，和窗口 minsize 绑定）
+                # 130x40 → 520x160（放大倍数见 CAPTCHA_ZOOM，和窗口宽度绑定）
                 self._cap_big = self._cap_small.zoom(CAPTCHA_ZOOM)
             except Exception:
                 log("验证码图片渲染失败:\n%s" % traceback.format_exc())
@@ -5656,7 +6232,25 @@ class SelfServiceWindow(object):
                          radius=pill_radius(h)).pack(side="left", padx=(0, 8))
         round_chip(btns, self.tk, "换一张", (self.fam, self.base),
                    BLUE_DARK, BLUE_SOFT, page=CARD, height=h,
-                   command=self._renew).pack(side="left")
+                   command=self._renew).pack(side="left", padx=(0, 8))
+        round_chip(btns, self.tk, "取消", (self.fam, self.base), SUB,
+                   "#eef1f6", page=CARD, height=h, hover="#e2e8f0",
+                   command=self._cancel).pack(side="left")
+        self._autosize()
+
+    def _back_row(self, inner):
+        """一行「返回」——失败页/验证码页用它回到数据页。"""
+        btns = self.tk.Frame(inner, bg=CARD)
+        btns.pack(pady=(10, 2))
+        h = self.base * 2 + 8
+        round_chip(btns, self.tk, "返回", (self.fam, self.base), BLUE_DARK,
+                   BLUE_SOFT, page=CARD, height=h,
+                   command=self._cancel).pack(side="left")
+
+    def _cancel(self):
+        """取消同步 / 返回：回到「本机历史」那个视图（不登录也看得到）。"""
+        self.syncing = False
+        self._render()
 
     def _draw_login_err(self, msg):
         """🔴 非验证码类的登录失败 —— **不许重试**。"""
@@ -5664,15 +6258,17 @@ class SelfServiceWindow(object):
         inner = self._card(None)
         self.tk.Label(inner, text="登录不上自助服务", bg=CARD, fg=DANGER,
                       font=(self.fam, self.base, "bold")).pack(anchor="w")
-        self.tk.Label(inner, text=msg, bg=CARD, fg=FG, wraplength=380,
+        self.tk.Label(inner, text=msg, bg=CARD, fg=FG, wraplength=CHART_W - 20,
                       justify="left", font=(self.fam, self.base)
                       ).pack(anchor="w", pady=(6, 0))
         self.tk.Label(inner,
                       text="这不是验证码的问题。\n"
                            "如果提示密码不对，请先在主界面把密码改对再试。\n"
                            "（这里**故意不再重试** —— 反复登录失败可能被学校锁号）",
-                      bg=CARD, fg=SUB, wraplength=380, justify="left",
+                      bg=CARD, fg=SUB, wraplength=CHART_W - 20, justify="left",
                       font=(self.fam, self.base - 1)).pack(anchor="w", pady=(6, 0))
+        self._back_row(inner)
+        self._autosize()
 
     def _submit(self):
         if self.tries >= SELF_LOGIN_MAX:
@@ -5680,80 +6276,21 @@ class SelfServiceWindow(object):
         e = self._entry
         if e is None:
             return
-        code = (e.get() or "").strip()
+        try:
+            code = (e.get() or "").strip()
+        except Exception:
+            # 控件已经被 destroy 了（比如界面刚被重画）—— 当作没输入
+            return
         if not code:
             return
         e.configure(state="disabled")
-        self._busy("正在登录…")
+        self._busy_note("正在登录…")
         self._run(lambda: self._job_login(code))
 
     def _renew(self):
         """换一张验证码。**不计入登录次数**（没发登录请求）。"""
-        self._busy("正在取新验证码…")
+        self._busy_note("正在取新验证码…")
         self._run(self._job_captcha)
-
-    def _draw_data(self, d):
-        self._clear()
-        f, t = d.get("flow") or {}, d.get("time") or {}
-
-        inner = self._card("账号")
-        self._row(inner, "账号状态", d.get("status") or "-")
-        self._row(inner, "上网套餐", d.get("plan") or "-")
-        self._row(inner, "套餐到期", d.get("expire") or "-")
-        self._row(inner, "计费日", d.get("billing_day") or "-")
-        # 余额只在按金额扣费（chargeType == "1"）时才有意义 ——
-        # 和学校网页的显示条件一致，别在套餐制下显示一个恒为 0 的"余额"。
-        if str(d.get("charge_type")) == "1":
-            self._row(inner, "余额", "%.2f 元" % (d.get("balance") or 0.0))
-
-        inner = self._card("用量")
-        tbl = self.tk.Frame(inner, bg=CARD)
-        tbl.pack(fill="x")
-        for col, txt in enumerate(("", "今日", "本月", "累计")):
-            self.tk.Label(tbl, text=txt, bg=CARD, fg=SUB,
-                          font=(self.fam, self.base - 1)
-                          ).grid(row=0, column=col, sticky="w", padx=(0, 14))
-        for row, (name, k) in enumerate((("流量", "flow"), ("时长", "time")), 1):
-            src = f if k == "flow" else t
-            fmt = self_service.fmt_flow if k == "flow" else self_service.fmt_hours
-            self.tk.Label(tbl, text=name, bg=CARD, fg=SUB,
-                          font=(self.fam, self.base)).grid(row=row, column=0,
-                                                           sticky="w")
-            for col, key in enumerate(("today", "month", "total"), 1):
-                self.tk.Label(tbl, text=fmt(src.get(key)), bg=CARD, fg=FG,
-                              font=(self.fam, self.base, "bold")
-                              ).grid(row=row, column=col, sticky="w",
-                                     padx=(0, 14))
-        lim = []
-        if f.get("limit"):
-            lim.append("流量 %s" % f["limit"])
-        if t.get("limit"):
-            lim.append("时长 %s" % t["limit"])
-        if lim:
-            self.tk.Label(inner, text="限额：" + "　".join(lim), bg=CARD, fg=SUB,
-                          font=(self.fam, self.base - 1)
-                          ).pack(anchor="w", pady=(6, 0))
-
-        dev = d.get("devices") or []
-        inner = self._card("在线设备（%d 台）" % len(dev))
-        if not dev:
-            self.tk.Label(inner, text="当前没有设备在线", bg=CARD, fg=SUB,
-                          font=(self.fam, self.base)).pack(anchor="w")
-        for x in dev:
-            self.tk.Label(inner, text="%s　%s" % (x.get("ip") or "-",
-                                                  x.get("mac") or "-"),
-                          bg=CARD, fg=FG,
-                          font=(self.fam, self.base, "bold")).pack(anchor="w")
-            self.tk.Label(inner,
-                          text="%s　%s 上线" % (x.get("os") or "-",
-                                                x.get("since") or "-"),
-                          bg=CARD, fg=SUB,
-                          font=(self.fam, self.base - 1)).pack(anchor="w")
-
-        self.tk.Label(self.body,
-                      text="数据来自学校自助服务，只读；本窗口关掉后不会保存任何东西。",
-                      bg=BG, fg=SUB, font=(self.fam, self.base - 2)
-                      ).pack(anchor="w", pady=(8, 0))
 
 
 class LoginApp:

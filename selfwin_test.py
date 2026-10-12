@@ -9,10 +9,15 @@
       · 🔴 `PhotoImage` 没留引用 → 图片被 GC 掉，Label 一片空白，**不报错**
       · `round_panel(pad_x/pad_y < radius)` → 圆角被白方块糊掉，**不报错**
       · 控件被摆到窗口外 / 挤没了 → **不报错**
-      · `_entry` 指向已经 destroy 掉的控件 → 只有特定点击顺序才炸
+      · 容器（Canvas）比内容窄 → 内容被**静默裁掉**，只能量尺寸才发现
 
     所以这一档**真的 `tk.Tk()` 建窗口**，而且**真的把事件循环转起来**
-    （`root.update()` 轮询），让它走完「取验证码 → 画界面 → 提交 → 画数据」。
+    （`root.update()` 轮询），让它走完「画界面 → 点同步 → 验证码 → 数据 → 重画」。
+
+🔴 2026-10-12 第二版：面板改成了**离线优先**（打开不联网、点「同步数据」才要
+    验证码），所以这个文件也跟着改了 —— 现在它同时钉两件事：
+      · **打开面板时一次网络都不能发**（发一次就意味着用户又要读验证码）；
+      · 点同步之后整条链路（验证码 → 登录 → 合并写盘 → 重画）真的走通。
 
 🔴 为什么归 `env` 档，不归 `fast` 档：
     它要真桌面（真建窗口、真跑事件循环）。项目里所有建真窗口的脚本
@@ -28,8 +33,8 @@
     所以「不联网」是**被强制**的，不是靠自觉。末尾还会断言
     **所有请求都不是在 Tk 主线程上发的**（发在主线程会把界面冻住）。
 
-🔴 **不碰真实数据**：先 `datasafe.sandbox()`。面板出错时会走 `log()` 写日志，
-    不沙箱就会写到真实数据目录里。收尾还有 `datasafe.assert_untouched()`。
+🔴 **不碰真实数据**：先 `datasafe.sandbox()`（面板会写本地流量历史）。
+    收尾还有 `datasafe.assert_untouched()`。
 
 用法：
     python selfwin_test.py
@@ -49,6 +54,7 @@ sys.path.insert(0, HERE)
 
 import datasafe                # noqa: E402  （import 它就会 import campus_login）
 import proc_tree               # noqa: E402
+import self_history as H       # noqa: E402
 import self_service as S       # noqa: E402
 
 C = datasafe.C                 # campus_login 模块（和 datasafe 里那个是同一个）
@@ -92,6 +98,20 @@ CAPTCHA_PNG = _make_captcha()
 
 # ---------------------------------------------------------------- 假数据层
 
+# 这三天的数**照抄实测那份 dump.json**（2026-10-09~11），
+# 包括「上行 + 下行 == 合计」这个已经验过的性质。
+FAKE_DAYS = [
+    {"date": "2026-10-09", "flow": 3906.4059, "up": 683.3043,
+     "down": 3223.1016, "hours": 22.0},
+    {"date": "2026-10-10", "flow": 3463.7843, "up": 1186.5343,
+     "down": 2277.2500, "hours": 18.0},
+    {"date": "2026-10-11", "flow": 3936.1761, "up": 973.9739,
+     "down": 2962.2022, "hours": 20.0},
+]
+# 今天：**上下行是 None**（服务端不给，实测）
+FAKE_TODAY = {"date": "2026-10-12", "flow": 2428.691523,
+              "up": None, "down": None, "hours": 14.002222}
+
 FAKE_DATA = {
     "status": "正常",
     "plan": "校园网电信融合套餐",
@@ -100,12 +120,18 @@ FAKE_DATA = {
     "billing_day": "2026-10-06",
     "charge_type": "1",
     "balance": 12.5,
-    "flow": {"today": 123.5, "month": 18454.78, "total": 99000.0,
-             "limit": "100 GB"},
-    "time": {"today": 3.25, "month": 120.5, "total": 999.0, "limit": "不限"},
-    "devices": [{"ip": "10.1.2.3", "mac": "AA-BB-CC-DD-EE-FF",
-                 "since": "2026-10-12 08:00", "os": "Windows",
-                 "nas": "NAS1", "kind": "PC"}],
+    "flow": {"today": 2428.691523, "month": 18454.782751,
+             "total": 690876.003675, "limit": "不限制"},
+    "time": {"today": 14.002222, "month": 104.017223,
+             "total": 3355.498325, "limit": "不限制"},
+    "days": FAKE_DAYS,
+    "summary": {"today": FAKE_TODAY,
+                "total": {"flow": 690876.003675, "hours": 3355.498325},
+                "month": {"flow": 18454.782751, "hours": 104.017223},
+                "limit": {"flow": "不限制", "hours": "不限制"}},
+    "devices": [{"ip": "10.15.116.156", "mac": "84:9E:56:40:69:1D",
+                 "since": "2026-10-12 09:37:49", "os": "Windows",
+                 "nas": "ZZHK-ZAX-BRAS", "kind": "a"}],
 }
 
 
@@ -119,15 +145,15 @@ class FakeSvc(object):
     made = 0                  # 被建了几个（用来确认真的换成了替身）
     off_main = True           # 所有请求是否都发生在**非**主线程
     last_login = None         # 最后一次 login 的实参
+    calls = []                # 所有请求的名字（**用来验「打开面板时一次都没发」**）
     script = {}
 
     def __init__(self, base=None, timeout=None):
         FakeSvc.made += 1
         self.base = base
-        self.calls = []
 
     def _note(self, name):
-        self.calls.append(name)
+        FakeSvc.calls.append(name)
         if threading.current_thread() is threading.main_thread():
             FakeSvc.off_main = False
 
@@ -158,7 +184,7 @@ class FakeSvc(object):
             # **非** SelfError —— 专门用来验「后台任务崩了界面也得看得见」
             raise RuntimeError("假装代码写错了")
 
-    def load(self, account):
+    def load(self, account, today=None):
         self._note("load")
         return json.loads(json.dumps(FAKE_DATA))    # 深拷贝，防被测代码改到
 
@@ -194,11 +220,17 @@ def all_widgets(w):
 
 
 def texts_of(w):
-    """界面上所有看得见的文字。
+    """界面上所有看得见的文字。**包括 Canvas 上画的**。
 
-    ⚠️ `round_chip` / `round_button` 是 Canvas 画的，文字**不在** `cget("text")`
-       里，而是挂在 `_rb_text` 上（见 round_chip 的说明）。只查 `cget` 的话
-       按钮文字会被整个漏掉 —— 那样「确定按钮还在不在」这条断言就永远是假绿。
+    ⚠️ 两层都得捞，少一层就是「假绿」：
+
+      · `round_chip` / `round_button` 是 Canvas 画的，文字**不在**
+        `cget("text")` 里，而是挂在 `_rb_text` 上（见 round_chip 的说明）。
+        只查 `cget` 的话按钮文字会被整个漏掉。
+      · 🔴 图表（柱顶数值、日期刻度、空状态提示）是 `create_text` 画的 ——
+        那**根本不是控件**，`winfo_children()` 遍历不到。不捞这一层，
+        「柱顶有没有标值」这类断言就会**永远为假却也不报错**
+        （2026-10-12 实测：`本机还没有流量数据` 那句就是这么漏掉的）。
     """
     out = []
     for c in all_widgets(w):
@@ -211,6 +243,14 @@ def texts_of(w):
             t = getattr(c, "_rb_text", None)
         if t:
             out.append(str(t))
+        try:
+            for item in c.find_all():
+                if c.type(item) == "text":
+                    t2 = c.itemcget(item, "text")
+                    if t2:
+                        out.append(str(t2))
+        except Exception:
+            pass          # 不是 Canvas（find_all 会抛）—— 正常
     return out
 
 
@@ -225,6 +265,17 @@ def images_of(w):
         if v:
             out.append((c, str(v)))
     return out
+
+
+def canvas_items(w):
+    """界面上所有 Canvas 里画了几个图元（柱状图的柱子就是图元）。"""
+    n = 0
+    for c in all_widgets(w):
+        try:
+            n += len(c.find_all())
+        except Exception:
+            pass
+    return n
 
 
 def tk_image_size(root, name):
@@ -255,9 +306,60 @@ def pump(root, seconds=6.0, until=None):
     return bool(until is None or until())
 
 
-def has_text(win, *needles):
-    t = texts_of(win)
-    return all(any(n in x for x in t) for n in needles)
+def open_panel(root, account="2507210230"):
+    """开一个面板（**不跑它自己的网络流程** —— 打开面板本来就不联网）。"""
+    return C.SelfServiceWindow(root, _tk(), *_font(root), account,
+                               "not-a-real-pwd", "http://202.196.169.246")
+
+
+def reset_fake():
+    FakeSvc.script = {}
+    FakeSvc.made = 0
+    FakeSvc.off_main = True
+    FakeSvc.last_login = None
+    FakeSvc.calls = []
+
+
+def reset_history():
+    """把沙箱里的本地历史清干净（每个用例开始前调）。"""
+    try:
+        os.remove(C.SELF_FLOW_FILE)
+    except OSError:
+        pass
+
+
+def seed_history(account="2507210230", days=None):
+    """往沙箱里的本地历史塞几天数据，返回写进去的 store。"""
+    store, _ = H.load(C.SELF_FLOW_FILE)
+    H.merge(store, account, days if days is not None else FAKE_DAYS[:2])
+    H.save(C.SELF_FLOW_FILE, store)
+    return store
+
+
+def _tk():
+    import tkinter as tk
+    return tk
+
+
+def _font(root):
+    import tkinter.font as tkfont
+    return C._ui_font(root, tkfont)
+
+
+def _no_net_guard():
+    """把出网的路全掐了。**「不联网」是强制的，不是靠自觉。**"""
+    real = (socket.socket.connect, socket.create_connection)
+
+    def boom(*a, **k):
+        raise AssertionError("界面自检不许联网，却试图连 %r" % (a[:1],))
+
+    socket.socket.connect = boom
+    socket.create_connection = boom
+    return real
+
+
+def _restore_net(real):
+    socket.socket.connect, socket.create_connection = real
 
 
 # ---------------------------------------------------------------- 测试
@@ -272,85 +374,142 @@ def test_available():
     check("没配学校 → 默认郑航", C.self_service_available({}), True)
 
 
-def test_panel_session_miss(root):
-    """走「没有会话 → 取验证码 → 画界面 → 验证码错 → 3 次闸门 → 关窗」。"""
-    print("\n② 面板：没有会话 → 验证码界面")
+def test_open_offline_empty(root):
+    """🔴 打开面板**一次网络都不发**（没历史时也一样）。"""
+    print("\n② 打开面板：不联网、不要验证码（本机没历史）")
+    reset_fake()
+    reset_history()
+    w = open_panel(root)
+    pump(root, 0.6)
+
+    check("打开面板时**一个请求都没发**", FakeSvc.calls, [])
+    # 面板构造时会 new 一个取数对象（拿它的方法备用），但**一次都不许调** ——
+    # 「一个请求都没发」才是这条要钉的东西（上面那行）。
+    check("构造了取数对象但没用过", FakeSvc.made, 1)
+    check_true("没有数据（还没同步过）", w.data is None, "")
+    check_true("没有显示验证码", w._cap_big is None, "")
+    t = texts_of(w.win)
+    check_true("明说本机还没有数据",
+               any("本机还没有流量数据" in x for x in t), "")
+    check_true("引导用户点「同步数据」",
+               any("同步数据" in x for x in t), "")
+    check_true("图上说清了怎么开始",
+               any("以后不登录也能看" in x for x in t), "")
+    w.close()
+
+
+def test_open_offline_with_history(root):
+    """🔴 有本地历史时，打开面板**直接画图**，同样不联网。"""
+    print("\n③ 打开面板：有本地历史 → 直接画图（不联网）")
+    reset_fake()
+    reset_history()
+    seed_history()
+    w = open_panel(root)
+    pump(root, 0.6)
+
+    check("打开面板时**一个请求都没发**", FakeSvc.calls, [])
+    t = texts_of(w.win)
+    check_true("画了「数据流量」卡片", any("数据流量" in x for x in t), "")
+    check_true("有「按天」切换", any("按天" in x for x in t), "")
+    check_true("有「按月」切换", any("按月" in x for x in t), "")
+    check_true("柱状图上真的画了东西", canvas_items(w.win) > 5,
+               "（图元 %d 个）" % canvas_items(w.win))
+    check_true("显示了月份导航", any("2026 年 10 月" in x for x in t), "")
+    check_true("显示了「上次同步」的说明",
+               any("上次同步" in x for x in t), "")
+    check_true("汇总里有「共计」", any("共计" in x for x in t), "")
+    check_true("汇总里有「上行」", any("上行" in x for x in t), "")
+    check_true("汇总里有「下行」", any("下行" in x for x in t), "")
+    check_true("汇总里有「日均」", any("日均" in x for x in t), "")
+    check_true("没有账号卡（没同步过，那些数拿不到）",
+               not any("账号状态" in x for x in t), "")
+    check_true("没有设备卡", not any("在线设备" in x for x in t), "")
+
+    # 🔴 正文必须**真的有图表那么宽**。这条看着像废话，其实抓的是一个静默 bug：
+    #    正文在滚动区里，holder 不绑 `<Configure>` 撑到 canvas 宽度的话，
+    #    它会停在卡片 Canvas 的默认宽度（378px），而图表画布是 520px ——
+    #    **右边 1/3 被裁掉**（实测：6 天的柱子只画出来 4 根），Tk 一声不吭。
+    #    ⚠️ 光数「柱子有几根」抓不到它（都画了，只是看不见），**必须量宽度**。
+    root.update()
+    need = C.CHART_W + 2 * 14          # 图表宽 + 卡片两侧内边距
+    check_true("正文宽度够画整张图（不然柱子会被裁）",
+               w.body.winfo_width() >= need,
+               "（实测 %d，需要 %d）" % (w.body.winfo_width(), need))
+    w.close()
+
+
+def test_sync_full_flow(root):
+    """🔴 点「同步数据」→ 验证码 → 登录 → 合并写盘 → 重画。"""
+    print("\n④ 同步：验证码 → 登录 → 数据 → 写进本地")
+    reset_fake()
+    reset_history()
     FakeSvc.script = {"has_session": "no", "login": "ok"}
-    FakeSvc.made = 0
-    FakeSvc.off_main = True
+    w = open_panel(root)
+    w._today = lambda: "2026-10-12"          # 固定「今天」，测试才确定性
+    pump(root, 0.4)
 
-    w = C.SelfServiceWindow(root, _tk(), *_font(root), "2507210230",
-                            "not-a-real-pwd", "http://202.196.169.246")
+    check("打开时仍然没发请求", FakeSvc.calls, [])
+    w.start_sync()
     ok = pump(root, 6.0, lambda: w._cap_big is not None)
-    check_true("验证码界面画出来了（等到了图）", ok, "")
+    check_true("点同步后才去取验证码", ok, "")
+    check("确实发了取验证码的请求", "fetch_captcha" in FakeSvc.calls, True)
+    check("同步中按钮被禁用（防连点把 3 次闸门耗光）",
+          str(w.btn_sync.cget("state")), "disabled")
 
-    # --- 🔴 图片必须真的活着 ---
-    check_true("_cap_big 有引用", w._cap_big is not None, "")
+    # 验证码图必须真的活着
     check("原图尺寸", (w._cap_small.width(), w._cap_small.height()),
           (CAPTCHA_W, CAPTCHA_H))
-    check("放大 4 倍后的尺寸", (w._cap_big.width(), w._cap_big.height()),
+    check("放大后的尺寸", (w._cap_big.width(), w._cap_big.height()),
           (CAPTCHA_W * 4, CAPTCHA_H * 4))
-
-    # 界面上确实有一个 Label 挂着这张图
-    imgs = images_of(w.win)
-    check("挂图的控件数", len(imgs), 1)
-    if imgs:
-        check("挂的正是放大后的那张", imgs[0][1], str(w._cap_big))
-
-    # 🔴 GC 之后图还得在（这才是「没留引用」那个坑的真检测）
     gc.collect()
     root.update()
     check("GC 之后 Tk 里的图片仍在（没被回收）",
           tk_image_size(root, str(w._cap_big)), (CAPTCHA_W * 4, CAPTCHA_H * 4))
-    check_true("GC 之后界面还挂着图", len(images_of(w.win)) == 1, "")
 
-    # --- 🔴 窗口必须宽到放得下验证码图 ---
-    #     这是 2026-10-12 截图量出来的 bug：正文卡片是 `round_panel` 返回的
-    #     **Canvas**，而 Canvas 的 `reqwidth` 只等于它自己的 `width` 选项、
-    #     **不跟着里面塞的图长** ⇒ 窗口停在标题行撑出来的 ~406px，
-    #     卡片可用宽度只有 350px，图右边 1/3 被**静默裁掉**。
-    #     用户根本读不全 4 个字符，功能等于不可用，而 Tk 一声不吭。
-    #     ⚠️ 所以这条只能**量**：截图里缺一角的棋盘格看着还是棋盘格。
-    root.update()
-    avail = w.win.winfo_width() - 2 * C.OUTER_PAD - 2 * 14
-    check_true("窗口真的被映射了（否则下面那条是假绿）",
-               w.win.winfo_width() > 100,
-               "（实测宽 %d）" % w.win.winfo_width())
-    check_true("窗口宽到放得下验证码图（没被裁）",
-               avail >= w._cap_big.width(),
-               "（可用 %d vs 图 %d）" % (avail, w._cap_big.width()))
-
-    # --- 输入框 ---
-    check_true("有输入框", w._entry is not None, "")
-    if w._entry is not None:
-        w._entry.insert(0, "a1b2")
-        check("输入框里读得到刚打的字", w._entry.get(), "a1b2")
-
-    # --- 提交 → 登录成功 → 数据界面 ---
+    # 输入并提交
+    w._entry.insert(0, "a1b2")
     w._submit()
     ok = pump(root, 6.0, lambda: "账号状态" in texts_of(w.win))
-    check_true("提交后走到了数据界面", ok, "")
+    check_true("同步完切到了数据界面", ok, "")
     check("发给学校的验证码就是刚输入的那个",
           FakeSvc.last_login[2] if FakeSvc.last_login else None, "a1b2")
     check("登录用的账号", FakeSvc.last_login[0] if FakeSvc.last_login else None,
           "2507210230")
+    check_true("同步完按钮恢复可用", str(w.btn_sync.cget("state")) == "normal", "")
 
-    # --- 关窗 ---
+    # 🔴 数据必须真的写进了本地
+    check_true("本地历史文件写出来了", os.path.isfile(C.SELF_FLOW_FILE), "")
+    store, why = H.load(C.SELF_FLOW_FILE)
+    check("读回来没有报错", why, "")
+    got = H.days_of(store, "2507210230")
+    check("本地存了 4 天（3 天明细 + 今天）", len(got), 4)
+    check("日期都对", [d["date"] for d in got],
+          ["2026-10-09", "2026-10-10", "2026-10-11", "2026-10-12"])
+    check("今天的上下行是 None（服务端不给）", got[-1]["up"], None)
+    check_true("记下了「上次同步」时间", bool(H.updated_at(store, "2507210230")), "")
+    check_true("界面上说了新增/更新了几天",
+               "新增 4 天" in getattr(w, "note", ""), getattr(w, "note", ""))
+
+    # 再同步一次（同样的数据）⇒ 不该重复「新增」
+    FakeSvc.script = {"has_session": "yes", "login": "ok"}
+    w.start_sync()
+    ok = pump(root, 6.0, lambda: "新增 0 天" in getattr(w, "note", ""))
+    check_true("同样的数据再同步一次 ⇒ 新增 0 天", ok, getattr(w, "note", ""))
+    check("第二次走了「会话还在」这条路（没再要验证码）",
+          "has_session" in FakeSvc.calls, True)
+    check("第二次没有登录", FakeSvc.last_login[2], "a1b2")   # 还是第一次那个
     w.close()
-    check_true("close 之后标记为已关", w.closed, "")
-    w.close()                                   # 幂等：再来一次不许炸
-    check_true("close 可以重复调用", True, "")
-    w._put("data", FAKE_DATA)                   # 关了之后不该再进队列
-    check_true("关窗后新结果不再入队", w.q.empty(), "")
-    return w
 
 
-def test_panel_captcha_wrong(root):
+def test_sync_captcha_wrong(root):
     """验证码错 → 允许重试（换一张），且**新图必须真的换掉旧的**。"""
-    print("\n③ 验证码错：可以重试，且不能拿旧图糊弄")
+    print("\n⑤ 验证码错：可以重试，且不能拿旧图糊弄")
+    reset_fake()
+    reset_history()
     FakeSvc.script = {"has_session": "no", "login": "captcha"}
-    w = C.SelfServiceWindow(root, _tk(), *_font(root), "2507210230", "p",
-                            "http://202.196.169.246")
+    w = open_panel(root)
+    w._today = lambda: "2026-10-12"
+    w.start_sync()
     pump(root, 6.0, lambda: w._cap_big is not None)
     w._entry.insert(0, "zzzz")
     w._submit()
@@ -358,24 +517,25 @@ def test_panel_captcha_wrong(root):
     check_true("提示了「验证码不对」", ok, "")
     check("登录只发了 1 次（验证码错也算 1 次，防锁号）", w.tries, 1)
     check_true("还能继续试（tries 没到上限）", w.tries < C.SELF_LOGIN_MAX, "")
-    check_true("「确定」按钮还在（允许重试）",
-               "确定" in texts_of(w.win), "")
+    check_true("「确定」按钮还在（允许重试）", "确定" in texts_of(w.win), "")
     check_true("有「换一张」", "换一张" in texts_of(w.win), "")
+    check_true("有「取消」（能退回看历史）", "取消" in texts_of(w.win), "")
 
     # 🔴 换新图失败时**不许**继续显示旧图，而且**必须照样说清为什么失败**。
     #    这条路只有走 `_job_login` 才到得了：验证码错 → 顺手取新图 → 新图没取到
-    #    → png 是 None。原来的写法会「提示整个消失」（note 被当成标志位用，
-    #    见 `_handle` 里那段说明），所以这里钉两件事：① 不留旧图；② 提示还在。
+    #    → png 是 None。原来的写法会「提示整个消失」（note 被当成标志位用）。
+    reset_fake()
     FakeSvc.script = {"has_session": "no", "login": "captcha"}
-    w2 = C.SelfServiceWindow(root, _tk(), *_font(root), "2507210230", "p",
-                             "http://202.196.169.246")
+    w2 = open_panel(root)
+    w2._today = lambda: "2026-10-12"
+    w2.start_sync()
     pump(root, 6.0, lambda: w2._cap_big is not None)
     old2 = str(w2._cap_big)          # 先正常拿到一张，后面才知道「旧的是哪张」
     FakeSvc.script["fetch_captcha"] = "raise"      # 从现在起取不到新图
     w2._entry.insert(0, "zzzz")
     w2._submit()
     ok = pump(root, 6.0, lambda: "新的没取到" in " ".join(texts_of(w2.win)))
-    check_true("取不到新图时明说「显示不出来」", ok, "")
+    check_true("取不到新图时明说「没取到」", ok, "")
     check_true("取不到新图时不留旧图引用", w2._cap_big is None,
                "（旧引用 = %s）" % ("还在" if w2._cap_big else "已清"))
     check_true("旧图在界面上也确实没了", len(images_of(w2.win)) == 0, "")
@@ -384,15 +544,25 @@ def test_panel_captcha_wrong(root):
     check_true("提示没被吞掉（这条原来就是 bug）",
                any("验证码不对" in x for x in texts_of(w2.win)), "")
     w2.close()
+
+    # 取消能退回历史视图
+    w._cancel()
+    pump(root, 0.4)
+    check_true("「取消」之后回到历史视图（不再是验证码界面）",
+               "确定" not in texts_of(w.win), "")
+    check_true("取消之后同步按钮恢复可用",
+               str(w.btn_sync.cget("state")) == "normal", "")
     w.close()
 
 
-def test_panel_login_fail(root):
+def test_sync_login_fail(root):
     """密码错 → **不许重试**，把「确定」收起来。"""
-    print("\n④ 密码错：不许重试")
+    print("\n⑥ 密码错：不许重试")
+    reset_fake()
+    reset_history()
     FakeSvc.script = {"has_session": "no", "login": "login"}
-    w = C.SelfServiceWindow(root, _tk(), *_font(root), "2507210230", "wrong",
-                            "http://202.196.169.246")
+    w = open_panel(root)
+    w.start_sync()
     pump(root, 6.0, lambda: w._cap_big is not None)
     w._entry.insert(0, "a1b2")
     w._submit()
@@ -402,101 +572,53 @@ def test_panel_login_fail(root):
                "确定" not in texts_of(w.win), "")
     check_true("说清了原因不是验证码",
                any("这不是验证码的问题" in x for x in texts_of(w.win)), "")
+    check_true("有「返回」", "返回" in texts_of(w.win), "")
     w.close()
 
 
-def test_panel_tries_gate(root):
+def test_sync_tries_gate(root):
     """3 次闸门：到了上限只剩「换一张」。"""
-    print("\n⑤ 3 次闸门")
+    print("\n⑦ 3 次闸门")
+    reset_fake()
+    reset_history()
     FakeSvc.script = {"has_session": "no", "login": "captcha"}
-    w = C.SelfServiceWindow(root, _tk(), *_font(root), "2507210230", "p",
-                            "http://202.196.169.246")
+    w = open_panel(root)
+    w.start_sync()
     pump(root, 6.0, lambda: w._cap_big is not None)
     w.tries = C.SELF_LOGIN_MAX
     w._draw_captcha(CAPTCHA_PNG)
     t = texts_of(w.win)
     check_true("「确定」不见了", "确定" not in t, "")
     check_true("「换一张」还在", "换一张" in t, "")
-    check_true("说清了为什么停下（怕被锁号）",
-               any("锁" in x for x in t), "")
+    check_true("说清了为什么停下（怕被锁号）", any("锁" in x for x in t), "")
     w._entry.insert(0, "a1b2")
     w._submit()                                  # 到了上限就不该再发请求
     check("到上限后不再发登录请求", w.tries, C.SELF_LOGIN_MAX)
     w.close()
 
 
-def test_panel_net_fail(root):
-    """网络不通 → 有中文提示，不是空白窗口。"""
-    print("\n⑥ 网络不通")
+def test_sync_net_fail(root):
+    """网络不通 → 有中文提示，而且**本机历史不受影响**。"""
+    print("\n⑧ 网络不通")
+    reset_fake()
+    reset_history()
+    seed_history()
     FakeSvc.script = {"has_session": "raise"}
-    w = C.SelfServiceWindow(root, _tk(), *_font(root), "2507210230", "p",
-                            "http://202.196.169.246")
+    w = open_panel(root)
+    w.start_sync()
     ok = pump(root, 6.0, lambda: "读不到数据" in " ".join(texts_of(w.win)))
     check_true("提示了「读不到数据」", ok, "")
     check_true("把原始错误也带上了（好排查）",
                any("假装连不上" in x for x in texts_of(w.win)), "")
+    check_true("说了本机历史不受影响",
+               any("本机已经存下来的流量历史不受影响" in x
+                   for x in texts_of(w.win)), "")
+    check_true("有「返回」能回到历史视图", "返回" in texts_of(w.win), "")
+    w._cancel()
+    pump(root, 0.4)
+    check_true("返回之后又看得到历史了",
+               any("数据流量" in x for x in texts_of(w.win)), "")
     w.close()
-
-
-def test_data_render(root):
-    """数据界面：该显示的都在，不该显示的（套餐制下的余额）不在。
-
-    ⚠️ 这里**故意不转事件循环**，直接调 `_draw_data()` 手画 ——
-       要的是「给定这份数据，界面长什么样」，和线程/队列无关。
-       也因此**不能在画之前 `close()`**：`close()` 会把 Toplevel 销毁掉，
-       之后 `_draw_data` 里那句 `self.body.winfo_children()` 直接抛 TclError。
-    """
-    print("\n⑦ 数据界面")
-    FakeSvc.script = {"has_session": "no"}
-    w = C.SelfServiceWindow(root, _tk(), *_font(root), "2507210230", "p",
-                            "http://202.196.169.246")
-
-    w._draw_data(json.loads(json.dumps(FAKE_DATA)))
-    t = texts_of(w.win)
-    joined = " | ".join(t)
-    for needle in ("账号状态", "正常", "校园网电信融合套餐", "2038-01-01",
-                   "2026-10-06", "12.50 元", "123.50 MB", "18.02 GB",
-                   "96.68 GB", "3.25 小时", "100 GB", "10.1.2.3",
-                   "AA-BB-CC-DD-EE-FF", "在线设备（1 台）"):
-        check_true("界面上有 %r" % needle, needle in joined, "")
-    check_true("说了这是只读、不留东西",
-               any("只读" in x for x in t) and any("不会保存" in x for x in t),
-               "")
-
-    # 套餐制（chargeType=0）下**不许**显示余额 —— 那会是一个恒为 0 的假数字
-    d2 = json.loads(json.dumps(FAKE_DATA))
-    d2["charge_type"] = "0"
-    d2["balance"] = 0.0
-    w._draw_data(d2)
-    t2 = " | ".join(texts_of(w.win))
-    check_true("套餐制下不显示「余额」", "余额" not in t2, "")
-    check_true("套餐制下也不显示那个 0 元", "0.00 元" not in t2, "")
-
-    # 没有在线设备时要说一句，不能留一片空白
-    d3 = json.loads(json.dumps(FAKE_DATA))
-    d3["devices"] = []
-    w._draw_data(d3)
-    check_true("没设备时明说「当前没有设备在线」",
-               any("当前没有设备在线" in x for x in texts_of(w.win)), "")
-
-    # 敏感字段就算被硬塞进来也不该显示（纵深防御：取数层已经过滤过一次）
-    d4 = json.loads(json.dumps(FAKE_DATA))
-    d4["idCardNum"] = "SENTINEL_IDCARD"
-    d4["accountMobile"] = "SENTINEL_PHONE"
-    w._draw_data(d4)
-    t4 = " | ".join(texts_of(w.win))
-    check_true("界面不显示身份证号", "SENTINEL_IDCARD" not in t4, "")
-    check_true("界面不显示手机号", "SENTINEL_PHONE" not in t4, "")
-    w.close()
-
-
-def test_off_main_thread():
-    """🔴 所有网络请求都必须在**非主线程**上发 —— 发在主线程会把界面冻住。"""
-    print("\n⑨ 请求不在 Tk 主线程上发")
-    check_true("所有请求都在子线程里", FakeSvc.off_main,
-               "" if FakeSvc.off_main else "（有请求跑在主线程上）")
-    check_true("替身真的被用上了（真对象一次都没建）", FakeSvc.made > 0,
-               "（建了 %d 个）" % FakeSvc.made)
 
 
 def test_job_crash_visible(root):
@@ -506,10 +628,12 @@ def test_job_crash_visible(root):
     表现是「界面永远停在正在登录…」。而 `self.password` 那个 bug 正是这么藏的 ——
     只跑 py_compile / AST 扫描，或者只断言「代码没崩」，都看不出来。
     """
-    print("\n⑩ 后台任务崩了也要看得见")
+    print("\n⑨ 后台任务崩了也要看得见")
+    reset_fake()
+    reset_history()
     FakeSvc.script = {"has_session": "no", "login": "boom"}
-    w = C.SelfServiceWindow(root, _tk(), *_font(root), "2507210230", "p",
-                            "http://202.196.169.246")
+    w = open_panel(root)
+    w.start_sync()
     pump(root, 6.0, lambda: w._cap_big is not None)
     w._entry.insert(0, "a1b2")
     w._submit()
@@ -522,6 +646,149 @@ def test_job_crash_visible(root):
     w.close()
 
 
+def test_clear_history(root):
+    """清历史：**只清当前账号**，别的账号不动。"""
+    print("\n⑩ 清掉本机历史（只清当前账号）")
+    reset_fake()
+    reset_history()
+    store, _ = H.load(C.SELF_FLOW_FILE)
+    H.merge(store, "2507210230", FAKE_DAYS)
+    H.merge(store, "2026999999", [{"date": "2026-10-01", "flow": 1.0}])
+    H.save(C.SELF_FLOW_FILE, store)
+
+    w = open_panel(root)
+    w.ask = lambda *a: True                  # 别弹模态框（会把自动化挂住）
+    pump(root, 0.4)
+    w.clear_history()
+    pump(root, 0.4)
+
+    store2, _ = H.load(C.SELF_FLOW_FILE)
+    check("当前账号的历史清掉了", H.days_of(store2, "2507210230"), [])
+    check("**别的账号**的历史还在", len(H.days_of(store2, "2026999999")), 1)
+    check_true("界面提示清完了", "已清掉" in getattr(w, "note", ""),
+               getattr(w, "note", ""))
+
+    # 用户点「否」时不能清
+    store3, _ = H.load(C.SELF_FLOW_FILE)
+    H.merge(store3, "2507210230", FAKE_DAYS)
+    H.save(C.SELF_FLOW_FILE, store3)
+    w2 = open_panel(root)
+    w2.ask = lambda *a: False
+    pump(root, 0.4)
+    w2.clear_history()
+    store4, _ = H.load(C.SELF_FLOW_FILE)
+    check("点「否」就不清", len(H.days_of(store4, "2507210230")), 3)
+
+    # 没有历史时不该弹确认框
+    w3 = open_panel(root, account="2026000000")
+    called = []
+    w3.ask = lambda *a: called.append(1) or True
+    pump(root, 0.4)
+    w3.clear_history()
+    check("没历史时连确认框都不弹", called, [])
+    check_true("并明说没有历史", "没有" in getattr(w3, "note", ""), getattr(w3, "note", ""))
+    for x in (w, w2, w3):
+        x.close()
+
+
+def test_chart_views(root):
+    """图表：按天/按月切换 + 月份导航。"""
+    print("\n⑪ 图表：按天 / 按月 / 月份导航")
+    reset_fake()
+    reset_history()
+    store, _ = H.load(C.SELF_FLOW_FILE)
+    H.merge(store, "2507210230", [
+        {"date": "2026-09-28", "flow": 3762.25, "up": 393.57, "down": 3368.68, "hours": 24.0},
+        {"date": "2026-09-29", "flow": 32812.71, "up": 6170.45, "down": 26642.26, "hours": 16.0},
+    ] + FAKE_DAYS)
+    H.save(C.SELF_FLOW_FILE, store)
+
+    w = open_panel(root)
+    pump(root, 0.6)
+    t = texts_of(w.win)
+    check_true("默认是「按天」", w.view, "")
+    check("默认看的是最近那个月", w.ym, "2026-10")
+    check_true("柱顶标了值（有 G 结尾的短格式）",
+               any(x.endswith("G") for x in t), "")
+    check_true("有月份导航的左右箭头",
+               "‹" in t or "›" in t, "")
+    check_true("柱顶标签里有「日均」那条线",
+               any("日均" in x for x in t), "")
+
+    # 切到 9 月
+    w.shift_month(-1)
+    pump(root, 0.4)
+    check("往回一个月", w.ym, "2026-09")
+    check_true("界面上写的是 9 月",
+               any("2026 年 9 月" in x for x in texts_of(w.win)), "")
+    # 9 月只有两天
+    check("9 月只有 2 根柱子", len(w._series(H.days_of(w.store, w.account))), 2)
+
+    # 切到按月
+    w.set_view("month")
+    pump(root, 0.4)
+    check("切到按月", w.view, "month")
+    check("按月有 2 个月", len(w._series(H.days_of(w.store, w.account))), 2)
+    check_true("按月视图下没有月份导航（按月本来就不用选月）",
+               not any("2026 年 10 月" in x for x in texts_of(w.win)), "")
+    check_true("按月时柱子的标签是「9月」「10月」",
+               any("9月" in x for x in texts_of(w.win))
+               and any("10月" in x for x in texts_of(w.win)), "")
+    # 切回来
+    w.set_view("day")
+    pump(root, 0.4)
+    check("切回按天", w.view, "day")
+    w.close()
+
+
+def test_devices_layout(root):
+    """在线设备：**设备类型优先**，其次是上线时间，其余写小字。"""
+    print("\n⑫ 在线设备：设备类型优先")
+    reset_fake()
+    reset_history()
+    FakeSvc.script = {"has_session": "yes"}
+    w = open_panel(root)
+    w._today = lambda: "2026-10-12"
+    w.start_sync()
+    ok = pump(root, 6.0, lambda: "在线设备" in " ".join(texts_of(w.win)))
+    check_true("同步之后出现了设备卡", ok, "")
+    t = texts_of(w.win)
+    check_true("有设备类型（Windows）", "Windows" in t, "")
+    check_true("有上线时间", any("上线" in x for x in t), "")
+    check_true("IP / MAC 也在（小字那行）",
+               any("10.15.116.156" in x for x in t), "")
+    check_true("设备卡标题带了台数",
+               any("在线设备（1 台）" in x for x in t), "")
+
+    # 设备类型为空时**不许猜**（terminalType 是 "a" 这种代码，含义没验证过）
+    FakeSvc.script = {"has_session": "yes"}
+    saved = json.loads(json.dumps(FAKE_DATA))
+    saved["devices"][0]["os"] = ""
+    orig_load = FakeSvc.load
+    FakeSvc.load = lambda self, account, today=None: json.loads(json.dumps(saved))
+    w2 = open_panel(root)
+    w2._today = lambda: "2026-10-12"
+    w2.start_sync()
+    pump(root, 6.0, lambda: "在线设备" in " ".join(texts_of(w2.win)))
+    t2 = texts_of(w2.win)
+    check_true("设备类型空 → 写「未知设备」，不拿 terminalType 猜",
+               "未知设备" in t2, "")
+    check_true("也没有把那个代码 a 当成设备类型显示",
+               not any(x.strip() == "a" for x in t2), "")
+    FakeSvc.load = orig_load
+    w.close()
+    w2.close()
+
+
+def test_off_main_thread():
+    """🔴 所有网络请求都必须在**非主线程**上发 —— 发在主线程会把界面冻住。"""
+    print("\n⑬ 请求不在 Tk 主线程上发")
+    check_true("所有请求都在子线程里", FakeSvc.off_main,
+               "" if FakeSvc.off_main else "（有请求跑在主线程上）")
+    check_true("替身真的被用上了（真对象一次都没建）", FakeSvc.made > 0,
+               "（建了 %d 个）" % FakeSvc.made)
+
+
 def test_main_window_chip():
     """主界面状态卡上的「上网数据」圆角片：**在、文字对、高度和邻居一模一样**。
 
@@ -530,7 +797,7 @@ def test_main_window_chip():
        整张卡的高度就一个像素都不变。所以这里直接拿两个控件比高度 ——
        哪天有人只改了一个，这条立刻红。
     """
-    print("\n⑩ 主界面上的入口")
+    print("\n⑭ 主界面上的入口")
     app = C.LoginApp(smoke=True)
     try:
         check_true("郑航下「上网数据」入口存在", app.btn_self is not None, "")
@@ -569,56 +836,6 @@ def test_main_window_chip():
 
 # ---------------------------------------------------------------- 收尾
 
-def _tk():
-    import tkinter as tk
-    return tk
-
-
-def _mark(msg):
-    """排障用落点。收尾卡住时这是唯一线索（stdout 可能还没刷出来）。
-
-    ⚠️ 别删：它的用途是**证明「脚本真的跑完了」**。退出码可疑时，
-       `%TEMP%/selfwin_marks.txt` 里有没有最后一行就是判据 ——
-       2026-10-12 正是靠它把「脚本没跑完」和「跑完了但退出码被信号改写」分开的。
-    """
-    try:
-        import tempfile
-        with open(os.path.join(tempfile.gettempdir(), "selfwin_marks.txt"),
-                  "a", encoding="utf-8") as f:
-            f.write("%s  %s\n" % (time.strftime("%H:%M:%S"), msg))
-    except Exception:
-        pass
-
-
-def _mark_reset():
-    try:
-        import tempfile
-        os.remove(os.path.join(tempfile.gettempdir(), "selfwin_marks.txt"))
-    except OSError:
-        return          # 文件本来就不在，正常
-
-
-def _font(root):
-    import tkinter.font as tkfont
-    return C._ui_font(root, tkfont)
-
-
-def _no_net_guard():
-    """把出网的路全掐了。**「不联网」是强制的，不是靠自觉。**"""
-    real = (socket.socket.connect, socket.create_connection)
-
-    def boom(*a, **k):
-        raise AssertionError("界面自检不许联网，却试图连 %r" % (a[:1],))
-
-    socket.socket.connect = boom
-    socket.create_connection = boom
-    return real
-
-
-def _restore_net(real):
-    socket.socket.connect, socket.create_connection = real
-
-
 def main():
     print("=" * 78)
     print("SelfServiceWindow（上网数据面板）界面自检")
@@ -627,7 +844,7 @@ def main():
 
     d = datasafe.sandbox(copy_real=False, tag="selfwin")
     print("沙箱数据目录：%s" % d)
-    _mark_reset()
+    print("沙箱里的历史文件：%s" % C.SELF_FLOW_FILE)
 
     real_svc = S.SelfService
     S.SelfService = FakeSvc
@@ -638,24 +855,26 @@ def main():
         root = _tk().Tk()
         # 🔴 **不能 withdraw**：面板是 `transient(root)` 的，主窗一隐藏，
         #    Windows 就不映射子窗 —— 于是 `winfo_width()` 永远是 1，
-        #    下面那条「窗口够不够宽」的断言就成了假绿（量到 1 也算过）。
+        #    「窗口够不够宽」那条断言就成了假绿（量到 1 也算过）。
         #    所以这里让它真的显示出来（很小的一块，测试期间闪一下而已）。
         root.geometry("320x140+30+30")
         root.update()
         try:
-            test_panel_session_miss(root)
-            test_panel_captcha_wrong(root)
-            test_panel_login_fail(root)
-            test_panel_tries_gate(root)
-            test_panel_net_fail(root)
-            test_data_render(root)
+            test_open_offline_empty(root)
+            test_open_offline_with_history(root)
+            test_sync_full_flow(root)
+            test_sync_captcha_wrong(root)
+            test_sync_login_fail(root)
+            test_sync_tries_gate(root)
+            test_sync_net_fail(root)
             test_job_crash_visible(root)
+            test_clear_history(root)
+            test_chart_views(root)
+            test_devices_layout(root)
         finally:
             root.destroy()
-        _mark("第一棵 Tk 根已销毁")
         test_off_main_thread()
         test_main_window_chip()
-        _mark("主界面那棵 Tk 根已销毁")
         print("\n%s" % datasafe.assert_untouched())
     finally:
         S.SelfService = real_svc
@@ -673,7 +892,6 @@ def main():
 
 if __name__ == "__main__":
     _rc = main()
-    _mark("main() 返回 rc=%s" % _rc)
     # 🔴 必须走 `proc_tree.exit_hard()`，**不能**用 `os._exit()`。
     #
     #    2026-10-12 实测踩出来的：这个脚本建过真 Tk 窗口，用 `os._exit(rc)`
@@ -686,5 +904,4 @@ if __name__ == "__main__":
     #    走 `ExitProcess`，它会等所有已加载 DLL 的 `DLL_PROCESS_DETACH` 跑完，
     #    而 Tcl/Tk 的清理**又慢又不可靠**（实测 11~12 秒）。
     #    `exit_hard()` 走 `TerminateProcess`，**根本不执行 DLL 卸载** —— 毫秒级。
-    #    （同一条路上 `ui_shot.py` 也是这么收尾的，所以它拿得到干净的退出码。）
     proc_tree.exit_hard(_rc)
