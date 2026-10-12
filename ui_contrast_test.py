@@ -90,10 +90,14 @@ def main():
         btn("退出当前账号", C.DANGER_SOFT, C.CARD),
         btn("选用", "#f1f5f9", C.CARD),
         btn("删除", "#fef6f6", C.CARD),
+        # 账号行上「这个账号属于别的学校」那个警示片（2026-10-12 加）。
+        # 它的底色是**最浅的一档**（WARN_SOFT #fffbeb 落在白卡上），
+        # 所以必须放进这棵树里 —— 它是最可能踩到阈值的一个。
+        btn("郑州航空工业管理学院", C.WARN_SOFT, C.CARD),
     )
     hit, msg = verdict(root)
     check("真实配色的一整屏按钮 -> 放行", hit, False)
-    check("结论里报了按钮个数", "6 个按钮" in msg, True)
+    check("结论里报了按钮个数", "7 个按钮" in msg, True)
 
     print()
     print("=== 3. 负向对照：把按钮弄隐形，必须每一项都被拦下 ===")
@@ -144,6 +148,20 @@ def main():
           C._color_delta(C._DISABLED_FALLBACK, C.CARD) >= C._CONTRAST_MIN, True)
     check("两个默认色**确实**是同一个值（否则第 1 项测的是空气）",
           C.BG, "#eef1f6")
+
+    print()
+    print("=== 7. 新加的语义浅底必须过阈值（不然「看得见」只是嘴上说说）===")
+    # 🔴 这一节存在的理由：`round_chip` 也挂 `_rb_bg`，所以每一块圆角小标签
+    #    都会被 ui_contrast_check 查一遍。新加一个浅底颜色时，凭肉眼挑一个
+    #    「看着挺明显」的值是不够的 —— 差 4~5 级肉眼就分不出了。
+    for _name, _soft, _page in (("WARN_SOFT 在白卡上", C.WARN_SOFT, C.CARD),
+                                 ("WARN_SOFT 在页面底上", C.WARN_SOFT, C.BG),
+                                 ("BLUE_SOFT 在白卡上", C.BLUE_SOFT, C.CARD),
+                                 ("OK_SOFT 在白卡上", C.OK_SOFT, C.CARD),
+                                 ("DANGER_SOFT 在白卡上", C.DANGER_SOFT, C.CARD)):
+        _d = C._color_delta(_soft, _page)
+        check("%-18s 色差 %d >= %d" % (_name, _d, C._CONTRAST_MIN),
+              _d >= C._CONTRAST_MIN, True)
 
     print()
     if FAILS:

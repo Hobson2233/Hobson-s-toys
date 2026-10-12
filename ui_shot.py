@@ -40,10 +40,15 @@ DEMO_DIR = os.path.join(tempfile.gettempdir(), "campus_ui_shot")
 DEMO_UID_1 = "2026000001"
 DEMO_UID_2 = "2026000002"
 DEMO_ACCOUNTS = {
+    # ⚠️ `school` 是「这个账号属于哪所学校」（2026-10-12 加）。
+    #    故意让两个账号分属不同学校 —— 第 6 张图拍的就是「属于别的学校」那个警示标签，
+    #    否则那条分支永远不会被人看见。
     DEMO_UID_1: {"passwd": PWD_DEMO, "lastSuccess": "2026-01-01 09:00:00",
-                 "lastAttempt": "2026-01-01 09:00:00", "lastResult": "ok"},
+                 "lastAttempt": "2026-01-01 09:00:00", "lastResult": "ok",
+                 "school": "zua"},
     DEMO_UID_2: {"passwd": "demo-5678", "lastSuccess": "2026-01-01 08:30:00",
-                 "lastAttempt": "2026-01-01 08:30:00", "lastResult": "ok"},
+                 "lastAttempt": "2026-01-01 08:30:00", "lastResult": "ok",
+                 "school": "zjxu"},
 }
 
 
@@ -60,9 +65,12 @@ def sandbox():
     C.LOG_FILE = os.path.join(DEMO_DIR, "campus-login.log")
     C.RESULT_FILE = os.path.join(DEMO_DIR, "last-result.json")
 
-    cfg = dict(C.DEFAULTS)
-    cfg["userId"] = DEMO_UID_1
-    cfg["passwd"] = PWD_DEMO
+    # ⚠️ 只写「用户真的会写的东西」—— 别拿 `dict(C.DEFAULTS)` 打底。
+    #    那样会往 demo 的 config.json 里塞进 4 个「化石键」，
+    #    而 load_config 现在会把它们过滤掉、set_school 还会把它们清掉，
+    #    于是截图里会多出一段「清掉了老版本留下的旧参数」的提示，
+    #    而那不是要演示的常态（来龙去脉见 campus_login._fossil_keys）。
+    cfg = {"userId": DEMO_UID_1, "passwd": PWD_DEMO}
     C.save_config(cfg)
     C.save_accounts({"accounts": DEMO_ACCOUNTS, "lastOnline": DEMO_UID_1})
     print("沙箱数据目录: %s（已写入假账号 %s / %s）"
@@ -74,13 +82,20 @@ def sandbox():
 
 
 fields = []                     # 记下 run_gui 建的那个 PasswordField
+apps = []                       # 记下 run_gui 建的那个 LoginApp（第 6 张图要用）
 _orig_init = C.PasswordField.__init__
+_orig_app_init = C.LoginApp.__init__
 _orig_mainloop = tk.Tk.mainloop
 
 
 def _init(self, *a, **k):
     _orig_init(self, *a, **k)
     fields.append(self)
+
+
+def _app_init(self, *a, **k):
+    _orig_app_init(self, *a, **k)
+    apps.append(self)
 
 
 def grab(widget, name):
@@ -181,6 +196,22 @@ def schedule(root):
         else:
             print("  没找到说明弹窗")
 
+    def switch_school():
+        """第 6 张：切到嘉兴大学 —— 账号行上「属于别的学校」的警示标签就会出现。
+
+        ⚠️ 走的是**真的** `on_school()`（不是自己拼个界面状态）：它要写 config.json、
+           要重画账号列表、还要弹提示消息，这几步都得被真跑一遍才拍得到。
+        """
+        a = apps[0] if apps else None
+        print("[6] 切到嘉兴大学（演示账号行上的「别的学校」警示标签）")
+        if not a:
+            print("  **没拿到 LoginApp 实例**，跳过")
+            return
+        a.on_school("zjxu")
+
+    def shot_switched():
+        grab(root, "06_切到嘉兴后账号行的警示标签")
+
     root.after(2600, initial)
     root.after(3200, demo_type)
     root.after(3600, shot_typing)
@@ -190,7 +221,9 @@ def schedule(root):
     root.after(5600, shot_hidden)
     root.after(6200, open_help)
     root.after(6800, shot_help)
-    root.after(7600, root.quit)
+    root.after(7600, switch_school)
+    root.after(8200, shot_switched)
+    root.after(9000, root.quit)
 
 
 def _mainloop(self, *a, **k):
@@ -204,6 +237,7 @@ def main():
     # 到点还没收尾就硬退，绝不留窗口。
     proc_tree.arm_watchdog(90, "ui_shot.py")
     C.PasswordField.__init__ = _init
+    C.LoginApp.__init__ = _app_init
     tk.Tk.mainloop = _mainloop
     # **不要在这里声明 DPI 感知**：程序本身（打包出来的 exe）是 DPI 不感知的，
     # Windows 会给它一个「虚拟化」的坐标空间。声明感知后 Tk 看到的是物理像素，
@@ -216,6 +250,7 @@ def main():
         print("run_gui 异常: %s: %s" % (type(e).__name__, e))
     finally:
         C.PasswordField.__init__ = _orig_init
+        C.LoginApp.__init__ = _orig_app_init
         tk.Tk.mainloop = _orig_mainloop
     print("完成，输出目录: %s" % OUT)
     # **不要 disarm()** —— exit_hard() 就在下一句，os._exit() 会带走守护线程。

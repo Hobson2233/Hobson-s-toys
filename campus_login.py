@@ -32,6 +32,8 @@ import threading
 import subprocess
 import tempfile
 import traceback
+import hashlib
+import hmac
 import http.cookiejar
 import urllib.error
 import urllib.request
@@ -49,7 +51,7 @@ import updater
 # 和 updater 同理：顶层 import，**打包时必须让 PyInstaller 看见它**。
 from palette import (BG, CARD, FG, SUB, LINE, FIELD, SEC_FG,
                      BLUE, BLUE_DARK, BLUE_SOFT,
-                     OK, OK_SOFT, DANGER, DANGER_SOFT, WARN)
+                     OK, OK_SOFT, DANGER, DANGER_SOFT, WARN, WARN_SOFT)
 
 APP_NAME = "CampusLogin"
 APP_TITLE = "校园网自动登录"
@@ -62,7 +64,7 @@ APP_TITLE = "校园网自动登录"
 # ⚠️ 这里是**唯一来源**。界面标题、使用说明、--version、--selftest、
 #    以及 exe 文件属性里的版本，全部由它推导 —— 不要在别处另写一份，
 #    否则迟早漂移（改了一处忘了另一处，用户看到的版本号就是错的）。
-VERSION = "0.5.3"
+VERSION = "0.5.4"
 
 # ==================== 学校参数：换学校只改 config.json ====================
 #
@@ -72,6 +74,7 @@ VERSION = "0.5.3"
 #    （README 的「适配其它学校」一节列的正是这几个键，两边要一起改。）
 #
 #    可覆盖的键（config.json 键名 → 默认值 → 取值函数）：
+#        school          用哪个内置档案    "zua"（郑航）                school_key()
 #        portalHost      门户主机          "http://202.196.169.166"     load_config()
 #        wlanAcIp        接入控制器 IP     "10.0.1.10"                  load_config()
 #        wlanAcName      接入控制器名      "ZZHK-ZAX-BRAS"              load_config()
@@ -86,7 +89,14 @@ VERSION = "0.5.3"
 #       实际压根没生效」，正是本项目最警惕的那类静默错误。
 #       （`campus_subnets()` 从 2026-09-19 就是这么做的，另外三个 2026-10-05 补齐。）
 #    回归靠 `school_profile_test.py`（含阳性对照：故意写错的配置必须真的改变结果）。
-SCHOOL_KEYS = ("portalHost", "wlanAcIp", "wlanAcName", "timeoutSec",
+#
+# 🔴 `school` 是 2026-10-12 加进来的（界面上的学校下拉框）。
+#    它跟另外 8 个**不是一类** —— 那 8 个是「参数」，它是「选择器」：
+#    它自己不是参数值，而是决定去 `SCHOOLS` 里取哪一套参数。
+#    ⚠️ 但迁移时它必须跟那 8 个一起被保住，否则用户换过学校、一升级
+#       又变回郑航（静默的，界面上还显示着他选的学校名）。
+SCHOOL_KEYS = ("school",
+               "portalHost", "wlanAcIp", "wlanAcName", "timeoutSec",
                "campusSubnets", "triggerUrl", "checkTargets", "loginExtra")
 
 # 学校 portal 默认参数（拷到同校其他电脑上可直接用）
@@ -96,6 +106,47 @@ DEFAULTS = {
     "wlanAcName": "ZZHK-ZAX-BRAS",
     "timeoutSec": 8,
 }
+
+# ==================== 内置学校档案 ====================
+# 用户只需要在 config.json 里写一行 `"school": "<key>"`，程序就把这套参数铺开，
+# 不用手抄一长串。
+#
+# 优先级（后者覆盖前者）：
+#     这里的档案  <  config.json 里的单项覆盖（如 `"portalHost"`）
+# 也就是「选了学校之后，仍然可以单独覆盖某一项」—— 高级用户的路没被堵死。
+#
+# ⚠️ 加一所新学校 = 在这里加一项，**不用改别的代码**。
+# 🔴 但每一项都要**实测过**再写进来 —— 尤其 `campusSubnets`：
+#    填宽了会把宿舍/家庭的私网也判成校园网（2026-09-19 踩过，见 campus_subnets 的说明）。
+# 🔴 `portalType` 决定走哪套认证实现：
+#    · "webauth" —— 郑航那套（webauth.do 表单，见 portal_login）
+#    · "srun"    —— 深澜 Srun（嘉兴大学，见「深澜 Srun 适配」一节）
+SCHOOLS = {
+    "zua": {
+        "name": "郑州航空工业管理学院",
+        "portalType": "webauth",
+        "portalHost": "http://202.196.169.166",
+        "wlanAcIp": "10.0.1.10",
+        "wlanAcName": "ZZHK-ZAX-BRAS",
+        "campusSubnets": ["10."],
+        "triggerUrl": "http://1.1.1.1/",
+    },
+    # 嘉兴大学（2026-10-11/12 实网验证：认证打通 + 强制认证 + HTTP 拦截都在）
+    # 详见工作区的 `嘉兴大学适配.md`
+    "zjxu": {
+        "name": "嘉兴大学",
+        "portalType": "srun",
+        "portalHost": "http://wlan.zjxu.edu.cn",
+        # 🔴 必须是 `10.246.`，不能是 `10.` —— 实测网段是 10.246.0.0/16
+        "campusSubnets": ["10.246."],
+        "triggerUrl": "http://1.1.1.1/",
+    },
+}
+
+# 不写 `school` 时用哪个。
+# 🔴 **必须是 zua** —— 老用户的 config.json 里没有这个键，默认值一变他们的行为
+#    就跟着变（红线：郑航那套一个字都不能动）。
+DEFAULT_SCHOOL = "zua"
 
 # 校园网给终端分配的网段前缀。**判断「在不在校园网」用它，不用「能不能上网」**。
 #
@@ -436,25 +487,162 @@ def mutate_accounts(fn):
 
 
 # ==================== 配置 ====================
+def school_profile(key):
+    """按 key 取内置学校档案。认不出来就返回空 dict（于是走 DEFAULTS）。
+
+    ⚠️ 认不出来时**故意**退回空 dict 而不是报错 —— 用户把 key 写错了，
+       行为应当回到「郑航默认」，而不是让程序起不来。
+    """
+    if not isinstance(key, str) or not key.strip():
+        key = DEFAULT_SCHOOL
+    return dict(SCHOOLS.get(key.strip().lower(), {}))
+
+
+def _fossil_keys(raw):
+    """config.json 里那些「长得像老版本自动写进去的」键。
+
+    🔴 为什么需要它（2026-10-12 实测复现，见 `_repro_school_switch.py`）：
+        老版本的 `on_save` / `on_switch` / `set_active_account` 都是
+        `save_config(load_config())`，而 `load_config()` 返回的是
+        「DEFAULTS + 用户写的那份」**合并后的整份** —— 于是 DEFAULTS 里那 4 个键
+        （portalHost / wlanAcIp / wlanAcName / timeoutSec）被**固化**进了文件。
+        用户从没写过它们，但文件里从此有了。（本机真实 config.json 实测确认。）
+
+        而学校档案的优先级**低于**「config.json 里的键」，于是这 4 个化石
+        永远盖住档案 —— 表现是「界面选了嘉兴，登录还打到郑航」，一声不吭。
+
+    判据：**键在 DEFAULTS 里，且值和 DEFAULTS 一模一样**。
+        ⚠️ 这个判据是「不会误伤」的：值与默认值相同的键删掉之后，
+           `load_config()` 回落到的还是同一个值 —— 对**当前**这 4 个键而言
+           删与不删行为完全一致（`SCHOOLS["zua"]` 的同名值和 DEFAULTS 相同）。
+           而用户真改过的（比如把 timeoutSec 写成 20）值不等于 DEFAULTS，
+           不会被误删 —— 这条由 `_repro_school_switch.py` 第 3 节钉着。
+    """
+    return [k for k, v in DEFAULTS.items() if k in raw and raw[k] == v]
+
+
 def load_config():
     cfg = read_json(CONFIG_FILE)
     if not isinstance(cfg, dict):
         cfg = {}
     out = dict(DEFAULTS)
+    # 学校档案铺在 DEFAULTS **之上**：选了嘉兴时它会覆盖 portalHost / campusSubnets 等。
+    # ⚠️ 顺序不能反 —— 反了 DEFAULTS 里的郑航地址会把嘉兴的盖掉。
+    out.update(school_profile(cfg.get("school")))
     out["userId"] = ""
     out["passwd"] = ""
-    out.update({k: v for k, v in cfg.items() if v is not None})
+    # 化石键**不参与覆盖**：它们不是用户的选择，只是老版本顺手写下的痕迹，
+    # 留着就会把学校档案盖住（见 _fossil_keys）。
+    skip = set(_fossil_keys(cfg))
+    out.update({k: v for k, v in cfg.items() if v is not None and k not in skip})
     return out
 
 
 def save_config(cfg):
+    """整份覆盖。⚠️ 除了迁移和测试，**业务代码不要用这个** —— 用 `update_config()`。
+
+    原因见 `update_config` 的说明：整份写回会把内置默认值固化成用户配置。
+    """
     write_json(CONFIG_FILE, cfg)
 
 
+def update_config(patch):
+    """**只改 `patch` 里点名的键**，文件里其它键原样保留。
+
+    🔴 为什么不能写成 `cfg = load_config(); cfg[k] = v; save_config(cfg)`
+       （2026-10-12 实测复现）：`load_config()` 返回的是合并后的**整份**，
+       把它写回去等于把**内置默认值固化成了用户配置** —— 从此换学校换不过去。
+       本机真实 config.json 里就躺着老版本写下的 4 个这样的键。
+
+    `patch` 里值为 None 的键 = **删除**该键。
+    ⚠️ 只写「文件里本来就有的键 + patch 里点名的键」，绝不注入档案值。
+    """
+    raw = read_json(CONFIG_FILE)
+    if not isinstance(raw, dict):
+        raw = {}
+    for k, v in patch.items():
+        if v is None:
+            raw.pop(k, None)
+        else:
+            raw[k] = v
+    write_json(CONFIG_FILE, raw)
+    return raw
+
+
+def set_school(key):
+    """切换学校：写 `school` 键，并清掉老版本留下的化石键。
+
+    返回 (生效的学校 key, 被清掉的化石键列表)。
+
+    ⚠️ 为什么「清化石」这一步必须做、而且必须在这里做：
+        `load_config()` 里那道过滤（`_fossil_keys`）已经能让化石键不生效了，
+        但**文件里那份谎话还在** —— 用户拿记事本打开 config.json 会看到
+        一个他从没写过的 `portalHost`，而它跟界面上选的学校是矛盾的。
+        所以这里把它物理删掉，让文件本身也是诚实的。
+        （两道防线：读的时候不认它，写的时候顺手清掉。测试两条都钉了。）
+    """
+    k = key.strip().lower() if isinstance(key, str) else ""
+    if k not in SCHOOLS:
+        k = DEFAULT_SCHOOL
+    raw = read_json(CONFIG_FILE)
+    if not isinstance(raw, dict):
+        raw = {}
+    dropped = _fossil_keys(raw)
+    patch = {f: None for f in dropped}
+    patch["school"] = k
+    update_config(patch)
+    if dropped:
+        log("切换学校 → %s：清掉了老版本固化在 config.json 里的 %d 个键（%s）"
+            % (k, len(dropped), "、".join(dropped)))
+    return k, dropped
+
+
 # ---- 学校参数的取值函数（默认值在文件顶部「学校参数」一节，可被 config.json 覆盖）----
-# 三个都收一个可选的已读好的 cfg，免得在一次登录里把同一个文件读三遍。
+# 都收一个可选的已读好的 cfg，免得在一次登录里把同一个文件读三遍。
 def _cfg_or_load(cfg):
     return cfg if isinstance(cfg, dict) else load_config()
+
+
+def school_key(cfg=None):
+    """当前生效的学校 key。
+
+    ⚠️ 认不出来时**故意**退回 `DEFAULT_SCHOOL` 而不是报错 —— 用户把 key 拼错了，
+       行为应当回到「郑航默认」，而不是让程序起不来。
+       （和 `school_profile()` 的兜底是同一条原则。）
+    """
+    v = _cfg_or_load(cfg).get("school")
+    if not isinstance(v, str) or not v.strip():
+        return DEFAULT_SCHOOL
+    v = v.strip().lower()
+    return v if v in SCHOOLS else DEFAULT_SCHOOL
+
+
+def portal_type(cfg=None):
+    """当前该走哪套认证实现：'webauth'（郑航） / 'srun'（深澜，嘉兴大学）。
+
+    🔴 抽出来是因为它原来在 `portal_login` / `check_password` / `portal_logout`
+       里**各抄了一遍** —— 三份判断迟早会漂移，而漂移的表现是
+       「登录走 srun、登出却走 webauth」这种只在特定学校才炸的错。
+    """
+    v = _cfg_or_load(cfg).get("portalType")
+    if isinstance(v, str) and v.strip():
+        return v.strip().lower()
+    return "webauth"
+
+
+def school_choices():
+    """界面上学校下拉框的选项：`[(key, 中文名), …]`，顺序固定（按 SCHOOLS 的定义序）。
+
+    ⚠️ 顺序**不能**用 `sorted()`：字典序是 zjxu / zua，
+       而用户最可能选的是列表第一个（郑航）—— 排序会把它挤到后面。
+    """
+    return [(k, (p.get("name") or k)) for k, p in SCHOOLS.items()]
+
+
+def school_name(key=None):
+    """学校的中文名（界面显示用）。`key=None` = 当前生效的那所。"""
+    k = school_key() if key is None else key
+    return (SCHOOLS.get(k) or {}).get("name") or (k or "未知学校")
 
 
 def trigger_url(cfg=None):
@@ -547,20 +735,45 @@ def save_accounts(store):
             _ACCOUNTS_LOCK.release()
 
 
-def upsert_account(uid, pwd, overwrite):
+def upsert_account(uid, pwd, overwrite, school=None):
     """记录一个账号。
 
     overwrite=False 时**不覆盖**已存的密码 —— 切换账号时必须这样，
     否则回滚目标的密码就被新密码冲掉了，保险会失效。
+
+    🔴 `school`（2026-10-12 加）：这个账号是在**哪所学校**下保存的。
+       为什么必须记（不是锦上添花）：
+           账号库是**两所学校共用**的（同一个 accounts.json）。
+           用户在郑航存了自己的账号、又切到嘉兴帮同学测，
+           之后只要在嘉兴这所学校下点一次「切换到此账号」，
+           **他的郑航密码就会被发到嘉兴大学的门户服务器上** ——
+           那是把密码交给第三方。所以每个账号都要带上它属于哪所学校，
+           界面上看得见、切换前会问一句（见 render_accounts / on_switch）。
+
+       `school=None` = **不改动**已有的标记（老版本存下的账号没有这个键，
+       这时按「跟当前学校一致」处理，不打扰用户）。
     """
     def _do(store):
-        if uid not in store["accounts"]:
-            store["accounts"][uid] = {"passwd": pwd, "lastSuccess": "",
-                                      "lastAttempt": "", "lastResult": ""}
-        elif overwrite or not store["accounts"][uid].get("passwd"):
-            store["accounts"][uid]["passwd"] = pwd
+        a = store["accounts"].get(uid)
+        if a is None:
+            a = {"passwd": pwd, "lastSuccess": "", "lastAttempt": "",
+                 "lastResult": ""}
+            store["accounts"][uid] = a
+        elif overwrite or not a.get("passwd"):
+            a["passwd"] = pwd
+        # ⚠️ 只在明确传了学校时才写 —— 别用 school_key() 兜底，
+        #    否则守护/自动登录那条路会把老账号的标记悄悄改成当前学校。
+        if school:
+            a["school"] = school
 
     mutate_accounts(_do)
+
+
+def account_school(uid):
+    """这个账号是在哪所学校下保存的。没标记（老数据）返回空串。"""
+    a = (load_accounts().get("accounts") or {}).get(uid) or {}
+    v = a.get("school")
+    return v if isinstance(v, str) else ""
 
 
 def update_account_record(uid, pwd, ok):
@@ -615,10 +828,12 @@ def logged_out_recently(within=GUARD_RESPECT_LOGOUT):
 
 
 def set_active_account(uid, pwd):
-    cfg = load_config()
-    cfg["userId"] = uid
-    cfg["passwd"] = pwd
-    save_config(cfg)
+    """把「当前账号」记进 config.json。
+
+    ⚠️ 走 `update_config` 而不是 `save_config(load_config())` ——
+       后者会把内置默认值固化成用户配置，见 `update_config` 的说明。
+    """
+    update_config({"userId": uid, "passwd": pwd})
 
 
 def resolve_rollback(prev_uid):
@@ -671,9 +886,6 @@ def migrate_legacy_data():
         old_cfg = read_json(os.path.join(src, "config.json"))
         if not isinstance(old_cfg, dict):
             continue
-        cfg = dict(DEFAULTS)
-        cfg["userId"] = old_cfg.get("userId", "") or ""
-        cfg["passwd"] = old_cfg.get("passwd", "") or ""
         # ⚠️ 这里必须遍历 **SCHOOL_KEYS**，不能只遍历 DEFAULTS。
         #    DEFAULTS 只有 4 个键（portalHost / wlanAcIp / wlanAcName / timeoutSec），
         #    而换学校的用户会在 config.json 里额外写 campusSubnets / triggerUrl /
@@ -681,6 +893,14 @@ def migrate_legacy_data():
         #    用户看到的是「配置明明写了却不生效」（2026-10-05 用
         #    _repro_migrate_school_keys.py 实测复现，退出码 1）。
         #    回归钉在 school_profile_test.py 第 6 节。
+        #
+        # 🔴 2026-10-12：**不再拿 DEFAULTS 打底**（原来是 `cfg = dict(DEFAULTS)`）。
+        #    打底等于把内置默认值写成用户配置 —— 迁移过来的 config.json 会凭空多出
+        #    4 个化石键，从此换学校换不过去（见 `_fossil_keys` / `set_school`）。
+        #    只搬「旧文件里真的写了的东西」，缺的键 `load_config()` 自己会兜底。
+        cfg = {}
+        cfg["userId"] = old_cfg.get("userId", "") or ""
+        cfg["passwd"] = old_cfg.get("passwd", "") or ""
         for k in SCHOOL_KEYS:
             if old_cfg.get(k):
                 cfg[k] = old_cfg[k]
@@ -1296,18 +1516,34 @@ def need_logout_before_switch(net):
 
 
 def local_ipv4():
-    """借 UDP connect 拿到本机用于访问 portal 的出口 IP（不发包）"""
+    """借 UDP connect 拿到本机用于访问 portal 的出口 IP（不发包）。
+
+    🔴 为什么要有**字面量 IP 兜底**（2026-10-12，嘉兴实机测出来的）：
+        这里只借 `connect()` 让内核**选一次路由**，并**不真的发包** ——
+        所以目标地址是不是 portal 根本不重要，重要的是它**必须能被解析出来**。
+        而 `portalHost` 是**域名**时（郑航是纯 IP `202.196.169.166`，嘉兴是
+        `wlan.zjxu.edu.cn`），这一句就变成了一个**隐式的 DNS 依赖**。
+        实测后果：嘉兴换 MAC 进未认证状态后，守护**连续 4 分钟什么都没做**
+        —— 因为 `on_campus_network()` 判不出来（它依赖本函数**和**
+        `portal_reachable()`，两个都要解析域名），`guard_decide()` 于是返回
+        「什么都不做」，而且**不写任何日志**。
+        ⇒ 加一组**字面量 IP** 兜底：解析不了域名时，用固定 IP 照样能选到路由、
+          拿到出口 IP。这**不改变**正常情况下的行为（域名永远先试）。
+    """
     host = urlparse(load_config().get("portalHost") or DEFAULTS["portalHost"]).hostname
-    if not host:
-        return None
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.connect((host, 80))
-        return s.getsockname()[0]
-    except Exception:
-        return None
-    finally:
-        s.close()
+    # 域名先试（保持原行为：拿到的是「朝 portal 那个方向的」出口 IP）；
+    # 解析不了就退到字面量 IP —— 它们唯一的用途就是让内核挑一条路由。
+    targets = ([host] if host else []) + ["223.5.5.5", "1.1.1.1"]
+    for t in targets:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect((t, 80))
+            return s.getsockname()[0]
+        except Exception:
+            continue
+        finally:
+            s.close()
+    return None
 
 
 _MAC_RE = re.compile(r"^[0-9a-f]{2}(?::[0-9a-f]{2}){5}$")
@@ -1447,6 +1683,14 @@ def wait_for_campus(max_seconds=60):
             if portal_reachable(2.0):
                 return True
         time.sleep(0.5)
+    # 🔴 超时了：把「为什么判成不在校园网」写进日志（2026-10-12，嘉兴实机测出来的）。
+    #    以前这里只 `return False`，调用方打一句「未检测到校园网，请确认已连接校园网
+    #    Wi-Fi」—— 而这句话在「Wi-Fi 明明连着、只是没认证」时是**误导**，
+    #    日志里也没有任何线索能查，只能靠猜。
+    ip = local_ipv4()
+    log("等校园网超时（%d 秒）：本机IP=%s，配置的校园网段=%s。"
+        "判据是「IP 落在网段」或「门户主机可达」，两条都没满足 ⇒ 判成不在校园网。"
+        % (max_seconds, ip or "取不到", ",".join(campus_subnets())))
     return False
 
 
@@ -1513,7 +1757,322 @@ def logout_form(user, token):
     return form
 
 
+# ==================== 深澜 Srun 适配（嘉兴大学）====================
+# 算法**逐行对照门户自己的 JS** 实现（`Portal.js` + `all.min.js` 里的
+# jquery-base64 v1.0 / md5 v2.10.0 / js-sha1 v0.6.0），原始 JS 见工作区的
+# `嘉兴大学-Srun算法采集.md`；并做过**逐字节对拍**（`_lab/srun_algo_check.py`：
+# 4 组用例的 JSON 载荷 / xEncode / base64 / info 全部一致）。
+#
+# 流程（2026-10-11 实网验证成功，`suc_msg = login_ok`）：
+#   1. GET /cgi-bin/get_challenge  → 一次性 token（只校验 IP，不校验账号）
+#   2. hmd5 = HMAC-MD5(原始密码, key=token)
+#   3. info = '{SRBX1}' + srun_b64(srun_xencode(JSON, token))
+#   4. chksum = sha1(token+uid+token+hmd5+token+acid+token+ip+token+n+token+type+token+info)
+#   5. GET /cgi-bin/srun_portal?action=login&…
+#
+# ⚠️ 判结果看 `suc_msg`，**不是 `ecode`** —— 「已在线」时 ecode 也是 0（实网踩过）。
+# ⚠️ 该校开了 **macauth**：设备被 AC 按 MAC 自动放行时 `domain == "macauth"`，
+#    那属于**正常在线**，别误判成「需要登录」（见 srun_status）。
+# ⚠️ 纯标准库；请求走项目的 `Session`（它已经禁用系统代理 —— 校园网内网正需要这个）。
+SRUN_ALPHA = "LVoJPiCN2R8G90yg+hmFHuacZ1OWMnrsSTXkYpUq/3dlbfKwv6xztjI7DeBE45QA"
+_SRUN_MASK = 0xFFFFFFFF
+SRUN_AC_ID = 1
+SRUN_N = 200
+SRUN_TYPE = 1
+SRUN_ENC = "srun_bx1"
+SRUN_LOGIN_OK = "login_ok"
+SRUN_ALREADY_ONLINE = "ip_already_online_error"
+
+
+def _srun_str2long(a, w):
+    """门户里的 `s(a, b)`。按 UTF-16 码元取码（等价于 JS 的 charCodeAt）。"""
+    raw = a.encode("utf-16-le")
+    units = [raw[i] | (raw[i + 1] << 8) for i in range(0, len(raw), 2)]
+    v = []
+    for i in range(0, len(units), 4):
+        val = 0
+        for j, u in enumerate(units[i:i + 4]):
+            val |= u << (8 * j)
+        v.append(val & _SRUN_MASK)
+    if w:
+        v.append(len(units))
+    return v
+
+
+def _srun_long2str(a, w):
+    """门户里的 `l(a, b)`。本流程只用 `w=False`。"""
+    d = len(a)
+    out = []
+    for x in a:
+        out.append(chr(x & 0xFF))
+        out.append(chr((x >> 8) & 0xFF))
+        out.append(chr((x >> 16) & 0xFF))
+        out.append(chr((x >> 24) & 0xFF))
+    s = "".join(out)
+    if not w:
+        return s
+    c = (d - 1) << 2
+    m = a[d - 1]
+    if m < c - 3 or m > c:
+        return None
+    return s[:m]
+
+
+def srun_xencode(msg, key):
+    """门户里的 `encode(str, key)` —— XXTEA 变体。
+
+    ⚠️ JS 的 `>>>` / `<<` / `^` 都把操作数转成 32 位，Python 不会 ⇒
+       每处位运算后补 `& 0xFFFFFFFF`（低 32 位相同，是**等价**不是近似）。
+       但中间变量 `m` **反而不能截断** —— JS 那里是浮点加法不溢出，
+       而 `(v[p] + m) & MASK` 只取决于低 32 位。
+    """
+    if msg == "":
+        return ""
+    v = _srun_str2long(msg, True)
+    k = _srun_str2long(key, False)
+    if len(k) < 4:
+        k = k + [0] * (4 - len(k))
+    n = len(v) - 1
+    z = v[n]
+    y = v[0]
+    c = 0x86014019 | 0x183639A0          # = 0x9E3779B9（XXTEA 的 delta）
+    d = 0
+    q = int(6 + 52 / (n + 1))
+    while q > 0:
+        q -= 1
+        d = (d + c) & _SRUN_MASK
+        e = (d >> 2) & 3
+        p = 0
+        while p < n:
+            y = v[p + 1]
+            m = (z >> 5) ^ (y << 2)
+            m += (y >> 3) ^ (z << 4) ^ (d ^ y)
+            m += k[(p & 3) ^ e] ^ z
+            v[p] = (v[p] + m) & _SRUN_MASK
+            z = v[p]
+            p += 1
+        y = v[0]
+        m = (z >> 5) ^ (y << 2)
+        m += (y >> 3) ^ (z << 4) ^ (d ^ y)
+        m += k[(p & 3) ^ e] ^ z
+        v[n] = (v[n] + m) & _SRUN_MASK
+        z = v[n]
+    return _srun_long2str(v, False)
+
+
+def srun_b64(s):
+    """深澜自定义 base64（字符表与标准不同）。输入每字符码必须 ≤ 255。"""
+    data = [ord(ch) for ch in s]
+    n = len(data)
+    if n == 0:
+        return ""
+    imax = n - n % 3
+    out = []
+    for i in range(0, imax, 3):
+        b10 = (data[i] << 16) | (data[i + 1] << 8) | data[i + 2]
+        out.append(SRUN_ALPHA[(b10 >> 18) & 63])
+        out.append(SRUN_ALPHA[(b10 >> 12) & 63])
+        out.append(SRUN_ALPHA[(b10 >> 6) & 63])
+        out.append(SRUN_ALPHA[b10 & 63])
+    rem = n - imax
+    if rem == 1:
+        b10 = data[imax] << 16
+        out.append(SRUN_ALPHA[(b10 >> 18) & 63])
+        out.append(SRUN_ALPHA[(b10 >> 12) & 63])
+        out.append("=")
+        out.append("=")
+    elif rem == 2:
+        b10 = (data[imax] << 16) | (data[imax + 1] << 8)
+        out.append(SRUN_ALPHA[(b10 >> 18) & 63])
+        out.append(SRUN_ALPHA[(b10 >> 12) & 63])
+        out.append(SRUN_ALPHA[(b10 >> 6) & 63])
+        out.append("=")
+    return "".join(out)
+
+
+def _srun_jsonp(text):
+    """接口是 JSONP（`x({...})`），剥壳。"""
+    i = text.find("(")
+    j = text.rfind(")")
+    if i >= 0 and j > i:
+        return json.loads(text[i + 1:j])
+    return json.loads(text)
+
+
+def _srun_base(cfg=None):
+    return (_cfg_or_load(cfg).get("portalHost") or "").rstrip("/")
+
+
+def srun_status(cfg=None):
+    """查在线状态。不在线时 `res == "not_online_error"`。
+
+    ⚠️ `domain == "macauth"` 表示设备已被 AC 按 MAC **自动放行** ——
+       那属于正常在线，**别当成「需要登录」**（2026-10-12 实测）。
+    """
+    url = "%s/cgi-bin/rad_user_info?%s" % (
+        _srun_base(cfg),
+        urlencode({"callback": "x", "ip": local_ipv4() or ""}))
+    return _srun_jsonp(http_get(url, timeout=10, headers={"User-Agent": UA}).text)
+
+
+def srun_login(uid, pwd, cfg=None):
+    """深澜 Srun 认证。成功返回 True。
+
+    与 webauth 那套最大的差别：**不需要**先 GET 触发地址、也不用从重定向里
+    解析参数 —— 直接问门户要 token 再提交。
+    """
+    cfg = _cfg_or_load(cfg)
+    base = _srun_base(cfg)
+    if not base:
+        log("Srun: config 里没有 portalHost，没法认证")
+        return False
+
+    ip = local_ipv4()
+    if not ip:
+        log("Srun: 拿不到本机出口 IP（不在校园网？）")
+        return False
+
+    sess = Session({"User-Agent": UA})
+
+    # ---- 1) 拿 challenge ----
+    try:
+        r = sess.get("%s/cgi-bin/get_challenge?%s" % (
+            base, urlencode({"callback": "x", "username": uid, "ip": ip})),
+            timeout=10)
+        ch = _srun_jsonp(r.text)
+    except Exception as e:
+        log("Srun: get_challenge 失败：%s" % e)
+        return False
+
+    token = ch.get("challenge")
+    if not token:
+        log("Srun: 没拿到 challenge，响应=%r" % (r.text or "")[:200])
+        return False
+    log("Srun: 拿到 challenge（%d 字符），ecode=%s" % (len(token), ch.get("ecode")))
+
+    # ---- 2) 派生 hmd5 / info / chksum ----
+    hmd5 = hmac.new(token.encode("utf-8"), pwd.encode("utf-8"),
+                    hashlib.md5).hexdigest()
+    payload = json.dumps({
+        "username": uid, "password": pwd, "ip": ip,
+        "acid": SRUN_AC_ID, "enc_ver": SRUN_ENC,
+    }, separators=(",", ":"), ensure_ascii=False)
+    info = "{SRBX1}" + srun_b64(srun_xencode(payload, token))
+
+    chkstr = token + uid
+    chkstr += token + hmd5
+    chkstr += token + str(SRUN_AC_ID)
+    chkstr += token + ip
+    chkstr += token + str(SRUN_N)
+    chkstr += token + str(SRUN_TYPE)
+    chkstr += token + info
+    chksum = hashlib.sha1(chkstr.encode("utf-8")).hexdigest()
+
+    # ---- 3) 提交 ----
+    params = {
+        "callback": "x", "action": "login", "username": uid,
+        "password": "{MD5}" + hmd5,
+        # ⚠️ 门户实际值是 os="Windows 10" / name="Windows"，但实测服务端**不校验**，
+        #    用 "Windows" 也能登录成功（而且省掉了空格的编码问题）。
+        "os": "Windows", "name": "Windows",
+        "double_stack": "0", "chksum": chksum, "info": info,
+        "ac_id": str(SRUN_AC_ID), "ip": ip,
+        "n": str(SRUN_N), "type": str(SRUN_TYPE),
+    }
+    try:
+        r = sess.get("%s/cgi-bin/srun_portal?%s" % (base, urlencode(params)),
+                     timeout=15)
+        res = _srun_jsonp(r.text)
+    except Exception as e:
+        log("Srun: srun_portal 失败：%s" % e)
+        return False
+
+    suc = res.get("suc_msg") or ""
+    log("Srun: suc_msg=%r ecode=%s error=%r"
+        % (suc, res.get("ecode"), res.get("error")))
+
+    # 🔴 判成功看 `suc_msg`，**不是 `ecode`** —— 已在线时 ecode 也是 0（实网踩过）。
+    if suc in (SRUN_LOGIN_OK, SRUN_ALREADY_ONLINE):
+        if suc == SRUN_ALREADY_ONLINE:
+            log("Srun: 本来就在线（幂等，算成功）")
+        # 门户建会话要几秒 —— 与 webauth 那边同理，多探几次再下结论。
+        for i, delay in enumerate((2, 3, 3), 1):
+            time.sleep(delay)
+            net = test_internet(timeout=5)
+            if net is True:
+                log("Srun: 认证后第 %d 次探测：已连通" % i)
+                return True
+            log("Srun: 认证后第 %d 次探测：%s"
+                % (i, "仍未连通" if net is False else "无法判定"))
+        return False
+
+    log("Srun: 认证被拒：%s"
+        % (res.get("error_msg") or res.get("error") or "（没给原因）"))
+    return False
+
+
+def srun_logout(cfg=None):
+    """Srun 下线。三态约定与 `portal_logout` 相同（True / False / None）。
+
+    ⚠️ **对 macauth 会话无效**（2026-10-12 实网实测）—— 门户会回
+       `login_error` / "You are not online."。
+
+       那不是「失败」，而是「**本机已经没有计费会话**」
+       （AC 可能仍在按 MAC 放行，见 `嘉兴大学适配.md` §5.1）。
+
+       ⇒ 按 **True** 返回（确实没有会话可退），但日志会写明；
+         **绝不能当 False 去重试** —— 重试多少次都是同一个结果，
+         只会让用户白等三轮（`do_logout` 里那个重试循环）。
+    """
+    cfg = _cfg_or_load(cfg)
+    base = _srun_base(cfg)
+    uid = cfg.get("userId") or ""
+    ip = local_ipv4()
+    if not base or not ip:
+        log("Srun: 缺 portalHost 或本机 IP，没法下线")
+        return None
+    try:
+        r = http_get("%s/cgi-bin/srun_portal?%s" % (
+            base, urlencode({"callback": "x", "action": "logout",
+                             "username": uid, "ip": ip,
+                             "ac_id": str(SRUN_AC_ID)})),
+            timeout=15, headers={"User-Agent": UA})
+        res = _srun_jsonp(r.text)
+    except Exception as e:
+        log("Srun: 下线请求失败：%s" % e)
+        return None
+
+    suc = res.get("suc_msg") or ""
+    err = res.get("error") or ""
+    msg = res.get("error_msg") or ""
+    log("Srun: 下线响应 suc_msg=%r error=%r error_msg=%r ecode=%s"
+        % (suc, err, msg, res.get("ecode")))
+
+    if err == "ok" or suc:
+        return True
+    low = msg.lower()
+    if "not_online" in low or "not online" in low:
+        log("Srun: 门户说「本机不在线」—— 没有会话可退，算已下线")
+        log("      ⚠️ 若本机开了 macauth，AC 可能仍按 MAC 放行（这不是错误）")
+        return True
+    return None
+
+
 def portal_login(uid, pwd):
+    """认证入口 —— 按 `portalType` **分派**。
+
+    ⚠️ 这里只做分派，不碰两套实现里的任何逻辑：
+       · `webauth`（默认）= 郑航那套，原 `portal_login` 的代码**一字未改**地
+         搬进了 `webauth_login`；
+       · `srun` = 深澜 Srun（嘉兴大学）。
+    """
+    pt = portal_type()
+    if pt == "srun":
+        return srun_login(uid, pwd)
+    return webauth_login(uid, pwd)
+
+
+def webauth_login(uid, pwd):
     cfg = load_config()
     host = cfg.get("portalHost") or DEFAULTS["portalHost"]
     turl = trigger_url(cfg)          # 认证后跳转目标（可被 config.json 覆盖）
@@ -1615,7 +2174,17 @@ def portal_login(uid, pwd):
 
 
 def check_password(uid, pwd):
-    """只读校验：True 正确 / False 密码错 / None 无法判断"""
+    """只读校验：True 正确 / False 密码错 / None 无法判断
+
+    ⚠️ 2026-10-12 起按 `portalType` **分派**：**Srun 没有这个接口**
+       （郑航那套是 `checkUserPwdGeneral.do`），直接返回 `None`（「无法判断」），
+       调用方会按「跳过校验」处理。
+       Srun 的密码对不对，只能在真正登录时从 `suc_msg` 看出来 ——
+       这也够用：登录失败时会明确说「认证被拒」。
+    """
+    if portal_type() == "srun":
+        log("Srun: 没有独立的密码校验接口，跳过（真正登录时才知道）")
+        return None
     cfg = load_config()
     host = cfg.get("portalHost") or DEFAULTS["portalHost"]
     try:
@@ -1756,7 +2325,14 @@ def portal_logout():
 
     调用方**只应在 False 时报「退出失败」**；None 要按「可能要重试」处理，
     别把一次网络抖动当成一次确定的失败。
+
+    ⚠️ 2026-10-12 起按 `portalType` **分派**：`srun` 走 `srun_logout`，
+       其余（默认）走下面这段 webauth 的实现 —— **逻辑一字未改**。
+       ⚠️ 分派点放在**这里**（最里层）而不是 `do_logout()` ——
+          后者那套「锁 + 三态 + 重试 + 写结果」是通用的，两套协议都能用。
     """
+    if portal_type() == "srun":
+        return srun_logout()
     cfg = load_config()
     host = cfg.get("portalHost") or DEFAULTS["portalHost"]
     token = get_distoken()
@@ -2046,6 +2622,7 @@ def run_guard(seconds=GUARD_SECONDS, poll=GUARD_POLL):
     streak = 0        # 连续「测不出是否联网」的次数
     fails = 0         # 连续重连失败次数
     next_beat = time.time() + 300
+    last_state = None  # 上一拍的判定结果；只在**变化**时记日志（见下面的说明）
     # 退出原因。最后那行日志要**如实**说 —— 写死「已跑满 N 秒」的话，因为
     # 凭据被清除而提前退出时日志会撒谎，排查的人会被这行带偏。
     why_exit = "已跑满 %d 秒" % seconds
@@ -2071,6 +2648,19 @@ def run_guard(seconds=GUARD_SECONDS, poll=GUARD_POLL):
             # 不在校园网就不必花时间做联网检测 —— 那一项才是贵的（最多 10 秒）。
             net = test_internet(timeout=AUTO_NET_TIMEOUT) if on is True else None
             act = guard_decide(net, on, streak)
+            # 🔴 每一拍都把**判定结果**记下来（2026-10-12，嘉兴实机测出来的）：
+            #    以前 GUARD_IDLE 是**完全静默**的，于是「守护 4 分钟一次登录都没尝试」
+            #    在日志里只表现为「只有心跳」—— 事后完全分不清是
+            #    「不在校园网」「已经在线」还是「测不出来」，只能靠猜。
+            #    ⚠️ 只在**变化**时记：30 秒一条会把日志刷满（那正是当初保持静默的理由）。
+            #       首拍一定记，所以任何异常状态都不会被漏掉。
+            state = (on, net, act)
+            if state != last_state:
+                last_state = state
+                log("守护判定：在校园网=%s 联网=%s（本机IP=%s）→ %s"
+                    % ({True: "是", False: "否", None: "判不出"}[on],
+                       {True: "已联网", False: "被门户拦", None: "判不出"}[net],
+                       local_ipv4() or "取不到", act))
             if act == GUARD_WAIT:
                 streak += 1
                 log("守护：在校园网但测不出是否联网（连续第 %d 次）" % streak)
@@ -2945,11 +3535,27 @@ def autostart_upgrade():
 HELP_TEXT = (("校园网自动登录 —— 使用说明（v%s）\n" % VERSION) + r"""
 【第一次使用】
 
-  1. 填上你的校园网账号和密码
-  2. 点「仅保存」
-  3. 勾选最下面的「开机时自动登录校园网」
+  1. 选学校：「账号信息」那行右边的下拉框。默认是郑航，本校用户不用动。
+  2. 填上你的校园网账号和密码
+  3. 点「仅保存」
+  4. 勾选最下面的「开机时自动登录校园网」
 
   以后开机自动联网，不用再管。
+
+
+【换学校】
+
+  点「账号信息」那行右边的「学校」下拉框就能换。目前内置两所：
+
+    · 郑州航空工业管理学院（默认）
+    · 嘉兴大学
+
+  换完之后，登录、退出、开机自启都会走新学校的认证门户，不用重启程序。
+
+  一个提醒：已保存的账号列表是几所学校**共用**的。如果某个账号是在另一所学校
+  下保存的，它那一行会多出一个橙色的学校名。真去点「切换到此账号」时程序会
+  再问你一次 —— 因为继续下去会把那个账号的密码发到当前学校的门户服务器上。
+  确实要用它，点一次「仅保存」就能把标记改成当前学校。
 
 
 【三个按钮】
@@ -3026,7 +3632,8 @@ HELP_TEXT = (("校园网自动登录 —— 使用说明（v%s）\n" % VERSION) 
 
 【注意】
 
-  · 只适用于本校校园网。部分杀毒软件可能误报，加白名单即可。
+  · 只适用于内置档案里的那几所学校（见上面「换学校」）。部分杀毒软件可能误报，
+    加白名单即可。
   · 联网之后它还会继续守 30 分钟，掉线了自动重连，到点自己退出。
     这段时间里你要是主动点了「退出当前账号」，它不会把你登回去。
   · 主动退出账号后，校园网通常几十秒内会自动重新连上（学校那边的设置）。
@@ -4893,7 +5500,19 @@ class LoginApp:
 
         # --- 表单 ---
         c_form = self.card()
-        self.sec(c_form, "账号信息")
+        # 🔴 学校下拉框挂在**标题行右侧**，而不是下面新起一行（2026-10-12）。
+        #    为什么（这不是审美选择，是几何逼出来的）：
+        #      设置窗口的高度**直接等于内容高度**，而 16:10 屏上
+        #      `sh * SCREEN_H_RATIO` 只给到 906px。在下面新起一行要 80px
+        #      （实测：标签 22 + 间距 5 + 选择框 41 + 间距 12），加完是 **907px**
+        #      —— 正好压线，用户屏幕上凭空多一条滚动条、「开机自启」掉到滚动区外面。
+        #      实测数字见 `content_h_probe.py`。
+        #    挂在标题行右侧则是 **+0px**：标题行本来就 22px 高（徽章 22 + 标题字 22），
+        #      只要选择片也不超过 22px，整行高度一点不变。
+        #    ⚠️ 所以那个片的高度必须是 `linespace(SMALL)`（下面算出来的），
+        #       不能图省事写死一个更大的数 —— 一旦超过 22，整行被撑高，
+        #       内容高度跟着涨，而**这不会有任何报错**。
+        self.sec(c_form, "账号信息", right=self.school_selector)
         self.lbl(c_form, "学号 / 账号", self.SMALL, fg=SUB).pack(anchor="w", pady=(0, 5))
         self.var_uid = tk.StringVar()
         self.entry_box(c_form, self.var_uid)
@@ -5004,12 +5623,20 @@ class LoginApp:
         cv.pack(fill="x", pady=pady)
         return body
 
-    def sec(self, parent, text):
+    def sec(self, parent, text, right=None):
         """分区小标题：圆角彩色图标徽章 + 深色标题字。
 
         ⚠️ 高度和加图标之前**完全一致**（22px 徽章 vs 22px 的 Label 行高，
            外层都是 pady=(0,7)）—— 所以换上去之后内容高度一个像素都没变。
            这条是刻意的：改竖向间距就要重标定 CONTENT_H，能不碰就不碰。
+
+        `right` 是一个**工厂函数**，不是控件：`sec` 收下它、把「标题行」这个 Frame
+        交给它，由它现场造出要右对齐的控件并返回。
+        🔴 为什么必须是工厂（2026-10-12 踩到）：Tk 里**控件的 master 在创建时就定死了**，
+           `pack()` 只会把它放进自己的 master —— 先在别处建好、再交给这里 pack，
+           它**不会**跑到标题行里去，而且**不报任何错**，只是位置不对。
+        ⚠️ `right` 造出来的控件**也必须 <= 22px 高**，否则整行被撑高 ——
+           这类错同样**不报任何异常**，只表现为「窗口莫名其妙变高了」。
         """
         style = self.SEC_STYLE.get(text)
         if style is None:
@@ -5020,9 +5647,74 @@ class LoginApp:
                 % text)
         fg, soft, icon = style
         head = self.tk.Frame(parent, bg=CARD)
-        head.pack(anchor="w", pady=(0, 7))
+        # ⚠️ 原来是 `anchor="w"`。改成 `fill="x"` 才能把 right 推到最右边；
+        #    对没有 right 的分区没有任何视觉影响（子控件本来就是左对齐的）。
+        head.pack(fill="x", pady=(0, 7))
         icon_badge(head, self.tk, icon, fg, soft).pack(side="left")
         self.lbl(head, text, self.SMALL, True, SEC_FG).pack(side="left", padx=(8, 0))
+        if right is not None:
+            right(head).pack(side="right")
+        return head
+
+    def title_row_h(self):
+        """分区标题那一行的高度（= `linespace(SMALL)`，本机实测 22px）。
+
+        学校选择片必须**恰好**这么高，才不会把标题行撑高（见 sec / school_selector）。
+        按字体算而不是写死数字 —— 换字号时会自己跟着走。
+        """
+        import tkinter.font as tkfont
+        try:
+            return int(tkfont.Font(font=(self.fam, self.SMALL)).metrics("linespace"))
+        except Exception:
+            return self.SMALL + 13
+
+    def school_selector(self, head):
+        """造出「学校 [郑州航空工业管理学院 ▾]」，挂在「账号信息」标题行右侧。
+
+        🔴 为什么不新起一行（2026-10-12）：设置窗口的高度**直接等于内容高度**，
+           而 16:10 屏上 `sh * SCREEN_H_RATIO` 只给到 906px。新起一行要 80px
+           （实测：标签 22 + 间距 5 + 选择框 41 + 间距 12），加完是 **907px** ——
+           正好压线，用户屏幕上凭空多一条滚动条、「开机自启」掉到滚动区外面。
+           挂在标题行右侧是 **+0px**：那行本来就 22px 高。实测见 `content_h_probe.py`。
+
+        ⚠️ 不用 `tk.OptionMenu`：它是**直角**的，跟一屏圆角控件不搭
+           （和当初把 Label 换成 round_chip 是同一个理由）。
+        """
+        row = self.tk.Frame(head, bg=CARD)
+        self.lbl(row, "学校", self.SMALL, fg=SUB).pack(side="left", padx=(0, 6))
+        # 文字里带个 ▾ —— 一眼看出「这里能点开」。少了它，浅底小片看着就是个静态标签。
+        self.var_school = self.tk.StringVar(value=school_key())
+        holder = {}
+        self.chip_school = round_chip(
+            row, self.tk, self._school_chip_text(), (self.fam, self.SMALL),
+            BLUE_DARK, BLUE_SOFT, page=CARD, pad_x=11, height=self.title_row_h(),
+            hover="#d3e0ff", command=lambda: self._open_school_menu(holder["cv"]))
+        holder["cv"] = self.chip_school
+        self.chip_school.pack(side="left")
+        return row
+
+    def _school_chip_text(self):
+        """选择片上那行字。末尾的「▾」是**唯一**的「这里能点开」的提示 ——
+        去掉它，这块浅蓝小片看着就是个静态标签（和「当前使用」那种纯标签分不开）。
+
+        ⚠️ `▾` 前面留两个空格：那个字形本身的左右留白很小，
+           贴着学校名会看成「院▾」糊在一起（放大截图核对过）。
+        """
+        return "%s  ▾" % school_name()
+
+    def _open_school_menu(self, anchor):
+        """弹出学校菜单。`anchor` 是那块圆角片（菜单贴在它正下方）。"""
+        menu = self.tk.Menu(self.root, tearoff=0, font=(self.fam, self.BASE),
+                            bg=CARD, fg=FG, activebackground=BLUE_SOFT,
+                            activeforeground=BLUE_DARK)
+        for k, name in school_choices():
+            menu.add_radiobutton(label=name, value=k, variable=self.var_school,
+                                 command=lambda kk=k: self.on_school(kk))
+        try:
+            menu.tk_popup(anchor.winfo_rootx(),
+                          anchor.winfo_rooty() + anchor.winfo_height())
+        finally:
+            menu.grab_release()
 
     def entry_box(self, parent, textvariable=None):
         """带 1px 圆角描边、聚焦时描边变蓝的输入框。返回 (容器, Entry)。
@@ -5198,6 +5890,23 @@ class LoginApp:
             if uid == store.get("lastOnline"):
                 round_chip(line, self.tk, "上次登录", (self.fam, self.SMALL - 1),
                            "#15803d", OK_SOFT).pack(side="left", padx=(4, 0))
+            # 🔴 这个账号是在**另一所学校**下保存的（2026-10-12 加）。
+            #    账号库两校共用，所以列表里会混着别的学校的账号 ——
+            #    点错一次就会把 A 校的密码发到 B 校的门户（把密码交给第三方）。
+            #    所以必须**看得见**：这里给一个警示色小标签，on_switch 里还会再问一句。
+            #    ⚠️ 只在「不一样」时才显示 —— 老账号没有这个标记（`school` 缺失），
+            #       按「跟当前一致」处理，不打扰用户。
+            #    ⚠️ 高度不受影响：round_chip 只有 18px，比行高低，
+            #       靠 pack(side="left") 垂直居中，不会动 CONTENT_H。
+            #    ⚠️ 直接读上面已经取好的 `store`，**不要再调 account_school()** ——
+            #       那个函数会重新读一遍 accounts.json，每个账号一行就是一次文件读；
+            #       更要紧的是中途别的进程写一下，列表里就会出现「同一次渲染、
+            #       两个不同时刻的数据」。
+            a_school = a.get("school") if isinstance(a.get("school"), str) else ""
+            if a_school and a_school != school_key():
+                round_chip(line, self.tk, school_name(a_school),
+                           (self.fam, self.SMALL - 1), WARN, WARN_SOFT
+                           ).pack(side="left", padx=(4, 0))
             if a.get("lastSuccess"):
                 self.lbl(left, "上次成功：%s" % a["lastSuccess"], self.SMALL - 1,
                          fg=SUB).pack(anchor="w", pady=(3, 0))
@@ -5253,6 +5962,7 @@ class LoginApp:
         cfg = load_config()
         self.var_uid.set(cfg.get("userId") or "")
         self.pwd_field.set(cfg.get("passwd") or "")
+        self._sync_school()
         uid = cfg.get("userId")
         if uid:
             def _do(store):
@@ -5611,15 +6321,54 @@ class LoginApp:
         return uid, pwd
 
     def upsert(self, uid, pwd, overwrite):
-        upsert_account(uid, pwd, overwrite)
+        # 带上当前学校 —— 账号库是两所学校共用的，必须记得住「这个账号属于谁」，
+        # 否则切错学校就会把 A 校的密码发到 B 校的门户（见 upsert_account 的说明）。
+        upsert_account(uid, pwd, overwrite, school=school_key())
+
+    def _sync_school(self):
+        """把学校选择片拉回「配置文件里真实的值」。
+
+        为什么要有这一步：用户点完菜单，`variable` 已经被改成新值了，
+        但**写盘可能没成功**（比如正忙被拦下）。不同步的话界面显示新学校、
+        配置里还是旧学校 —— 又是一处静默说谎。
+        """
+        try:
+            k = school_key()
+            self.var_school.set(k)
+            self.chip_school.configure(text=self._school_chip_text())
+        except Exception:
+            pass                      # 界面正在销毁（关窗那一刻），画不了就算了
+
+    def on_school(self, key):
+        """学校下拉框选中了新的一项。"""
+        if self.state["busy"]:
+            self.show("正在处理上一个操作，请稍候", "info")
+            self._sync_school()       # 把下拉框弹回真实值
+            return
+        old = school_key()
+        if key == old:
+            return
+        new_key, dropped = set_school(key)
+        self._sync_school()
+        # 「清掉化石键」这件事必须说出来 —— 它是**修好了一个旧 bug**，
+        # 而不是日常动作；不吭声的话用户会以为程序动了他的配置。
+        note = ""
+        if dropped:
+            note = ("\n（顺带清掉了老版本自动写进配置文件的 %d 个旧参数：%s。"
+                    "它们会让「换学校」这个动作不生效。）"
+                    % (len(dropped), "、".join(dropped)))
+        self.show("已切换到「%s」。\n下次登录、以及开机自启，都会走这所学校的认证门户。%s"
+                  % (school_name(new_key), note), "ok")
+        # 账号行上「属于别的学校」的标记要跟着变
+        self.render_accounts()
+        # 校园网段变了 → 状态栏那句「已连接校园网 / 未连接」得重新判
+        self.refresh_status()
 
     def on_save(self):
         f = self.form()
         if not f:
             return
-        cfg = load_config()
-        cfg["userId"], cfg["passwd"] = f
-        save_config(cfg)
+        update_config({"userId": f[0], "passwd": f[1]})
         self.upsert(f[0], f[1], True)
         self.load_all()
         self.show("已保存", "ok")
@@ -5689,10 +6438,25 @@ class LoginApp:
         if not f:
             return
         uid, pwd = f
+        # 🔴 这个账号是在**另一所学校**下保存的 → 动手之前先把话说清楚。
+        #    账号库是两所学校共用的，点错一次就会把 A 校的密码发到 B 校的
+        #    门户服务器上 —— 那是把密码交给第三方，不能靠用户自己反应过来。
+        #    ⚠️ 只在**有标记且和当前不一致**时才问：老账号没有标记（返回空串），
+        #       按「跟当前一致」处理，不然每个老用户都会被多问一句。
+        a_school = account_school(uid)
+        if a_school and a_school != school_key():
+            if not self.messagebox.askyesno(
+                    APP_TITLE,
+                    "账号 %s 是在「%s」下保存的，而当前选的是「%s」。\n\n"
+                    "继续的话，它的密码会被发到「%s」的认证门户。\n\n"
+                    "如果这是选错了学校，请先在上面的「学校」里改回去。\n"
+                    "（如果确实要用它，点一次「仅保存」就能把标记改成当前学校。）\n\n"
+                    "确定继续吗？"
+                    % (uid, school_name(a_school), school_name(),
+                       school_name())):
+                return
         prev = load_config().get("userId") or ""
-        cfg = load_config()
-        cfg["userId"], cfg["passwd"] = uid, pwd
-        save_config(cfg)
+        update_config({"userId": uid, "passwd": pwd})
         self.upsert(uid, pwd, False)            # 不覆盖已存密码，回滚要靠它
         self.start_job("切换账号中，可能需要等待十几秒…",
                        self.action_runner(lambda: do_switch(uid, pwd, prev)))
@@ -6219,9 +6983,7 @@ def main():
                              "没有账号 %s 的密码，请先在设置页保存一次" % uid)
                 exit_now(1)
             prev = cur.get("userId") or ""
-            cfg = load_config()
-            cfg["userId"], cfg["passwd"] = uid, pwd
-            save_config(cfg)
+            update_config({"userId": uid, "passwd": pwd})
             upsert_account(uid, pwd, False)      # 不覆盖已存密码，回滚要靠它
             exit_now(do_switch(uid, pwd, prev))
         except Exception:

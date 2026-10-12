@@ -151,6 +151,10 @@ for bad, why in [
 # --------------------------------- 5. SCHOOL_KEYS 每个键都要有访问器接上
 section("5. SCHOOL_KEYS 里每个键都必须接线（防「加了键忘了接访问器」）")
 _probes = {
+    # ⚠️ `school` 是**选择器**不是参数（它决定去 SCHOOLS 里取哪一套），
+    #    所以探针是 `school_key()` 而不是 `load_config().get("school")` ——
+    #    要的是「认不出来的 key 会安静退回 zua」这个行为，不是原样读回。
+    "school":        C.school_key,
     "portalHost":    lambda: C.load_config().get("portalHost"),
     "wlanAcIp":      lambda: C.load_config().get("wlanAcIp"),
     "wlanAcName":    lambda: C.load_config().get("wlanAcName"),
@@ -161,6 +165,7 @@ _probes = {
     "loginExtra":    C.login_extra,
 }
 _sentinel = {
+    "school": "zjxu",
     "portalHost": "http://probe.invalid", "wlanAcIp": "9.9.9.9",
     "wlanAcName": "PROBE-BRAS", "timeoutSec": 1,
     "campusSubnets": ["77."], "triggerUrl": "http://probe.invalid/t",
@@ -189,6 +194,9 @@ os.makedirs(_MIG_OLD, exist_ok=True)
 os.makedirs(_MIG_NEW, exist_ok=True)
 _MIG_FULL = {
     "userId": "2026000001", "passwd": "secret",
+    # 🔴 `school` 必须一起搬 —— 换过学校的用户一升级又变回郑航是**静默的**：
+    #    界面上还显示着他选的学校名，只有登录打错门户才发现（2026-10-12 补）。
+    "school": "zjxu",
     "portalHost": "http://10.20.30.40", "wlanAcIp": "10.20.0.1",
     "wlanAcName": "OTHER-SCHOOL-BRAS", "timeoutSec": 12,
     "campusSubnets": ["172.16."], "triggerUrl": "http://10.20.30.40/",
@@ -220,6 +228,29 @@ try:
 finally:
     C.legacy_data_dirs = _legacy_orig
 check("幂等：第二次调用没动 config.json", _md5(C.CONFIG_FILE), _mig_md5)
+
+# 🔴 6b. 迁移**不许凭空多出化石键**（2026-10-12 修的）
+#    原来这里写的是 `cfg = dict(DEFAULTS)` 打底 —— 于是「只存了账号密码」的用户
+#    迁移完，config.json 里凭空多出 portalHost / wlanAcIp / wlanAcName / timeoutSec。
+#    这 4 个键的优先级**高于学校档案**，从此换学校换不过去（复现见
+#    `_repro_school_switch.py`）。现在只搬旧文件里真的写了的东西。
+_MIG_MIN_OLD = os.path.join(TMP, "legacy_min")
+_MIG_MIN_NEW = os.path.join(TMP, "migrated_min")
+os.makedirs(_MIG_MIN_OLD, exist_ok=True)
+os.makedirs(_MIG_MIN_NEW, exist_ok=True)
+with open(os.path.join(_MIG_MIN_OLD, "config.json"), "w", encoding="utf-8") as _fh:
+    json.dump({"userId": "2026000002", "passwd": "pw2"}, _fh, ensure_ascii=False)
+C.CONFIG_FILE = os.path.join(_MIG_MIN_NEW, "config.json")
+C.PURGED_FLAG = os.path.join(_MIG_MIN_NEW, "purged.flag")
+C.legacy_data_dirs = lambda: [_MIG_MIN_OLD]
+try:
+    check("（6b）最小旧配置也能迁移", C.migrate_legacy_data(), True)
+finally:
+    C.legacy_data_dirs = _legacy_orig
+_mig_min = json.load(open(C.CONFIG_FILE, encoding="utf-8"))
+check("（6b）迁移后**没有**多出化石键", sorted(_mig_min), ["passwd", "userId"])
+check("（6b）缺的键由 load_config 兜底（portalHost 仍是默认）",
+      C.load_config().get("portalHost"), C.DEFAULTS["portalHost"])
 
 # ------------------------------------------------------------------ 7. 收尾
 section("7. 收尾：真实数据目录一个字节都没动")
