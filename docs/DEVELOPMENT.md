@@ -342,7 +342,109 @@ python savepoint.py diff                       # 先看看现在跟存档差在�
 > `git status` 报 `fatal: bad object HEAD`，连初始提交都没了。
 > 清快照用 `tidy`（只删引用，不碰对象）。
 
-## 开机自启：为什么用计划任务，而不是启动文件夹
+## 🔴 版本号 / Tag / Release：三件事各管一段（2026-10-13 定的）
+
+> 起因：有人提醒「**正式发布必须从指定 Tag 对应的提交构建**」。一查发现
+> 我们这条链**断了一环** —— 当时 `deploy.py` 的 preflight 只检查 `site/` 和
+> `wrangler.toml` 在不在，**没有任何东西**保证「发出去的 exe 是从哪份代码构建的」。
+> 也就是说「手改了文件没提交 → 打包 → 发布」这条路是**通的**，而它正是
+> 红线「同一版本号不能发两份不同的包」要防的事 —— 那两份包连内容都对不上，
+> 事后也查不出哪份是哪份。
+
+三件事，各答一个问题：
+
+| | 回答什么 | 我们的载体 |
+|---|---|---|
+| **版本号** | 这次改动**是什么性质** | `campus_login.VERSION`（唯一来源）+ `README.md` |
+| **Tag** | 这个版本**对应哪份代码** | git tag `v<版本>` |
+| **Release** | 哪个版本**已经交给用户** | 站点 `version.json` / `versions.json` + GitHub Release |
+
+### 版本号按「性质」升，不按「发了几次」升
+
+- 只修 bug ⇒ 加修订号：`0.6.0 → 0.6.1`
+- 有新功能 ⇒ 加次版本号：`0.6.1 → 0.7.0`
+- 一次发布里既有新功能又有修 bug ⇒ 按**最高的那一档**算
+- **一次发布修三个 bug，也还是只加一位** —— 版本号不记录提交次数
+
+⚠️ **历史遗留**：0.5.0 ~ 0.5.6 一直是「每发一次 +1 修订号」，**不是严格语义化**。
+最明显的例子：0.5.4（嘉兴 Srun）和 0.5.6（上网数据）都是**新功能**，本该是次版本号升级；
+而且 0.5.5 和 0.5.6 其实是**同一个功能的两次迭代**，占掉了两个版本号。
+⇒ **0.5.6 已经发出去了，不改**（正式 tag 建了就不动，清单也不能改）；
+**从下一个版本开始按语义升** —— 下一个新功能是 `0.6.0`。
+
+### Tag 只锚定，不代表已发布
+
+- **先有 tag，再有 Release**。中间可以攒几个 tag 不发布，最后挑一个发。
+- 正式 tag **建了就不再移动**。要改就发新版本，不要把 `v0.6.0` 挪到新代码上。
+- 「有 tag」≠「已发布」：站点清单和 Releases 页只列**发过**的版本。
+
+### 发版顺序（和 2026-10-13 之前**不一样**）
+
+```bash
+# 1. 改代码 → 跑测试（run_tests.py fast / env）
+# 2. 升版本：campus_login.py 的 VERSION + README.md 里的版本号
+python refresh_screenshot.py          # ⚠️ 必须在提交**之前**（它写 repo/docs/main.png）
+# 3. 提交
+git -C repo commit ...
+# 4. 打 tag（锚点）
+git -C repo tag v0.6.0
+# 5. 构建 —— 这一步会**拒绝**在脏工作区上构建
+python repo/build.py                  # 产出 repo/distN/ + BUILD-INFO.txt
+python make_site.py && python make_manifest.py
+python deploy/upload_cnb.py
+python deploy/deploy.py               # ⚠️ 先 unset 掉所有 *_proxy（见下）
+python deploy/deploy.py --verify
+python api_push.py --release v0.6.0 --release-body-file rel_notes_v0.6.0.md
+python deploy/deploy.py --verify-sources
+```
+
+⚠️ **旧顺序是「先打包、后提交」**。那个顺序下，exe 是在**工作区可能有未提交改动**的
+状态下打出来的，谁也没法证明它对应哪次提交。现在改成「**提交 → tag → 构建**」，
+配合下面两道门，链条才闭合。
+
+### 三道门（都是 2026-10-13 加的）
+
+1. **`build.py`：工作区必须干净**。不干净就拒绝构建，并列出脏文件。
+   干净 ⇒ exe 的内容必然等于 HEAD 的内容。
+   只想本地试打包用 `--allow-dirty`，但那种包会被标记成 `dirty=yes`。
+2. **`build.py` 写 `distN/BUILD-INFO.txt`**：`version` / `commit` / `dirty` / `built`。
+   让下游能**核对**，而不是靠人记。
+3. **`make_site.py` 挑包时按版本挑，不按编号挑**，并且跳过 `dirty=yes` 的。
+   ⚠️ 编号**会被回收**（删掉 `distN` 后 `build.py` 会重新用那个编号），所以
+   「0.5.6 在 dist19、0.5.5 在 dist20」这种**反序**真的发生过 ——
+   那时「取 N 最大」会把**旧包**挑出来发出去。
+4. **`deploy.py` preflight：HEAD 上必须有 tag `v<版本>`**。没有就拒绝发布。
+
+### ⚠️ 发布前必须清掉代理
+
+```bash
+unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy ALL_PROXY all_proxy
+```
+
+本机（沙箱）默认带着 `HTTP_PROXY=http://127.0.0.1:49213`，wrangler 会**用上它**
+（日志里明写 `Proxy environment variables detected`），资产上传会卡死 ——
+2026-10-13 实测 `bucket 3/3` 超时、重试 5 次、**挂了 8 小时**。
+⚠️ 用 shell 的 `unset`，**别用 `env -u`**（本机的 `env` 是假的，见上面那条）。
+
+### ⚠️ `api.github.com` 要重试
+
+这个环境里它的 TLS 握手大约**5 次才通 1 次**（`SSL: UNEXPECTED_EOF_WHILE_READING` /
+`RemoteDisconnected` / `Tunnel connection failed: 502`）。
+⚠️ **`api_push.py --probe` 三主机全通**（裸 TCP connect）—— 所以
+**「探测通过」不等于「请求能发出去」**。发布脚本要带重试，并且：
+拿到 **422** 说明「上一次其实成功了、只是响应丢了」⇒ 改用
+`fix_release_asset.py --tag` 补传，**别再重试**（会留下空 Release）。
+
+⚠️ `--verify-sources` 报 GitHub 源失败时先别慌：这个环境到 github.com 的
+**大文件传输**不稳（小请求/响应头能通，11 MB 的体就断）。复核办法是
+**完整下载 + 对 sha256**，别只看那一条红。
+
+### ⚠️ 提交信息要写进文件再 `git commit -F`
+
+直接 `git commit -m "...`某个脚本.py`..."` 里的**反引号会被 bash 当命令替换执行**
+（2026-10-13 实测：报了 `xxx: command not found`，提交正文被吃掉一段）。
+`api_push.py` 的 `--release-body-file` 就是这个理由。
+
 
 2026-09-20 用本机事件日志逐帧量出来的同一次开机：
 

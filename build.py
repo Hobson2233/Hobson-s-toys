@@ -412,12 +412,82 @@ def _read_exe_version(path):
     return ctypes.wstring_at(ptr.value)
 
 
+# ------------------------------------------------------------ 构建溯源
+#
+# 🔴 「这个 exe 是从哪份代码构建的？」必须答得上来（2026-10-13 加）。
+#
+# 加这道门之前，**没有任何东西**保证「发出去的 exe 对应某一次提交」——
+# `deploy.py` 的 preflight 只检查 `site/` 和 `wrangler.toml` 在不在。
+# 于是「手改了文件没提交 → 打包 → 发布」这条路是**通的**，而它正是红线
+# 「同一版本号不能发两份不同的包」要防的事 —— 那两份包连内容都对不上，
+# 事后也查不出哪份是哪份。
+#
+# 做法（来自一条提醒：**正式发布必须从指定 Tag 对应的提交构建**）：
+#   · **构建前**：工作区必须干净 ⇒ exe 的内容必然等于 HEAD 的内容；
+#   · **构建后**：把「版本 / HEAD 的 sha / 干净与否」写进 `distN/BUILD-INFO.txt`，
+#     让下游（`make_site.py`）能**核对**，而不是靠人记；
+#   · 再配合「HEAD 上有 tag `vVERSION`」（`deploy.py` 的 preflight 查），
+#     `exe → 提交 → 版本` 这条链就闭合了。
+#
+# ⚠️ **发版顺序和以前不一样**（以前是「先打包、后提交」）：
+#      改代码 → 跑测试 → 升 VERSION + README → `refresh_screenshot.py`
+#      → **提交** → **打 tag** → `build.py` → `make_site.py` → …
+#   ⚠️ `refresh_screenshot.py` 必须在提交**之前** —— 它写的是
+#      `repo/docs/main.png`（在仓库里），放后面会把工作区弄脏、被这道门拦住。
+ALLOW_DIRTY = "--allow-dirty" in sys.argv
+
+
+def git_state():
+    """返回 `(commit_sha, dirty_lines, why)`；`why` 非空表示判不出来。
+
+    `dirty_lines` 只看**被跟踪的文件**（`--untracked-files=no`）：
+    `_lab/`、`dist*/`、`build*/`、`*.log` 这些未跟踪的东西不影响
+    「exe 是从哪份代码构建的」，拦它们只会让人烦。
+    """
+    def run(args):
+        return subprocess.run(["git"] + args, cwd=HERE,
+                              capture_output=True, text=True, timeout=20)
+    try:
+        sha = run(["rev-parse", "HEAD"]).stdout.strip()
+        st = run(["status", "--porcelain", "--untracked-files=no"])
+    except Exception as e:
+        return "", [], "跑不了 git（%s）" % type(e).__name__
+    if not sha:
+        return "", [], "git rev-parse HEAD 没输出（这里不是 git 仓库？）"
+    return sha, [l for l in st.stdout.splitlines() if l.strip()], ""
+
+
 def main():
     try:
         import tkinter  # noqa: F401
     except ImportError:
         print("当前解释器没有 tkinter，换一个（见本文件顶部的用法说明）")
         return 1
+
+    # 构建门槛 0：**工作区必须干净**（理由见上面那段「构建溯源」）。
+    # 放最前面：这条不需要任何计算，坏了立刻返回。
+    commit, dirty, why = git_state()
+    if why:
+        print("!! 构建门槛（工作区干净）无法判定：%s" % why)
+        print("   ⇒ 请在 git 仓库里跑 build.py —— 发布链路依赖这条。")
+        return 1
+    if dirty and not ALLOW_DIRTY:
+        print("!! 工作区有未提交的改动 —— 拒绝构建")
+        for l in dirty[:12]:
+            print("     %s" % l)
+        if len(dirty) > 12:
+            print("     …还有 %d 个" % (len(dirty) - 12))
+        print()
+        print("   为什么拦：不然打出来的 exe 和**任何一次提交**都不对应，")
+        print("   发布之后「%s 对应哪份代码」就答不上来了。" % VERSION)
+        print("   正确顺序：提交 → 打 tag → 构建。")
+        print("   （只想本地试打包：加 --allow-dirty。那种包会被标记成 dirty，")
+        print("     make_site.py 自动挑包时会跳过它。）")
+        return 1
+    if dirty:
+        print("⚠️ --allow-dirty：带着 %d 个未提交改动构建。" % len(dirty))
+        print("   ⚠️ 这个包**不许发布** —— 它和任何一次提交都不对应。")
+    print("构建来源: %s%s" % (commit[:12], "（dirty）" if dirty else ""))
 
     # 域名一致性检查（构建门槛，**源码级** —— 故意放在打包之前）。
     # 站点域名散在 7 个文件里（程序内置说明 / 更新清单地址 / 站点构建 / 发布校验 /
@@ -494,6 +564,25 @@ def main():
 
     src = os.path.join(dist, NAME + ".exe")
     print("产物:", src, os.path.getsize(src), "字节")
+
+    # 🔴 把溯源信息写在产物**旁边**，让下游能核对（不靠人记）。
+    #    `make_site.py` 挑包时会读它：`dirty=yes` 的、或者 `version` 和当前
+    #    `VERSION` 不一致的（那是上一版留下的旧包），一律跳过 ——
+    #    不然「拿旧包发新版」这种事没人发现得了（NOTE 里记过同类的教训）。
+    info = os.path.join(dist, "BUILD-INFO.txt")
+    try:
+        with open(info, "w", encoding="utf-8", newline="\n") as f:
+            f.write("version=%s\n" % VERSION)
+            f.write("commit=%s\n" % commit)
+            f.write("dirty=%s\n" % ("yes" if dirty else "no"))
+            f.write("built=%s\n" % time.strftime("%Y-%m-%d %H:%M:%S"))
+        print("溯源信息:", info)
+        print("          version=%s  commit=%s  dirty=%s"
+              % (VERSION, commit[:8], "yes" if dirty else "no"))
+    except Exception as e:
+        print("!! 写不了溯源信息 %s: %s" % (info, e))
+        print("   ⇒ 下游 make_site.py 认不出这个包，发布链路会断。")
+        return 1
 
     # 关键模块必须在包里。**放在冒烟测试之前**，因为漏掉模块的表现是
     # 「exe 启动即崩」→ 冒烟测试要跑满 45 秒超时才报错，而且报的是

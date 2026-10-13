@@ -281,9 +281,17 @@ def parse_days(chart, today=None):
     days = [merged[k] for k in sorted(merged)]
 
     # 今天：只有合计和时长，上下行是 None（见上面第 3 条）
-    today = None
+    #
+    # ⚠️ 变量名**故意不叫 `today`**（2026-10-13 踩过）：
+    #    原来写的是 `today = None`，再把那条记录赋给同一个名字 ——
+    #    于是**参数 `today` 先被自己清成了 None**，`today or 取当天` 永远走
+    #    「取当天」那一支，传进来的日期完全不起作用。
+    #    更阴的是：测试里传 `today="2026-10-12"`、那天**恰好**就是 10-12，
+    #    所以断言一直是绿的 —— 过了午夜才红。典型的「假绿」。
+    #    ⇒ 换个名字，从根上不可能再覆盖参数。
+    today_rec = None
     if "sameDayFlow" in use:
-        today = {
+        today_rec = {
             "date": today or datetime.date.today().isoformat(),
             "flow": _num(use.get("sameDayFlow"), 0.0),
             "up": None,
@@ -291,7 +299,7 @@ def parse_days(chart, today=None):
             "hours": _num_or_none(use.get("sameDayTime")),
         }
     return days, {
-        "today": today,
+        "today": today_rec,
         "total": {
             "flow": _num(use.get("cumulativeFlow"), 0.0),
             "hours": _num_or_none(use.get("cumulativeTime")),
