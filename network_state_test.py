@@ -231,6 +231,116 @@ finally:
         os.environ[_env_key] = _old_env
 
 
+# ------------------------- 6. IP 兜底能救什么、救不了什么（2026-10-15 加）
+section("6. local_ipv4 的 IP 兜底 —— 能救什么、救不了什么")
+# 背景（嘉兴大学实机，2026-10-12）：那台机器换 MAC 进未认证状态后，守护**连续 4 分钟
+# 一次登录都没尝试**。按日志排除法只能是 guard_decide() 返回了 GUARD_IDLE，
+# 而它只有在「on_campus_network() 不是 True」时才这样。偏偏 on_campus_network() 的
+# **两条**判据都要先把门户域名解析出来（郑航门户是纯 IP，嘉兴是 wlan.zjxu.edu.cn，
+# 所以这个问题在郑航从来没暴露过）⇒ 给 local_ipv4() 加了一组**字面量 IP 兜底**。
+#
+# ⚠️ 这条兜底**只救得了判据 1，救不了判据 2**。这一节把边界钉死，
+#    免得以后有人以为「加了兜底就万事大吉」。
+import socket as _socket  # noqa: E402
+
+
+_attempts = []
+# ⚠️ 用**开关**控制替身行为，绝不去改替身类的属性 ——
+#    第一版写成 `_FakeSock.connect = lambda ...` 直接覆盖了类方法，
+#    补丁**泄漏**到了后面那段（portal_reachable 于是拿到 True 而不是 False）。
+_fail_dns = [True]
+
+
+class _FakeSock:
+    """替身 socket：域名 connect 可以按 `_fail_dns` 决定失不失败（模拟 DNS 挂掉），
+    字面量 IP 永远成功。每次尝试的 host 记进 `_attempts`，用来验证「先试谁」。"""
+
+    def __init__(self, *a, **k):
+        pass
+
+    def connect(self, addr):
+        host = addr[0]
+        _attempts.append(host)
+        if _fail_dns[0] and any(ch.isalpha() for ch in host):
+            raise OSError("模拟 DNS 解析不了")
+
+    def getsockname(self):
+        return ("10.246.4.141", 51234)
+
+    def settimeout(self, t):
+        pass
+
+    def close(self):
+        pass
+
+
+class _FakeSocketMod:
+    AF_INET = _socket.AF_INET
+    SOCK_DGRAM = _socket.SOCK_DGRAM
+    SOCK_STREAM = _socket.SOCK_STREAM
+
+    @staticmethod
+    def socket(*a, **k):
+        return _FakeSock()
+
+
+_orig_socket = C.socket
+_orig_load_config = C.load_config
+try:
+    C.load_config = lambda: {"portalHost": "http://wlan.zjxu.edu.cn/"}
+    C.socket = _FakeSocketMod
+
+    # ① 域名解析不了 ⇒ 必须退到字面量 IP，而且**先试过域名**才算数
+    _fail_dns[0] = True
+    _attempts.clear()
+    check("DNS 挂掉时 local_ipv4() 仍拿得到出口 IP", C.local_ipv4(), "10.246.4.141")
+    check("它是「先试域名、失败了才退兜底」", _attempts,
+          ["wlan.zjxu.edu.cn", "223.5.5.5"])
+
+    # ② 阴性对照：域名**能**解析时，只试域名就返回 —— 兜底不参与
+    #    （对应 local_ipv4 注释里那句「不改变正常情况下的行为」）
+    _fail_dns[0] = False
+    _attempts.clear()
+    check("DNS 正常时 local_ipv4() 正常返回", C.local_ipv4(), "10.246.4.141")
+    check("阴性对照：只试了域名一次，没动兜底", _attempts, ["wlan.zjxu.edu.cn"])
+
+    # ③ 判据 2 救不了 —— portal_reachable() 连的是门户**域名**，没法用字面量 IP
+    #    代替：换成 223.5.5.5 就变成「能不能上公网」，语义完全变了（在家也会 True
+    #    ⇒ 把家里误判成校园网）。所以它**天生依赖 DNS**，返回 False 是安全的那一侧。
+    _fail_dns[0] = True
+    _attempts.clear()
+    check("portal_reachable 连的是门户域名（所以天生依赖 DNS）",
+          (C.portal_reachable(timeout=0.1), list(_attempts)),
+          (False, ["wlan.zjxu.edu.cn"]))
+finally:
+    C.socket = _orig_socket
+    C.load_config = _orig_load_config
+
+# ④ 🔴 兜底**只在「未认证 IP 仍落在 campusSubnets 里」时才管用**
+_orig_lip = C.local_ipv4
+try:
+    C.portal_reachable = lambda *a, **k: False      # 模拟门户不可达
+    C.campus_subnets = lambda: ["10.246."]
+
+    C.local_ipv4 = lambda: "10.246.4.141"           # 未认证 IP 还在校园网段
+    check("兜底生效：IP 在 10.246. 里 + 门户不可达 → 仍判在校园网",
+          C.on_campus_network(), True)
+
+    C.local_ipv4 = lambda: "10.99.0.7"              # 未认证 VLAN 跑到 10.246. 之外
+    check("🔴 兜底救不了：IP 不在校园网段 + 门户不可达 → 判成不在校园网",
+          C.on_campus_network(), False)
+    # ↑ 这条就是嘉兴那个「根因 (b)」。所以 0.5.6 的兜底**只在未认证 IP 仍落在
+    #   10.246. 时才管用**；若复测发现 IP 跑出去了，唯一的修法是把那个网段加进
+    #   嘉兴档案的 campusSubnets（改配置，不用改代码）。
+
+    C.local_ipv4 = lambda: None                     # 连兜底都拿不到
+    check("两条都拿不到 → None（判不了，不能硬说「不在」）",
+          C.on_campus_network(), None)
+finally:
+    C.local_ipv4 = _orig_lip
+    C.campus_subnets, C.portal_reachable = _orig_subnets, _orig_portal
+
+
 # ------------------------------------------------------------------ 汇总
 print("\n" + "=" * 70)
 print("通过 %d 项，失败 %d 项" % (len(PASS), len(FAIL)))
