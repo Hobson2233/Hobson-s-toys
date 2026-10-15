@@ -351,8 +351,12 @@ def section_switch():
           [k for k in ("portalHost", "wlanAcIp", "wlanAcName", "timeoutSec")
            if k in raw], [])
     check("school 写进去了", raw.get("school"), "zjxu")
-    check("凭据没被动过", (raw.get("userId"), raw.get("passwd")),
+    check("凭据没被动过", (raw.get("userId"), C.decrypt_secret(raw.get("passwd"))),
           ("2507210230", "fake-pw"))
+    # ⚠️ 2026-10-15 改：密码现在是 DPAPI 密文，不能再拿原始文件比明文。
+    #    上面那行用 decrypt_secret() 还原 —— 那才是「凭据没丢」的真实语义。
+    #    顺手钉住「写盘时确实加密了」，免得哪天加密静默失效这条还是绿的。
+    check("写盘时密码确实被加密了", C.is_encrypted(raw.get("passwd")), True)
     check("切完之后门户是嘉兴的", C.load_config()["portalHost"],
           "http://wlan.zjxu.edu.cn")
 

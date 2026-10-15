@@ -4,7 +4,7 @@
 
 > 非官方项目，与学校网络管理部门无关。请仅使用你本人有权访问的账号，并遵守学校的网络使用规定。
 
-当前版本 0.5.6，从 [Releases](../../releases) 或 [hobson2233.dpdns.org](https://hobson2233.dpdns.org) 下载，[历史版本](https://hobson2233.dpdns.org/history) 也都留着。
+当前版本 0.6.0，从 [Releases](../../releases) 或 [hobson2233.dpdns.org](https://hobson2233.dpdns.org) 下载，[历史版本](https://hobson2233.dpdns.org/history) 也都留着。
 
 ![设置界面](docs/main.png)
 
@@ -86,6 +86,10 @@
 ## 隐私与数据
 
 账号、密码与登录记录只写在本机 `C:\ProgramData\CampusLogin\`，该目录不可写时回退到 `%APPDATA%\CampusLogin\`。程序对外只访问学校认证门户与更新发布站 `hobson2233.dpdns.org`，没有统计、上报、崩溃收集或第三方接口。
+
+**密码是加密存的**（0.6.0 起）：用 Windows 自带的 DPAPI，密钥由 Windows 按当前登录用户保管，本程序既不生成也不保存密钥。换一个 Windows 用户、或把文件拷到别的电脑上**解不开**，打开只会看到 `enc:v1:` 开头的乱码；老版本存下的明文密码会在下次保存时自动升级，用户无需做任何事。
+
+⚠️ 别把它当保险箱：同一个 Windows 用户下运行的其它程序仍然解得开 —— DPAPI 是「按用户」不是「按程序」，它挡的是「别的用户 / 文件被拷走」，挡不住「这台电脑已经中了木马」。另外，若把「开机自动登录」的运行身份改成别的用户，密码会解不开，程序会当成「没存过」，重新输入一次即可。
 
 清掉本机账号数据有两种方式：设置页最下面的「清除本机保存的账号密码」，或命令行 `校园网自动登录.exe --purge`。两者都会删除 `config.json`、`accounts.json`、`last-result.json` 与 `campus-login.log`，不可恢复。
 

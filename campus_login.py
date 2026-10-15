@@ -27,6 +27,8 @@ import sys
 import json
 import time
 import socket
+import base64
+import copy
 import queue
 import threading
 import subprocess
@@ -77,7 +79,7 @@ APP_TITLE = "校园网自动登录"
 # ⚠️ 这里是**唯一来源**。界面标题、使用说明、--version、--selftest、
 #    以及 exe 文件属性里的版本，全部由它推导 —— 不要在别处另写一份，
 #    否则迟早漂移（改了一处忘了另一处，用户看到的版本号就是错的）。
-VERSION = "0.5.6"
+VERSION = "0.6.0"
 
 # ==================== 学校参数：换学校只改 config.json ====================
 #
@@ -464,6 +466,284 @@ def read_json(path):
         return None
 
 
+# ==================== 密码怎么存：DPAPI 加密 ====================
+#
+# 🔴 为什么改（2026-10-15，用户点名要求）：
+#     原来密码是**明文**躺在 config.json / accounts.json 里，而数据目录是
+#     `C:\ProgramData\CampusLogin` —— **这台机器上任何用户都能读**。
+#     自己的电脑还好，但借给别人用一会儿、机房机器、同学的电脑，
+#     就等于把校园网密码送出去了；而校园网密码往往和教务 / 邮箱同源，
+#     泄露面比「一个校园网」大得多。
+#
+# 做法：用 **Windows 自带的 DPAPI**（`CryptProtectData` / `CryptUnprotectData`）。
+#     加密密钥由 Windows 按**当前用户**保管 —— 我们既不生成也不保存密钥。
+#     ⇒ 换个 Windows 用户登录、或把文件拷到另一台机器，**解不开**（这正是要的）。
+#     ⇒ 用户**不用**再记一个「主密码」——那才是真会丢的东西。
+#
+# ⚠️ 三条必须说清楚的边界（别把它当保险箱）：
+#   1. **同一个用户下的其它程序仍然解得开** —— DPAPI 是「按用户」不是「按程序」。
+#      它挡的是「别的用户 / 文件被拷走」，挡不住「这台机器已经中了木马」。
+#      准确说法：把「明文躺在那，记事本一开就看见」升级成「得跑一段代码才能拿到」。
+#   2. 额外加了一串**固定熵**当胡椒（`_DPAPI_ENTROPY`）。它在 exe 里是公开的，
+#      作用只是让「随手调一下 CryptUnprotectData」的通用工具拿不到东西 ——
+#      **它不是密钥**，别指望它。
+#   3. 🔴 **开机自启的计划任务是以当前用户身份跑的**（`TASK_XML` 里
+#      `LogonType=InteractiveToken` + 同一个 `UserId`，见 `task_create()`），
+#      所以守护进程解得开。**哪天要是把任务改成别的身份 / SYSTEM，
+#      密码就解不开了** —— 那时必须改成 per-machine
+#      （`CRYPTPROTECT_LOCAL_MACHINE`）或换存储方式。改任务 XML 时别忘了这条。
+#
+# 兼容：老文件里是**明文** ⇒ 读的时候原样可用（没前缀就不动它），
+#      下一次写盘自动变成密文。用户什么都不用做。
+#      解不开时返回**空串**（= 当没存过，让用户重新输一次），
+#      **绝不把密文当密码发出去**。
+SECRET_PREFIX = "enc:v1:"
+
+# 固定熵（胡椒，不是密钥 —— 见上面第 2 条）
+_DPAPI_ENTROPY = b"CampusLogin/secret/v1"
+
+# 0x1 = CRYPTPROTECT_UI_FORBIDDEN：绝不弹任何界面。
+# ⚠️ 这条不能省 —— 这个函数在**后台守护进程**里也会被调到，那里弹窗等于卡死。
+_CRYPTPROTECT_UI_FORBIDDEN = 0x1
+
+_plaintext_warned = [False]          # 「加密不可用」只警告一次，别刷屏
+
+
+def is_encrypted(s):
+    """这串是不是我们写出去的密文。"""
+    return isinstance(s, str) and s.startswith(SECRET_PREFIX)
+
+
+def dpapi_available():
+    """DPAPI 能不能用（加密 + 解密各跑一次往返）。给 `--selftest` 用。"""
+    probe = "campus-login-dpapi-probe"
+    try:
+        blob = _dpapi(probe.encode("utf-8"), True)
+        if blob is None:
+            return False
+        back = _dpapi(blob, False)
+        return back is not None and back.decode("utf-8") == probe
+    except Exception:
+        return False
+
+
+def _dpapi(data, protect):
+    """跑一次 DPAPI。成功返回 bytes，失败返回 None（**任何情况下都不抛**）。
+
+    ⚠️ 为什么必须不抛：这个函数在**开机自启的守护进程**里也会被调到。
+       在这里抛出去等于「密码读不出来 ⇒ 整个自动登录挂掉」，而且报错还看不见。
+       读不出来就退回「当没存过」，让用户重新输一次 —— 那是可恢复的。
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class _BLOB(ctypes.Structure):
+            _fields_ = [("cbData", wintypes.DWORD),
+                        ("pbData", ctypes.POINTER(ctypes.c_char))]
+
+        def _mk(b):
+            buf = ctypes.create_string_buffer(b, len(b))
+            return (_BLOB(len(b),
+                          ctypes.cast(buf, ctypes.POINTER(ctypes.c_char))), buf)
+
+        if not data:
+            return None
+        crypt32 = ctypes.WinDLL("crypt32", use_last_error=True)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        # LocalFree 返回的是指针，不声明 restype 会被当成 c_int 截断
+        kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+        kernel32.LocalFree.restype = ctypes.c_void_p
+
+        blob_in, _k1 = _mk(data)
+        blob_ent, _k2 = _mk(_DPAPI_ENTROPY)
+        blob_out = _BLOB()
+        fn = crypt32.CryptProtectData if protect else crypt32.CryptUnprotectData
+        ok = fn(ctypes.byref(blob_in), None, ctypes.byref(blob_ent), None, None,
+                _CRYPTPROTECT_UI_FORBIDDEN, ctypes.byref(blob_out))
+        if not ok:
+            return None
+        try:
+            return ctypes.string_at(blob_out.pbData, blob_out.cbData)
+        finally:
+            kernel32.LocalFree(ctypes.cast(blob_out.pbData, ctypes.c_void_p))
+    except Exception:
+        return None
+
+
+def encrypt_secret(s):
+    """明文 → `enc:v1:<base64>`。空串 / 非字符串原样返回。
+
+    ⚠️ 加密不可用时**退回明文**并记一次日志 —— 宁可少一层保护，
+       也不能让用户「密码存不进去、每次开机都要手输」。
+       要确认它在不在工作，看 `--selftest` 里那行「密码加密」。
+    """
+    if not isinstance(s, str) or not s:
+        return s
+    if is_encrypted(s):
+        return s                      # 已经是密文，别二次加密
+    blob = _dpapi(s.encode("utf-8"), True)
+    if blob is None:
+        if not _plaintext_warned[0]:
+            _plaintext_warned[0] = True
+            log("⚠️ 密码加密不可用（DPAPI 调用失败），本次仍按明文保存")
+        return s
+    return SECRET_PREFIX + base64.b64encode(blob).decode("ascii")
+
+
+def decrypt_secret(s):
+    """`enc:v1:…` → 明文。**没前缀的原样返回**（老文件里的明文照样能用）。
+
+    解不开时返回空串 —— 那表示「当没存过」，界面会提示重新输入一次。
+    🔴 绝不把密文原样当密码返回：那串东西会被发到门户服务器上。
+    """
+    if not isinstance(s, str) or not s:
+        return s
+    if not is_encrypted(s):
+        return s
+    try:
+        blob = base64.b64decode(s[len(SECRET_PREFIX):], validate=True)
+    except Exception:
+        log("密码读不出来：密文格式不对，按「没存过」处理")
+        return ""
+    raw = _dpapi(blob, False)
+    if raw is None:
+        log("密码读不出来：DPAPI 解不开（换了 Windows 用户 / 换了机器？）"
+            "—— 按「没存过」处理，请重新输入一次")
+        return ""
+    try:
+        return raw.decode("utf-8")
+    except Exception:
+        return ""
+
+
+def _secrets_walk(raw, fn):
+    """把 raw 里**所有**密码字段过一遍 fn。就地改，返回 raw。
+
+    密码存在两处：
+      · `config.json`    → 顶层 `passwd`
+      · `accounts.json`  → `accounts[<学号>]["passwd"]`
+    🔴 **两处都要过** —— 只做一处等于没做，另一处还是明文躺着。
+    """
+    if not isinstance(raw, dict):
+        return raw
+    if isinstance(raw.get("passwd"), str):
+        raw["passwd"] = fn(raw["passwd"])
+    accs = raw.get("accounts")
+    if isinstance(accs, dict):
+        for a in accs.values():
+            if isinstance(a, dict) and isinstance(a.get("passwd"), str):
+                a["passwd"] = fn(a["passwd"])
+    return raw
+
+
+def read_secret_json(path):
+    """读 JSON 并把密码字段**解密**。文件不在 / 坏了 → None（和 read_json 一致）。"""
+    raw = read_json(path)
+    return None if raw is None else _secrets_walk(raw, decrypt_secret)
+
+
+def write_secret_json(path, obj):
+    """把密码字段**加密**后写。⚠️ **不改入参** —— 调用方手里那份必须还是明文。
+
+    为什么必须深拷贝：`update_config()` 是「读 → 改 → 写 → **返回 raw**」。
+    要是写的时候把 raw 里的密码就地换成密文，返回给调用方的那份就成了密文，
+    后面拿它去登录就废了。这种 bug 不报错、测试也可能不红，只表现为
+    「明明存对了却登录失败」——所以这里宁可多复制一次。
+    """
+    write_json(path, _secrets_walk(copy.deepcopy(obj), encrypt_secret))
+
+
+def secret_storage_text():
+    """一句话说清「磁盘上的密码现在是什么状态」。给 `--selftest` 用。
+
+    🔴 只看**有没有 `enc:v1:` 前缀**，**绝不真解密** —— 自检的输出会写进
+       `selftest.txt`，而那份文件是要发出去给人看的。把密码解到那里就闹笑话了。
+
+    为什么值得专门报一行：排查「开机自动登录突然说密码是空的」时，
+    第一手信息就是这一行 —— 多半是换了 Windows 用户 / 换了机器，DPAPI 解不开。
+    """
+    if not dpapi_available():
+        return "🔴 DPAPI 不可用 —— 密码只能按明文存"
+    n = enc = 0
+    for raw in (read_json(CONFIG_FILE), read_json(ACCOUNTS_FILE)):
+        if not isinstance(raw, dict):
+            continue
+        vals = [raw.get("passwd")]
+        accs = raw.get("accounts")
+        if isinstance(accs, dict):
+            vals += [a.get("passwd") for a in accs.values()
+                     if isinstance(a, dict)]
+        for v in vals:
+            if isinstance(v, str) and v:
+                n += 1
+                if is_encrypted(v):
+                    enc += 1
+    if n == 0:
+        return "DPAPI 可用；本机还没存过密码"
+    if enc == n:
+        return "DPAPI 已加密（%d 条）" % n
+    return "⚠️ 还有 %d/%d 条是明文（下次保存会自动加密）" % (n - enc, n)
+
+
+def should_upgrade_secrets(args):
+    """启动时要不要**主动**把明文密码升级成密文。`args` = main() 里那个小写参数列表。
+
+    🔴 自检入口（`--selftest` / `--guitest`）**不动真实数据**：
+       这两个恰恰是「**还没装新版**」时最常被跑的 —— `build.py` 的冒烟测试
+        就是拿刚打出来的新 exe 跑一次 `--selftest`（见 `main()` 上方那条注释）。
+        要是那次就把真实数据升级成密文，用户手上**还在用的旧版 exe**
+        会立刻读不懂密码（它会把那串 `enc:v1:…` 当密码发去门户）。
+        ⇒ 自检要写文件就写自己的 selftest.txt / guitest.txt，**别碰凭据**。
+
+    ⚠️ 抽成纯函数是为了**能测** —— 写成 `if "--selftest" not in args and ...`
+       内联在 main() 里的话，这条判断永远只有靠人读代码才能确认。
+    """
+    return "--selftest" not in args and "--guitest" not in args
+
+
+def upgrade_secrets_to_encrypted():
+    """把磁盘上残留的**明文**密码主动升级成密文。返回升级了几条（0 = 不用动）。
+
+    🔴 为什么必须有这一步（2026-10-15）：
+        光在「写盘时加密」是不够的 —— 老用户升级到 0.6.0 之后，
+        只要他**不再点一次「仅保存」**，config.json 里那串明文就会**一直躺着**。
+        而用户要的正是「别让密码明文躺在那」。所以得主动升一次。
+
+    ⚠️ 为什么放在**启动时**而不是「写盘时顺手」：写盘只发生在用户主动改东西时，
+       而明文残留恰恰是「用户什么都不改」的那种情况 —— 那正是最需要它的时候。
+
+    幂等：全都已经是密文时**一个字节都不写**。否则每次开机都改一次文件，
+          既没必要，也会让「文件被动过」这种排查信号失真。
+    """
+    changed = 0
+    for path, kind in ((CONFIG_FILE, "config.json"), (ACCOUNTS_FILE, "accounts.json")):
+        # ⚠️ 故意读**原始**的、不解密 —— 要判的是「磁盘上那串是不是明文」。
+        raw = read_json(path)
+        if not isinstance(raw, dict):
+            continue
+        plain = []
+        if (isinstance(raw.get("passwd"), str) and raw["passwd"]
+                and not is_encrypted(raw["passwd"])):
+            plain.append("passwd")
+        accs = raw.get("accounts")
+        if isinstance(accs, dict):
+            plain += [uid for uid, a in accs.items()
+                      if isinstance(a, dict) and isinstance(a.get("passwd"), str)
+                      and a["passwd"] and not is_encrypted(a["passwd"])]
+        if not plain:
+            continue
+        out = _secrets_walk(copy.deepcopy(raw), encrypt_secret)
+        if out == raw:
+            # 加密没生效（DPAPI 不可用，encrypt_secret 会原样退回）
+            # ⇒ **别写盘**，否则每次开机都白改一次文件。
+            continue
+        write_json(path, out)
+        changed += len(plain)
+        log("%s：把 %d 处明文密码升级成加密存储" % (kind, len(plain)))
+    return changed
+
+
 # ==================== 账号文件的互斥 ====================
 #
 # 🔴 为什么需要（2026-10-03，有复现脚本 _repro_accounts_race.py）：
@@ -546,7 +826,7 @@ def _fossil_keys(raw):
 
 
 def load_config():
-    cfg = read_json(CONFIG_FILE)
+    cfg = read_secret_json(CONFIG_FILE)
     if not isinstance(cfg, dict):
         cfg = {}
     out = dict(DEFAULTS)
@@ -567,7 +847,7 @@ def save_config(cfg):
 
     原因见 `update_config` 的说明：整份写回会把内置默认值固化成用户配置。
     """
-    write_json(CONFIG_FILE, cfg)
+    write_secret_json(CONFIG_FILE, cfg)
 
 
 def update_config(patch):
@@ -581,7 +861,7 @@ def update_config(patch):
     `patch` 里值为 None 的键 = **删除**该键。
     ⚠️ 只写「文件里本来就有的键 + patch 里点名的键」，绝不注入档案值。
     """
-    raw = read_json(CONFIG_FILE)
+    raw = read_secret_json(CONFIG_FILE)
     if not isinstance(raw, dict):
         raw = {}
     for k, v in patch.items():
@@ -589,7 +869,7 @@ def update_config(patch):
             raw.pop(k, None)
         else:
             raw[k] = v
-    write_json(CONFIG_FILE, raw)
+    write_secret_json(CONFIG_FILE, raw)
     return raw
 
 
@@ -608,7 +888,7 @@ def set_school(key):
     k = key.strip().lower() if isinstance(key, str) else ""
     if k not in SCHOOLS:
         k = DEFAULT_SCHOOL
-    raw = read_json(CONFIG_FILE)
+    raw = read_secret_json(CONFIG_FILE)
     if not isinstance(raw, dict):
         raw = {}
     dropped = _fossil_keys(raw)
@@ -734,7 +1014,7 @@ def load_accounts():
     """
     got = _ACCOUNTS_LOCK.acquire(timeout=ACCOUNTS_LOCK_TIMEOUT)
     try:
-        s = read_json(ACCOUNTS_FILE)
+        s = read_secret_json(ACCOUNTS_FILE)
         if not isinstance(s, dict):
             s = {}
         if not isinstance(s.get("accounts"), dict):
@@ -753,7 +1033,7 @@ def load_accounts():
 def save_accounts(store):
     got = _ACCOUNTS_LOCK.acquire(timeout=ACCOUNTS_LOCK_TIMEOUT)
     try:
-        write_json(ACCOUNTS_FILE, store)
+        write_secret_json(ACCOUNTS_FILE, store)
     finally:
         if got:
             _ACCOUNTS_LOCK.release()
@@ -907,7 +1187,7 @@ def migrate_legacy_data():
     for src in legacy_data_dirs():
         if not src or os.path.abspath(src) == dst:
             continue
-        old_cfg = read_json(os.path.join(src, "config.json"))
+        old_cfg = read_secret_json(os.path.join(src, "config.json"))
         if not isinstance(old_cfg, dict):
             continue
         # ⚠️ 这里必须遍历 **SCHOOL_KEYS**，不能只遍历 DEFAULTS。
@@ -929,7 +1209,7 @@ def migrate_legacy_data():
             if old_cfg.get(k):
                 cfg[k] = old_cfg[k]
         save_config(cfg)
-        old_acc = read_json(os.path.join(src, "accounts.json"))
+        old_acc = read_secret_json(os.path.join(src, "accounts.json"))
         if isinstance(old_acc, dict) and isinstance(old_acc.get("accounts"), dict):
             # 这里要的是「整份替换成旧位置那一份」，所以 clear + update，
             # 而不是把旧账号并进当前账号库 —— 保持原语义，只是挪进锁里。
@@ -3621,6 +3901,19 @@ HELP_TEXT = (("校园网自动登录 —— 使用说明（v%s）\n" % VERSION) 
 
   存在这台电脑的  C:\ProgramData\CampusLogin  里，不在这个程序里。所以把
   「校园网自动登录.exe」这一个文件拷给别人，不会带出你的账号、密码和登录记录。
+
+  🔒 密码是**加密**存的 —— 用 Windows 自带的 DPAPI，密钥由 Windows 按你这个
+  登录用户保管，本程序既不生成也不保存密钥。效果是：换一个 Windows 用户登录、
+  或者把这两个文件拷到别的电脑上，**解不开**（打开只会看到 enc:v1: 开头的乱码）。
+  老版本存下的明文密码会自动升级，你不用做任何事。
+
+  ⚠️ 三条得说清楚，别把它当保险箱：
+    · 同一个 Windows 用户下运行的**其它程序仍然解得开** —— DPAPI 是「按用户」
+      不是「按程序」。它挡的是「别的用户 / 文件被拷走」，挡不住「这台电脑
+      已经中了木马」。
+    · 如果你哪天把「开机自动登录」的运行身份改成了别的用户（默认就是你自己），
+      密码会解不开 —— 那时程序会当成「没存过」，需要重新输入一次。
+    · 校园网密码往往和教务、邮箱同源，所以这个功能的意义比「一个校园网」大。
 
   想在本机彻底清掉，点界面最下面那个「清除本机保存的账号密码」
   （命令行也可以：--purge）。清掉之后要重新输入账号密码才能登录；
@@ -7872,6 +8165,20 @@ def main():
         # 用户只看到一张空表单，分不清是"本来就没有旧数据"还是"继承时炸了"。
         log("继承旧数据失败（不影响启动）:\n%s" % traceback.format_exc())
 
+    # 老版本存下的**明文**密码主动升级成密文（2026-10-15 加）。
+    # ⚠️ 必须在 migrate_legacy_data() **之后** —— 继承过来的那份也可能是明文的，
+    #    顺序反了就得等下次开机才升（甚至永远不升，如果用户再也不动设置）。
+    #
+    # 🔴 为什么**自检入口要跳过**：见 `should_upgrade_secrets()` 的说明。
+    if should_upgrade_secrets(args):
+        try:
+            n_up = upgrade_secrets_to_encrypted()
+            if n_up:
+                log("已把 %d 处明文密码升级为加密存储" % n_up)
+        except Exception:
+            # 升级失败不能挡启动 —— 明文照样能用，只是少一层保护。
+            log("明文密码升级失败（不影响使用）:\n%s" % traceback.format_exc())
+
     # 老版本的自启挂在启动文件夹上，开机后要等 85 秒才轮到它（见 AUTOSTART_TASK_NAME
     # 那段实测）。升级后第一次运行就换成登录计划任务 —— 用户不该为了这次修复
     # 自己去「取消再勾一次」。
@@ -7926,6 +8233,10 @@ def main():
             "数据目录: %s" % dd,
             "数据目录来源: %s" % where,
             "配置存在: %s" % os.path.isfile(CONFIG_FILE),
+            # 密码在磁盘上是什么状态（2026-10-15 加）。只报「有没有 enc:v1: 前缀」，
+            # **不解密** —— 这份输出会被发出去。排查「开机自动登录说密码是空的」
+            # 时第一手就看这行：多半是换了 Windows 用户 / 换了机器，DPAPI 解不开。
+            "密码加密: %s" % secret_storage_text(),
             "已保存账号数: %s" % n_acct,
             "启动文件夹: %s" % startup_dir(),
             "自启链接: %s" % autostart_links(),

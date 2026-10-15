@@ -219,7 +219,13 @@ _mig = json.load(open(C.CONFIG_FILE, encoding="utf-8"))
 for _k in C.SCHOOL_KEYS:
     check("迁移保住 %-14s" % _k, _mig.get(_k), _MIG_FULL[_k])
 check("迁移保住 userId / passwd",
-      (_mig.get("userId"), _mig.get("passwd")), ("2026000001", "secret"))
+      (_mig.get("userId"), C.decrypt_secret(_mig.get("passwd"))),
+      ("2026000001", "secret"))
+# ⚠️ 注意上面这一行是**故意**绕了一下 `decrypt_secret()`（2026-10-15 改）：
+#    密码落盘后是 `enc:v1:…` 密文（DPAPI），所以「读原始文件比明文」这条
+#    断言从此不成立。判据应该是**「解出来还是原来那个」** —— 那才是业务语义。
+#    ⚠️ 顺手确认它真的加密了，别让这条断言在「明文直写」的情况下也通过。
+check("迁移写盘时密码确实被加密了", C.is_encrypted(_mig.get("passwd")), True)
 # 顺带：迁移是幂等的 —— 再跑一次不该改动已有的 config.json
 _mig_md5 = _md5(C.CONFIG_FILE)
 C.legacy_data_dirs = lambda: [_MIG_OLD]
