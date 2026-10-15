@@ -4,7 +4,12 @@
 
 > 非官方项目，与学校网络管理部门无关。请仅使用你本人有权访问的账号，并遵守学校的网络使用规定。
 
-当前版本 0.6.0，从 [Releases](../../releases) 或 [hobson2233.dpdns.org](https://hobson2233.dpdns.org) 下载，[历史版本](https://hobson2233.dpdns.org/history) 也都留着。
+当前版本 0.6.0（**开发中，还没发布** —— 线上现在能下到的是上一个正式版），从 [Releases](../../releases) 或 [hobson2233.dpdns.org](https://hobson2233.dpdns.org) 下载，[历史版本](https://hobson2233.dpdns.org/history) 也都留着。
+
+> ⚠️ 上面那个「开发中」标记是**临时**的：正式发 0.6.0 时把它删掉。
+> 为什么不直接写出「线上现在是哪个版本号」—— `version_test.py` 第 5 节要求 README 里
+> 出现的**每个**版本号都等于 `VERSION`，多写一个就会红。
+> 这条规则是故意的（防文档漂移）：加这段标记时我顺手写了那个号，测试**当场就红了**。
 
 ![设置界面](docs/main.png)
 

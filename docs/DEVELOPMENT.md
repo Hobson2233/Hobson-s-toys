@@ -1718,14 +1718,23 @@ Tk 里控件的 master 在创建时就定死了，`pack()` 只会把它放进自
 
 改完代码要发新版本时，流程见工作区根目录的 `GitHub发布操作指南.md`。
 
-完整顺序（0.4.4 起，多源校验必须在发完 Release 之后）：
+🔴 **这一节只讲「打包之后」那一段。** 完整顺序（含 **提交和打 tag 必须在
+`build.py` 之前** 这条 2026-10-13 才改的规矩）见上面
+「🔴 版本号 / Tag / Release：三件事各管一段」那一节。
+⚠️ 别照下面这个从 `build.py` 开始的列表从头做 —— 在脏工作区上构建会被
+`build.py` **直接拒绝**（它要的就是「exe 必须对应一次提交」）。
+
+打包之后的顺序（0.4.4 起，多源校验必须在发完 Release 之后）：
 
 ```
-build.py  →  make_site.py  →  make_manifest.py  →  deploy/deploy.py
+make_site.py  →  make_manifest.py  →  deploy/upload_cnb.py  →  deploy/deploy.py
           →  deploy/deploy.py --verify            （线上清单 + 历史包抽查）
           →  推 GitHub + 发 Release（tag vX.Y.Z，资产名 campus-login.exe）
           →  deploy/deploy.py --verify-sources    （每个下载源都能下）
 ```
+
+📌 **发版时别忘了删 README 里那句「开发中，还没发布」** ——
+那是「攒着不发」期间的临时标记（2026-10-15 加），正式发布时它就成了假话。
 
 🔴 **最后一步不能省**。清单里第二个下载源指向 GitHub Release，而 Release 是**发版之后**
 才存在的 —— 忘了发它不会报任何错，客户端探测失败会静默退回主源，看起来一切正常，
