@@ -173,6 +173,17 @@ FAKE_CHARGE = {
 }
 FAKE_BUSPKG = {"rows": [], "total": 0}
 
+# 踢人要的四个字段全在这里（`getonline.do` 的 rows）。
+# ⚠️ `billingId` / `serverIp` 是**每次登录**才有的，所以界面那份（`load()`
+#    带回来的）故意没有 —— `_kick` 里是**现取一次**再踢。
+FAKE_TARGET = {"accountId": "2025000000",
+               "accountMac": "84:9E:56:40:69:1D",
+               "accountIp": "10.15.116.156",
+               "onlineTime": "2026-10-12 09:37:49",
+               "osInfo": "Windows", "nasId": "ZZHK-ZAX-BRAS",
+               "terminalType": "a", "billingId": "bee1f27f",
+               "serverIp": "10.0.1.10"}
+
 FAKE_DATA = {
     "status": "正常",
     "plan": "校园网电信融合套餐",
@@ -217,6 +228,7 @@ class FakeSvc(object):
     off_main = True           # 所有请求是否都发生在**非**主线程
     last_login = None         # 最后一次 login 的实参
     calls = []                # 所有请求的名字（**用来验「打开面板时一次都没发」**）
+    posts = []                # 写操作层的 `(path, payload)`（B 档，逐字段断言用）
     script = {}
 
     def __init__(self, base=None, timeout=None):
@@ -279,6 +291,32 @@ class FakeSvc(object):
             d["buspkg"] = None
             d["center_error"] = "详单接口抽风"
         return d
+
+    # ------------------------------------------------------ 写操作层（B 档）
+
+    def _post(self, path, payload=None):
+        """`self_actions.SelfActions` 借它发写请求。**不联网。**
+
+        ⚠️ 这里**不区分读写**：被测的是「点了按钮之后发了什么」，
+           所以照实记 `(path, payload)`，由测试逐字段断言。
+        ⚠️ `script["_post"]` 控制行为：`net` / `session` / `denied` / `boom`。
+           默认 `"ok"`（返回 `errmsg`）。
+        """
+        self._note("_post")
+        FakeSvc.posts.append((path, payload))
+        mode = FakeSvc.script.get("_post", "ok")
+        if mode == "net":
+            raise S.SelfError("net", "假装网络断了")
+        if mode == "session":
+            raise S.SelfError("session", "假装会话过期")
+        if mode == "denied":
+            raise S.SelfError("other", "学校说：设备已离线")
+        if mode == "boom":
+            raise RuntimeError("假装代码写错了")
+        if path == "getonline.do":
+            rows = [] if FakeSvc.script.get("no_online") else [FAKE_TARGET]
+            return {"errmsg": "ok", "rows": rows}
+        return {"errmsg": "操作成功"}
 
 
 # ---------------------------------------------------------------- 小工具
@@ -450,6 +488,19 @@ def reset_fake():
     FakeSvc.off_main = True
     FakeSvc.last_login = None
     FakeSvc.calls = []
+    FakeSvc.posts = []
+
+
+def find_button(w, text):
+    """按 `_rb_text` 找按钮。`round_button` / `round_chip` 都把字挂在这个属性上
+    （Canvas 的 `create_text` 内容查不出来 —— 见那个工厂函数的说明）。
+
+    ⚠️ 同名按钮可能有好几个（比如每个绑定槽位一个「解绑」），这里返回**第一个**。
+    """
+    for c in all_widgets(w.win):
+        if getattr(c, "_rb_text", None) == text:
+            return c
+    return None
 
 
 def reset_history():
@@ -1211,6 +1262,186 @@ def test_center_cards2(root):
         w.close()
 
 
+# ---------------------------------------------------------------- B 档写操作
+
+def test_actions(root):
+    """⑰ B 档写操作：按钮出现条件 / 二次确认 / 请求体 / 失败分类 / 绝不重试。
+
+    🔴 这一节比别的都重要：别的测漏了顶多「显示不对」，这里测漏了是
+       **「把用户的网断了」**。
+    """
+    print("\n⑰ B 档写操作（下线 / 解绑 / 停机复机）")
+    reset_fake()
+    reset_history()
+    FakeSvc.script = {"has_session": "yes", "login": "ok"}
+    w = open_panel(root)
+    pump(root, 0.4)
+    try:
+        # ① 没同步过 ⇒ 一个写操作按钮都不许有（没有会话，点了也是白点）
+        for name in ("下线这台", "解绑", "停机", "复机"):
+            check_true("没同步过 ⇒ 没有「%s」按钮" % name,
+                       find_button(w, name) is None, "")
+
+        # ② 同步之后按钮出现，而且真的挂着左键事件（能点）
+        w.data = json.loads(json.dumps(FAKE_DATA))
+        w._render()
+        pump(root, 0.4)
+        for name in ("下线这台", "解绑", "停机"):
+            check_true("同步后出现「%s」" % name,
+                       find_button(w, name) is not None, "")
+        b = find_button(w, "下线这台")
+        check_true("「下线这台」是圆角按钮（有 _rb_text）", b is not None, "")
+        check_true("「下线这台」挂上了左键事件（能点）",
+                   bool(b is not None and b.bind("<Button-1>")), "")
+
+        # ③ 二次确认点了「取消」⇒ **一个请求都不发**
+        asked = []
+
+        def _no(msg):
+            asked.append(msg)
+            return False
+
+        w.ask = _no
+        FakeSvc.posts = []
+        find_button(w, "下线这台").invoke()
+        pump(root, 0.8)
+        check("弹了一次确认框", len(asked), 1)
+        check_true("确认框里说清了后果（会断网）", "断网" in asked[0], asked[0])
+        check("取消 ⇒ 一个写请求都没发", FakeSvc.posts, [])
+
+        # ④ 确认 ⇒ **先现取一次在线清单**，再按四个字段踢
+        w.ask = lambda msg: True
+        FakeSvc.posts = []
+        find_button(w, "下线这台").invoke()
+        ok = pump(root, 6.0,
+                  lambda: any(p[0] == "kickonline.do" for p in FakeSvc.posts))
+        check_true("踢人请求发出去了", ok, "")
+        paths = [p[0] for p in FakeSvc.posts]
+        check("先取在线清单、再踢（顺序）", paths[:2],
+              ["getonline.do", "kickonline.do"])
+        check("踢人请求体（四个字段全部来自 rows）", FakeSvc.posts[1][1],
+              {"accountId": "2025000000", "accountIp": "10.15.116.156",
+               "billingId": "bee1f27f", "serverIp": "10.0.1.10"})
+        check("踢人只发了一次（绝不重试）",
+              len([p for p in paths if p == "kickonline.do"]), 1)
+        ok = pump(root, 8.0, lambda: not w.syncing and "已下线" in w.note)
+        check_true("界面上说了「已下线」", ok, w.note)
+        check_true("🔴 自动刷新后那句「已下线」**没被同步提示盖掉**",
+                   "已下线" in w.note and "已同步" in w.note, w.note)
+
+        # ⑤ 解绑：槽位号直接来自**那条**绑定记录
+        w.data = json.loads(json.dumps(FAKE_DATA))
+        w._render()
+        pump(root, 0.4)
+        w.ask = lambda msg: True
+        FakeSvc.posts = []
+        find_button(w, "解绑").invoke()
+        ok = pump(root, 6.0,
+                  lambda: any(p[0] == "clearusermac.do" for p in FakeSvc.posts))
+        check_true("解绑请求发出去了", ok, "")
+        check("解绑请求体（clearType 就是那个槽位）",
+              [p for p in FakeSvc.posts if p[0] == "clearusermac.do"][0][1],
+              {"accountId": "2025000000", "clearType": "3"})
+        pump(root, 8.0, lambda: not w.syncing)
+
+        # ⑥ 停机：**先问原因**，再确认
+        w.data = json.loads(json.dumps(FAKE_DATA))
+        w._render()
+        pump(root, 0.4)
+        w.ask = lambda msg: True
+        w.ask_text = lambda title, prompt, initial: "测试原因"
+        FakeSvc.posts = []
+        find_button(w, "停机").invoke()
+        ok = pump(root, 6.0,
+                  lambda: any(p[0] == "selfstopping.do" for p in FakeSvc.posts))
+        check_true("停机请求发出去了", ok, "")
+        check("停机请求体（立即停机那条分支）",
+              [p for p in FakeSvc.posts if p[0] == "selfstopping.do"][0][1],
+              {"accountId": "2025000000", "shutdownReason": "测试原因"})
+        pump(root, 8.0, lambda: not w.syncing)
+
+        # 原因为空 ⇒ 直接拦下，**一个请求都不发**
+        w.data = json.loads(json.dumps(FAKE_DATA))
+        w._render()
+        pump(root, 0.4)
+        w.ask_text = lambda title, prompt, initial: "   "
+        FakeSvc.posts = []
+        find_button(w, "停机").invoke()
+        pump(root, 0.8)
+        check("原因为空 ⇒ 一个请求都不发", FakeSvc.posts, [])
+        check_true("并且说清了为什么", "不能为空" in w.note, w.note)
+
+        # 取消输入 ⇒ 也不发
+        w.ask_text = lambda title, prompt, initial: None
+        FakeSvc.posts = []
+        find_button(w, "停机").invoke()
+        pump(root, 0.8)
+        check("取消输入 ⇒ 一个请求都不发", FakeSvc.posts, [])
+
+        # ⑦ 停机中 ⇒ 出现「复机」，且**不再有**「停机」
+        d = json.loads(json.dumps(FAKE_DATA))
+        d["stop"] = {"page_type": "1", "state": "停机中", "reason": "欠费",
+                     "oper": "admin", "date": "2026-10-15"}
+        w.data = d
+        w.ask_text = lambda title, prompt, initial: "测试原因"
+        w._render()
+        pump(root, 0.4)
+        check_true("停机中 ⇒ 有「复机」", find_button(w, "复机") is not None, "")
+        check_true("停机中 ⇒ 没有「停机」", find_button(w, "停机") is None, "")
+        FakeSvc.posts = []
+        find_button(w, "复机").invoke()
+        ok = pump(root, 6.0,
+                  lambda: any(p[0] == "selfrecovery.do" for p in FakeSvc.posts))
+        check_true("复机请求发出去了", ok, "")
+        check("复机请求体",
+              [p for p in FakeSvc.posts if p[0] == "selfrecovery.do"][0][1],
+              {"accountId": "2025000000"})
+        pump(root, 8.0, lambda: not w.syncing)
+
+        # 🔴 状态是「未知」⇒ **一个按钮都不画**
+        #    （不知道那时候什么操作合法；红线 51 的同类：不认识的取值别硬套）
+        d["stop"] = {"page_type": "9", "state": "未知", "reason": "",
+                     "oper": "", "date": ""}
+        w.data = d
+        w._render()
+        pump(root, 0.4)
+        check_true("状态「未知」⇒ 不画「停机」", find_button(w, "停机") is None, "")
+        check_true("状态「未知」⇒ 不画「复机」", find_button(w, "复机") is None, "")
+
+        # ⑧ 🔴 失败分类：四类各自说人话，而且**都只发一次**
+        w.data = json.loads(json.dumps(FAKE_DATA))
+        w._render()
+        pump(root, 0.4)
+        w.ask = lambda msg: True
+        for mode, want, why in (
+                ("net", "不确定",
+                 "🔴 net 要说「成没成不确定」（只有这种可以再点）"),
+                ("session", "重新登录", "session 要提示重新同步"),
+                ("denied", "不要再点", "🔴 denied 要说「不要再点」"),
+                ("boom", "内部错误", "🔴 内部异常也要在界面上看得见")):
+            FakeSvc.script = {"has_session": "yes", "login": "ok", "_post": mode}
+            FakeSvc.posts = []
+            find_button(w, "解绑").invoke()
+            ok = pump(root, 6.0, lambda: "失败" in getattr(w, "note", ""))
+            check_true("%s：界面报出来了" % mode, ok, w.note)
+            check_true("%s：%s" % (mode, why), want in w.note, w.note)
+            check("%s：只发一次（绝不重试）" % mode, len(FakeSvc.posts), 1)
+            # 🔴 界面上**不许出现 markdown 的 `**`** —— Tk 的 Label 不渲染
+            #    markdown，用户会看到一串星号。第一版真写了「**不要再点**」，
+            #    是**看日志**看出来的（断言只看子串，看不出多了两个星号）。
+            bad = [x for x in texts_of(w.win) if "**" in x]
+            check("%s：界面上没有 markdown 的星号" % mode, bad, [])
+            w.note = ""
+            w._render()
+            pump(root, 0.3)
+
+        # ⑨ 后台线程里跑（不能卡主线程）—— 上面几轮已经隐含验过，
+        #    这里显式确认「写请求也在子线程」
+        check_true("写请求不在 Tk 主线程上发", FakeSvc.off_main, "")
+    finally:
+        w.close()
+
+
 # ---------------------------------------------------------------- 收尾
 
 def main():
@@ -1250,6 +1481,7 @@ def main():
             test_devices_layout(root)
             test_center_cards(root)
             test_center_cards2(root)
+            test_actions(root)
         finally:
             root.destroy()
         test_off_main_thread()

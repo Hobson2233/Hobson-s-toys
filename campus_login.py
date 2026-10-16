@@ -52,6 +52,14 @@ import updater
 # 它只 import 标准库（base64/datetime/hashlib/http.cookiejar/json/urllib），不引入新依赖。
 import self_service
 
+# 「账号中心」的**写操作**层（B 档：踢设备下线 / 解绑 MAC / 停机复机 / 改密码）。
+# 🔴 它和 `self_service` 是**故意分开**的两个模块：
+#    那边有测试扫源码钉着的「只读」契约（出现 kickonline 之类字面量就报失败），
+#    而这边全是**不可逆**动作。两边风险等级不同，规矩也相反
+#    （读可以重试，写**绝不能**重试）—— 混在一个文件里早晚有人记混。
+# 顶层 import 的理由同 `self_service`：PyInstaller 要看得见。
+import self_actions
+
 # 「账号中心」的**本地流量历史**（存本机，下次不登录也能看）。
 # ⚠️ 它和 self_service 是**故意分开**的两个模块：self_service 有一条被测试钉死的
 #    性质 —— **它不碰磁盘**（不 import os / pathlib、没有 open）。那条性质保护的是
@@ -5655,6 +5663,16 @@ class SelfServiceWindow(object):
     面板因此从三块变成四块（账号 / 图表 / 详单 / 设备），
     其中「停机状态」并进账号卡（它就是一个状态字段，不值得单独一张卡）。
 
+    ⚠️ 2026-10-16 又加了 A 档第二批三张卡（账号资料 / 费用记录 / 可购套餐，
+    见 `_card_profile` / `_card_fee` / `_card_buspkg`），以及 **B 档写操作**
+    （踢设备下线 / 解绑 MAC / 停机复机，见「写操作」那一节）。
+    现在一共七张卡，靠正文滚动 + 高度封顶（`_autosize`）兜住。
+
+    🔴 **写操作有一条前置条件**：它复用的是「同步过一次」之后的内存会话
+    （cookie 只在内存里）。所以没同步过时，界面**一个写操作按钮都不画**
+    （`_can_act`）—— 画出来只会骗人。每个动作都要二次确认，且**绝不重试**
+    （规矩在 `self_actions.py` 那边，有测试钉着）。
+
     🔴 三条硬要求（从上一版继承）：
 
       1. **独立 Toplevel + 自带 worker 线程和自己的队列** —— 不走
@@ -5704,6 +5722,19 @@ class SelfServiceWindow(object):
         self.ym = ""              # 按天视图当前看的是哪个月 "YYYY-MM"
         # 确认框。测试里替换成 `lambda *a: True`，免得模态框把自动化挂住。
         self.ask = None
+        # 要一行文字的输入框（停机原因）。测试里同样替换掉。
+        self.ask_text = None
+        # --- 写操作（B 档，2026-10-16 加）---
+        # 🔴 `actions` **懒创建**：它复用的就是 `self.svc` 里那个内存会话
+        #    （cookie 只活在内存里，窗口一关就没）。所以**没同步过就没有会话**，
+        #    界面也不该出现任何写操作按钮（见 `_can_act`）。
+        self.actions = None
+        self.acting = ""          # 正在进行的写操作名（空串 = 空闲；防连点）
+        # 🔴 写操作成功后会**自动刷新**一次。刷新走的是 `_on_synced`，
+        #    那里默认会把 `self.note` 覆盖成「已同步：…」—— 那样用户刚看到的
+        #    「已下线」就被盖掉了，等于不知道刚才那一下成没成。
+        #    这个标志让它**追加**而不是覆盖。
+        self.keep_note = False
         # 上一次操作的结果提示（同步完了 / 清完了），画在正文末尾
         self.note = ""
 
@@ -5931,6 +5962,11 @@ class SelfServiceWindow(object):
             self._on_synced(payload)
         elif kind == "fail":
             self._draw_fail(payload)
+        # --- 写操作（B 档）---
+        elif kind == "act_ok":
+            self._on_action_ok(payload)
+        elif kind == "act_err":
+            self._on_action_err(payload)
 
     # ------------------------------------------------------------ 后台任务
 
@@ -6022,8 +6058,16 @@ class SelfServiceWindow(object):
         ok, why = self_history.save(SELF_FLOW_FILE, self.store)
         if not ok:
             log("本地流量历史写盘失败：%s" % why)
-        self.note = ("已同步：新增 %d 天、更新 %d 天%s"
+        sync_note = ("已同步：新增 %d 天、更新 %d 天%s"
                      % (added, updated, "" if ok else "（但本地存不下，见日志）"))
+        # 🔴 写操作成功后会**自动刷新**一次，刷新走的就是这条路。
+        #    直接覆盖的话，用户刚看到的「已下线」会被同步提示盖掉 ——
+        #    那就等于**不知道刚才那一下成没成**。所以这里追加。
+        if self.keep_note and self.note:
+            self.note = self.note + "；" + sync_note
+        else:
+            self.note = sync_note
+        self.keep_note = False
         self.syncing = False
         self._render()
 
@@ -6067,6 +6111,184 @@ class SelfServiceWindow(object):
             log("账号中心面板确认框失败:\n%s" % traceback.format_exc())
             return False
 
+    # ------------------------------------------------------------ 写操作（B 档）
+    #
+    # 🔴 这一节是**唯一**能触发不可逆动作的地方。三条铁律（对应
+    #    `self_actions.py` 的模块规矩，那边也有测试钉着）：
+    #      ① 每个动作**必须先二次确认**（`_do_action(confirm=...)`）。
+    #      ② **绝不重试** —— `fn` 只跑一次。写操作重试 = 做第二遍。
+    #      ③ 网络在**子线程**里跑（复用 `_run`），界面不卡。
+    #
+    # ⚠️ 还有一条**界面**上的规矩：所有按钮都只在 `_can_act()` 为真时画 ——
+    #    没同步过（没会话）时点了也是白点，画出来只会骗人。
+
+    def _acts(self):
+        """拿写操作句柄（复用 `self.svc` 已登录的会话）。**没同步过就返回 None。**"""
+        if self.data is None:
+            return None
+        if self.actions is None:
+            self.actions = self_actions.SelfActions(self.svc)
+        return self.actions
+
+    def _can_act(self):
+        """现在能不能画写操作按钮：**同步过**（有会话）且**没有别的写操作在跑**。"""
+        return self.data is not None and not self.acting
+
+    def _ask_text_input(self, title, prompt, initial=""):
+        """要一行文字（停机原因）。`self.ask_text` 被测试替换时就不弹模态框。
+
+        ⚠️ 和 `_ask_yes_no` 同一个理由：模态框会把无人值守的自动化**挂住**。
+        """
+        if self.ask_text is not None:
+            return self.ask_text(title, prompt, initial)
+        try:
+            from tkinter import simpledialog
+            return simpledialog.askstring(title, prompt, initialvalue=initial,
+                                          parent=self.win)
+        except Exception:
+            log("账号中心面板输入框失败:\n%s" % traceback.format_exc())
+            return None
+
+    def _do_action(self, label, fn, confirm=None):
+        """写操作的**唯一入口**。`fn` 会在子线程里跑，且**只跑一次**。"""
+        if self.acting:
+            return                      # 防连点：上一个还没回来
+        if confirm and not self._ask_yes_no(confirm):
+            return
+        self.acting = label
+        self.note = "正在%s…" % label
+        self._render()
+        self._run(lambda: self._job_action(label, fn))
+
+    def _job_action(self, label, fn):
+        """子线程：跑一次写操作，结果放回队列。**绝不重试。**"""
+        try:
+            r = fn()
+            self._put("act_ok", (label, r))
+        except self_actions.ActionError as e:
+            self._put("act_err", (label, e.kind, e.msg))
+        except Exception as e:
+            # `_run` 里也有一层兜底，但这里自己接一下好带上**操作名** ——
+            # 用户看到的「下线失败：…」比光一句「内部错误」有用得多。
+            log("账号中心面板写操作异常:\n%s" % traceback.format_exc())
+            self._put("act_err", (label, "other",
+                                  "内部错误（已记日志）：%s: %s"
+                                  % (type(e).__name__, e)))
+
+    def _on_action_ok(self, payload):
+        """写操作成功 ⇒ **自动刷新一次**。
+
+        🔴 为什么必须刷新：不刷新的话界面上还写着「这台设备在线 / 状态正常」，
+           用户会以为没生效，**再点一次** —— 而那一下是在重复做同一件事。
+        """
+        label, r = payload
+        self.acting = ""
+        msg = (r or {}).get("msg") or ""
+        self.note = "已%s%s" % (label, ("（%s）" % msg) if msg else "")
+        self.keep_note = True           # 让刷新那一步**追加**而不是覆盖这条
+        self.start_sync()
+
+    def _on_action_err(self, payload):
+        """写操作失败。🔴 **按 `kind` 说人话** —— 尤其是要分清
+        「不知道成没成」（`net`）和「学校明确拒绝」（`denied`）：
+        只有前者可以再点一次，后者再点就是在骚扰学校服务器。"""
+        label, kind, msg = payload
+        self.acting = ""
+        if kind == "net":
+            tail = "（网络没通。「这次到底成没成」不确定 —— 稍后同步一次看状态。）"
+        elif kind == "session":
+            tail = "（登录状态过期了 —— 点「同步数据」重新登录再试。）"
+        elif kind == "denied":
+            tail = "（学校那边明确拒绝了，「不要再点」。）"
+        elif kind == "refused":
+            tail = ""
+        else:
+            tail = ""
+        self.note = "%s失败：%s%s" % (label, msg, tail)
+        self.keep_note = False
+        self._render()
+
+    # -------------------------------------------------- 三个具体动作的入口
+
+    def _kick(self, dev):
+        """把某台在线设备踢下线。**不可逆，它立刻断网。**"""
+        act = self._acts()
+        if act is None:
+            self.note = "要先点一次「同步数据」登录，才能下线设备。"
+            self._render()
+            return
+        who = "%s（%s）" % (dev.get("os") or "未知设备", dev.get("ip") or "-")
+
+        def job():
+            # 🔴 **踢之前现取一次**在线清单。两个理由：
+            #    ① 踢人要的 `billingId` / `serverIp` 是**每次登录**才有的，
+            #       而界面上那份（`load()` 带回来的）**故意没有**这两个字段
+            #       —— `self_service.online()` 就是为了「结构上凑不出踢人请求」。
+            #    ② 顺带解决竞态：用户点的时候那台可能已经下线了。
+            targets = act.online_targets(self.account)
+            t = None
+            for x in targets:
+                if (x.get("ip") == dev.get("ip")
+                        and x.get("mac") == dev.get("mac")):
+                    t = x
+                    break
+            if t is None:
+                raise self_actions.ActionError(
+                    "other", "这台设备已经不在线了（点「同步数据」刷新一下）")
+            return act.kick(self.account, t)
+
+        self._do_action(
+            "下线 %s" % who, job,
+            confirm="把 %s 下线吗？\n\n它「立刻断网」，要重新认证才能上网。\n"
+                    "如果这台就是你现在用的，你自己也会断。" % who)
+
+    def _unbind(self, b):
+        """解绑一个 MAC 槽位。**不可逆，那台设备要重新认证。**"""
+        act = self._acts()
+        if act is None:
+            self.note = "要先点一次「同步数据」登录，才能解绑设备。"
+            self._render()
+            return
+        mac = b.get("mac") or "-"
+        self._do_action(
+            "解绑 %s" % mac,
+            lambda: act.clear_mac(self.account, b.get("clear_type")),
+            confirm="把 %s 从绑定里解掉吗？\n\n"
+                    "那台设备要重新认证才能上网。" % mac)
+
+    def _stop_now(self):
+        """立即停机。**不可逆（要复机才能上网），而且会立刻断网。**"""
+        act = self._acts()
+        if act is None:
+            self.note = "要先点一次「同步数据」登录，才能停机。"
+            self._render()
+            return
+        reason = self._ask_text_input(
+            "停机", "停机原因（学校那边会记下来）", initial="本人在软件里主动停机")
+        if reason is None:              # 用户取消了
+            return
+        reason = reason.strip()
+        if not reason:
+            # 前端自己也校验这条（`shutdownReason` 不能为空）—— 空着发过去
+            # 学校多半会拒，而且报错信息看不出原因。
+            self.note = "停机原因不能为空。"
+            self._render()
+            return
+        self._do_action(
+            "停机", lambda: act.stop_now(self.account, reason),
+            confirm="确认停机吗？\n\n停机后「立刻断网」，"
+                    "要「复机」才能再上网。")
+
+    def _recover(self):
+        """复机（从停机状态恢复）。"""
+        act = self._acts()
+        if act is None:
+            self.note = "要先点一次「同步数据」登录，才能复机。"
+            self._render()
+            return
+        self._do_action("复机", lambda: act.recover(self.account),
+                        confirm="确认复机吗？（复机后就能正常上网了）")
+
     # ------------------------------------------------------------ 渲染
 
     def _clear(self):
@@ -6096,6 +6318,21 @@ class SelfServiceWindow(object):
         self.tk.Label(f, text=value, bg=CARD, fg=fg or FG,
                       font=(self.fam, self.base, "bold" if bold else "normal")
                       ).pack(side="right")
+
+    def _mini_button(self, parent, text, command, bg, fg, hover, active):
+        """卡片里的**小**按钮（写操作用）。
+
+        ⚠️ 高度和 `round_chip` 那类不一样：它是要**点**的，太矮不好点，
+           所以给 `base * 2 + 8`（约 30px）。宽度由 `pad_x` 撑。
+        ⚠️ 返回的是控件，**摆放由调用方负责** —— 卡片里统一用
+           `pack(anchor="e")` 放在记录的右下方：左边是文字、右边是按钮，
+           扫一眼就知道哪个按钮管哪条记录。
+        """
+        h = self.base * 2 + 8
+        return round_button(parent, text, command, (self.fam, self.base - 1),
+                            bg=bg, fg=fg, hover=hover, active=active,
+                            parent_bg=CARD, height=h, pad_x=14,
+                            radius=pill_radius(h))
 
     def _busy_note(self, text):
         """把正文换成一句「正在…」。**只用在同步过程中**（那时没有别的东西可看）。"""
@@ -6200,6 +6437,23 @@ class SelfServiceWindow(object):
                 self.tk.Label(inner, text="　".join(extra), bg=CARD, fg=SUB,
                               justify="left", wraplength=CHART_W - 20,
                               font=(self.fam, self.base - 2)).pack(anchor="w")
+
+            # --- 停机 / 复机按钮（B 档，2026-10-16 加）---
+            # 🔴 **只在「正常」和「停机中」两个状态下画按钮**。别的取值
+            #    （「未知」/「复机中」/以后学校新加的）**不画** ——
+            #    我们不知道那时候什么操作是合法的，宁可不给按钮，
+            #    让用户去学校网页。这是红线 51 的同类：不认识的取值别硬套。
+            if self._can_act():
+                if state == "正常":
+                    self._mini_button(
+                        inner, "停机", self._stop_now,
+                        "#fdecec", DANGER, "#fbdcdc", "#f8caca"
+                    ).pack(anchor="e", pady=(6, 0))
+                elif state == "停机中":
+                    self._mini_button(
+                        inner, "复机", self._recover,
+                        BLUE_SOFT, BLUE_DARK, "#dbe6ff", "#cddcff"
+                    ).pack(anchor="e", pady=(6, 0))
 
         self._row(inner, "上网套餐", d.get("plan") or "-")
         self._row(inner, "套餐到期", d.get("expire") or "-")
@@ -6376,6 +6630,14 @@ class SelfServiceWindow(object):
             self.tk.Label(inner, text="　".join(extra), bg=CARD, fg=SUB,
                           justify="left", wraplength=CHART_W - 20,
                           font=(self.fam, self.base - 2)).pack(anchor="w")
+            # --- 「下线这台」按钮（B 档，2026-10-16 加）---
+            # 🔴 只在有会话时才画（`_can_act`）。点了会二次确认 + 现取一次
+            #    在线清单再踢（见 `_kick` 的说明）。
+            if self._can_act():
+                self._mini_button(
+                    inner, "下线这台", (lambda x=x: self._kick(x)),
+                    "#fdecec", DANGER, "#fbdcdc", "#f8caca"
+                ).pack(anchor="e", pady=(6, 0))
 
     # ------------------------------------------------------------ 账号资料卡
 
@@ -6511,6 +6773,14 @@ class SelfServiceWindow(object):
                               wraplength=CHART_W - 20,
                               font=(self.fam, self.base - 1)
                               ).pack(anchor="w", pady=(2, 0))
+                # --- 「解绑」按钮（B 档，2026-10-16 加）---
+                # ⚠️ `clear_type` 就是**这个槽位**的号（1~6），直接取着传下去；
+                #    界面**不提供**「按序号解绑」那种入口（容易解错槽）。
+                if self._can_act():
+                    self._mini_button(
+                        inner, "解绑", (lambda y=x: self._unbind(y)),
+                        "#fdecec", DANGER, "#fbdcdc", "#f8caca"
+                    ).pack(anchor="e", pady=(4, 0))
 
         if not shown[0] and not binds:
             self.tk.Label(inner, text="（学校这次没有返回可显示的账号资料字段）",
