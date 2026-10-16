@@ -6136,6 +6136,12 @@ class SelfServiceWindow(object):
             self._card_bill(self.data)
         if self.data is not None:
             self._card_devices(self.data.get("devices") or [])
+            # --- A 档第二批（2026-10-16 加）---
+            # 顺序：资料 → 钱 → 能买什么。都排在「当前状态」之后 ——
+            # 它们是**备查**用的，日常看一眼的是上面的状态和图表。
+            self._card_profile(self.data)
+            self._card_fee(self.data)
+            self._card_buspkg(self.data)
         self._foot_note()
         self._autosize()
 
@@ -6370,6 +6376,267 @@ class SelfServiceWindow(object):
             self.tk.Label(inner, text="　".join(extra), bg=CARD, fg=SUB,
                           justify="left", wraplength=CHART_W - 20,
                           font=(self.fam, self.base - 2)).pack(anchor="w")
+
+    # ------------------------------------------------------------ 账号资料卡
+
+    def _sub(self, parent, text):
+        """卡片**内部**的小分区标题（比卡片标题小一档、用加粗压住正文）。"""
+        self.tk.Label(parent, text=text, bg=CARD, fg=SUB,
+                      font=(self.fam, self.base - 1, "bold")
+                      ).pack(anchor="w", pady=(9, 2))
+
+    def _card_profile(self, d):
+        """账号资料卡（A 档 `getbaseinfo.do`，2026-10-16 加）。
+
+        ⚠️ 这个接口返回 53+6+24 个字段，**数据层是白名单取的**
+           （`self_service.parse_baseinfo`）—— 这里只画白名单里那几个。
+           界面这层**不再过滤**：白名单已经保证「不认识的不带出来」。
+
+        🔴 **空值不画成空行**。这些字段对真实账号本来就会有一半是空的
+           （没停机就没有 `stopDate`）。画一排「-」会让卡片看着像坏了。
+           「整个接口没读到」是**另一回事** —— 那时 `base is None`，
+           走下面第一条分支**明说**（红线 50）。
+
+        ⚠️ 白名单里还有几个字段**故意没画**（`currAccumulateFlow` /
+           `groupChangeFlag` / `groupChangeDate` / `flowtimeflag` /
+           `operationAuthResult` / `operationAuthTime`）—— 它们的含义
+           只是从字段名猜的，**没实测过**。给一个数配一个猜的标签，
+           比不显示更糟（用户会当真）。要画得先弄明白它们是什么。
+        """
+        inner = self._card("账号资料")
+        b = d.get("base")
+        if not isinstance(b, dict):
+            self.tk.Label(inner, text="（这次没读到账号资料，见下方说明）",
+                          bg=CARD, fg=SUB,
+                          font=(self.fam, self.base)).pack(anchor="w")
+            return
+        text, num = b.get("text") or {}, b.get("num") or {}
+        shown = [0]
+
+        def row(name, value, fg=None, bold=False):
+            if value in (None, ""):
+                return
+            self._row(inner, name, str(value), fg=fg, bold=bold)
+            shown[0] += 1
+
+        def tv(k):
+            return (text.get(k) or "").strip()
+
+        def nv(k):
+            return num.get(k)
+
+        def pair(name, flow, hours):
+            """一行里放「流量 + 时长」两个数（单位由 `fmt_*` 各自处理）。"""
+            parts = []
+            if flow is not None:
+                parts.append(self_service.fmt_flow(flow))
+            if hours is not None:
+                parts.append("时长 %s" % self_service.fmt_hours(hours))
+            row(name, "　".join(parts))
+
+        # --- 日期 ---
+        row("开通日期", tv("openingDate"))
+        row("生效日期", tv("effectiveDate"))
+        row("到期日期", tv("expirationDate"))
+        row("首次使用", tv("firstUsetime"))
+        row("最近修改", tv("latestEditDate"))
+        row("上次月结", tv("lastmonthlyChargetime"))
+
+        # --- 认证 ---
+        if any(x not in (None, "") for x in (tv("authResult"), nv("loginCount"),
+                                             nv("webLoginFailTimes"))):
+            self._sub(inner, "认证")
+        ar = tv("authResult")
+        # ⚠️ 只把**认得出来的**成功值上绿；别的取值原样显示、不上色
+        #    （红线 51 的同类：枚举值不认识就别往「正常」上兜底）。
+        row("认证结果", ar, fg=OK if ar in ("成功", "认证成功") else None, bold=True)
+        if nv("loginCount") is not None:
+            row("登录次数", "%d 次" % int(nv("loginCount")))
+        fails = nv("webLoginFailTimes")
+        if fails is not None:
+            # 失败次数多了会被锁号 —— 只在 > 0 时上告警色
+            row("认证失败次数", "%d 次" % int(fails),
+                fg=WARN if float(fails) > 0 else None)
+
+        # --- 代理 / 共享检测 ---
+        # 这几项是学校判断「账号有没有被多人共享一条网」的依据，
+        # 也是**被停机最常见的原因**。学校自己的网页上不会解释它是干嘛的。
+        if any(x not in (None, "") for x in (tv("proxyCtrlResult"),
+                                             nv("proxyCtrlTimes"),
+                                             tv("proxyCtrlStopTime"))):
+            self._sub(inner, "代理 / 共享检测")
+            row("检测结果", tv("proxyCtrlResult"))
+            if nv("proxyCtrlTimes") is not None:
+                row("检测次数", "%d 次" % int(nv("proxyCtrlTimes")))
+            row("上次处理时间", tv("proxyCtrlStopTime"))
+            self.tk.Label(inner,
+                          text="（学校用这几项判断账号有没有被多人共享上网；"
+                               "检测到会限制或停机。）",
+                          bg=CARD, fg=SUB, justify="left",
+                          wraplength=CHART_W - 20,
+                          font=(self.fam, self.base - 3)
+                          ).pack(anchor="w", pady=(3, 0))
+
+        # --- 学校记账 ---
+        # ⚠️ 口径和上面的图表卡**不同**：这里全是**学校那边**的数。
+        #    图表卡画的是本机攒的历史，两个数本来就该不一样（红线 35）。
+        if any(nv(k) is not None for k in ("accumulateFlow", "currMonthFlow",
+                                           "lastMonthFlow", "remainflow",
+                                           "accumulateTime", "currMonthTime",
+                                           "lastMonthTime", "remaintime")):
+            self._sub(inner, "学校记账")
+        pair("累计", nv("accumulateFlow"), nv("accumulateTime"))
+        pair("本月", nv("currMonthFlow"), nv("currMonthTime"))
+        pair("上月", nv("lastMonthFlow"), nv("lastMonthTime"))
+        pair("剩余", nv("remainflow"), nv("remaintime"))
+        money = nv("accumulateMoney")
+        if money is not None:
+            # ⚠️ 单位（元）是按同族的 `sum*Money` 推断的，**没实测过**
+            row("累计消费", "%.2f 元" % float(money))
+
+        # --- MAC 绑定槽位（B 档解绑要用 `clear_type`，见 self_actions.py）---
+        binds = b.get("bind") or []
+        if binds:
+            self._sub(inner, "已绑定的设备（%d 个槽位）" % len(binds))
+            for x in binds:
+                line = x.get("mac") or "-"
+                # ⚠️ **只显示 `os`（"Windows" 这种人类可读的串），不显示 `kind`**
+                #    —— `kind` 是 `terminalType`，实测是 "a" 这种**代码**，
+                #    含义没验证过。显示成「a」对用户毫无意义，猜它的含义又是编。
+                #    （和 `_card_devices` 里那条一模一样 —— 第一版这里抄漏了，
+                #      被截图看出来了：界面上真写着「Windows　a」。）
+                if x.get("os"):
+                    line += "　" + x["os"]
+                self.tk.Label(inner, text=line, bg=CARD, fg=FG, justify="left",
+                              wraplength=CHART_W - 20,
+                              font=(self.fam, self.base - 1)
+                              ).pack(anchor="w", pady=(2, 0))
+
+        if not shown[0] and not binds:
+            self.tk.Label(inner, text="（学校这次没有返回可显示的账号资料字段）",
+                          bg=CARD, fg=SUB,
+                          font=(self.fam, self.base)).pack(anchor="w")
+
+    # ------------------------------------------------------------ 费用记录卡
+
+    FEE_SHOW = 6          # 扣费 / 缴费各最多列几条
+
+    def _rec_row(self, parent, when, what, money):
+        """费用记录的一行：左边「时间 + 类型」，右边金额。"""
+        f = self.tk.Frame(parent, bg=CARD)
+        f.pack(fill="x", pady=1)
+        self.tk.Label(f, text=when or "-", bg=CARD, fg=SUB,
+                      font=(self.fam, self.base - 2)).pack(side="left")
+        self.tk.Label(f, text=what or "", bg=CARD, fg=FG,
+                      font=(self.fam, self.base - 1)
+                      ).pack(side="left", padx=(8, 0))
+        self.tk.Label(f,
+                      text="-" if money is None else "%.2f 元" % float(money),
+                      bg=CARD, fg=FG,
+                      font=(self.fam, self.base - 1, "bold")).pack(side="right")
+
+    def _card_fee(self, d):
+        """费用记录卡：**扣费**（`getfeerecord.do`）+ **缴费**（`getchargerecord.do`）。
+
+        🔴 两个**方向相反**的集合放一张卡里，小标题必须写清楚是哪一边 ——
+           「扣费」是学校扣你的，「缴费」是你交给学校的。混着看会以为在重复计费。
+
+        🔴 四类汇总**即使全是 0 也画**：0 本身是有效信息（「这个套餐不单独计费」），
+           和「没读到」是两回事 —— 后者是 `fee is None`，走上面那条分支明说。
+        """
+        inner = self._card("费用记录")
+        fee, chg = d.get("fee"), d.get("charge")
+
+        # --- 扣费 ---
+        if not isinstance(fee, dict):
+            self.tk.Label(inner, text="（这次没读到扣费记录，见下方说明）",
+                          bg=CARD, fg=SUB,
+                          font=(self.fam, self.base)).pack(anchor="w")
+        else:
+            self._sub(inner, "扣费（学校扣你的）")
+            s = fee.get("sum") or {}
+            for label, key in (("固定费", "fix"), ("月租", "month"),
+                               ("业务费", "bus"), ("流量时长费", "flowtime")):
+                v = s.get(key)
+                self._row(inner, label,
+                          "-" if v is None else "%.2f 元" % float(v))
+            rows = fee.get("rows") or []
+            if not rows:
+                self.tk.Label(inner, text="（没有扣费明细）", bg=CARD, fg=SUB,
+                              font=(self.fam, self.base - 1)
+                              ).pack(anchor="w", pady=(3, 0))
+            for x in rows[:self.FEE_SHOW]:
+                self._rec_row(inner, (x.get("time") or "")[:10],
+                              x.get("kind") or "", x.get("money"))
+            if len(rows) > self.FEE_SHOW:
+                self.tk.Label(inner, text="（共 %d 条，这里只列最近 %d 条）"
+                              % (len(rows), self.FEE_SHOW), bg=CARD, fg=SUB,
+                              font=(self.fam, self.base - 3)
+                              ).pack(anchor="w", pady=(3, 0))
+
+        # --- 缴费 ---
+        if not isinstance(chg, dict):
+            self.tk.Label(inner, text="（这次没读到缴费记录，见下方说明）",
+                          bg=CARD, fg=SUB,
+                          font=(self.fam, self.base)).pack(anchor="w", pady=(8, 0))
+        else:
+            rows = chg.get("rows") or []
+            self._sub(inner, "缴费（你交给学校的）")
+            if not rows:
+                self.tk.Label(inner, text="（没有缴费记录）", bg=CARD, fg=SUB,
+                              font=(self.fam, self.base - 1)).pack(anchor="w")
+            for x in rows[:self.FEE_SHOW]:
+                what = x.get("kind") or ""
+                if x.get("state"):
+                    what += "　%s" % x["state"]
+                self._rec_row(inner, (x.get("time") or "")[:10], what,
+                              x.get("money"))
+            if len(rows) > self.FEE_SHOW:
+                self.tk.Label(inner, text="（共 %d 条，这里只列最近 %d 条）"
+                              % (len(rows), self.FEE_SHOW), bg=CARD, fg=SUB,
+                              font=(self.fam, self.base - 3)
+                              ).pack(anchor="w", pady=(3, 0))
+
+    # ------------------------------------------------------------ 可购套餐卡
+
+    def _card_buspkg(self, d):
+        """可购套餐卡（A 档 `getbusinesspackage.do`，2026-10-16 加）。**只列，不买。**"""
+        inner = self._card("可购套餐")
+        p = d.get("buspkg")
+        if not isinstance(p, dict):
+            self.tk.Label(inner, text="（这次没读到可购套餐，见下方说明）",
+                          bg=CARD, fg=SUB,
+                          font=(self.fam, self.base)).pack(anchor="w")
+            return
+        rows = p.get("rows") or []
+        if not rows:
+            # 🔴 **不许说成「你没有可购套餐」**。这个账号实测返回就是空的
+            #    （融合套餐由电信侧办理），但「学校返回空列表」和「你不能买」
+            #    是两件事 —— 后者是事实，前者只是我们看到的。
+            self.tk.Label(inner, text="学校返回的可购套餐列表是空的。",
+                          bg=CARD, fg=SUB,
+                          font=(self.fam, self.base)).pack(anchor="w")
+            self.tk.Label(inner,
+                          text="（要办套餐请到学校自助服务网页 —— 涉及付款，"
+                               "本软件不代办。）",
+                          bg=CARD, fg=SUB, justify="left",
+                          wraplength=CHART_W - 20,
+                          font=(self.fam, self.base - 2)
+                          ).pack(anchor="w", pady=(3, 0))
+            return
+        for x in rows:
+            f = self.tk.Frame(inner, bg=CARD)
+            f.pack(fill="x", pady=1)
+            self.tk.Label(f, text=x.get("name") or "（未命名套餐）", bg=CARD, fg=FG,
+                          font=(self.fam, self.base - 1)).pack(side="left")
+            right = []
+            if x.get("money") is not None:
+                right.append("%.2f 元" % float(x["money"]))
+            if x.get("flow") is not None:
+                right.append(self_service.fmt_flow(x["flow"]))
+            if right:
+                self.tk.Label(f, text="　".join(right), bg=CARD, fg=SUB,
+                              font=(self.fam, self.base - 1)).pack(side="right")
 
     # ------------------------------------------------------------ 图表卡
 

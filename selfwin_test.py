@@ -135,6 +135,44 @@ FAKE_STOP = {"page_type": "0", "state": "正常", "reason": "", "oper": "",
              "date": ""}
 FAKE_PACKAGE = {"state": "1", "available_flow": 0.0, "balance": 0.0}
 
+# --- A 档第二批（2026-10-16 加）：详细资料 / 扣费 / 缴费 / 可购套餐 ---
+# ⚠️ 故意在 text 里留**空值**（expirationDate / proxyCtrlStopTime …）：
+#    验「空字段不画成空行」—— 画一排「-」会让卡片看着像坏了。
+FAKE_BASE = {
+    "text": {"openingDate": "2024-09-01", "effectiveDate": "2024-09-01",
+             "expirationDate": "", "firstUsetime": "2024-09-01 10:00:00",
+             "latestEditDate": "2026-10-01 08:00:00",
+             "lastmonthlyChargetime": "2026-10-06 00:00:00",
+             "authResult": "成功", "operationAuthResult": "",
+             "operationAuthTime": "", "groupChangeDate": "",
+             "groupChangeFlag": "", "proxyCtrlResult": "未发现",
+             "proxyCtrlStopTime": "", "shutdownReason": "", "stopDate": "",
+             "flowtimeflag": ""},
+    "num": {"accumulateFlow": 690876.003675, "accumulateTime": 3359.498325,
+            "accumulateMoney": 0.0, "currMonthFlow": 18454.782751,
+            "currMonthTime": 104.017223, "lastMonthFlow": 22000.0,
+            "lastMonthTime": 130.0, "currAccumulateFlow": None,
+            "remainflow": None, "remaintime": None, "loginCount": 42,
+            "webLoginFailTimes": 0, "proxyCtrlTimes": 0},
+    "bind": [{"clear_type": "3", "mac": "84:9E:56:40:69:1D",
+              "kind": "a", "os": "Windows"}],
+    "bind_count": 1,
+}
+FAKE_FEE = {
+    "rows": [{"kind": "月租", "plan": "校园网电信融合套餐", "area": "电信",
+              "money": 0.0, "month": "2026-10", "time": "2026-10-06 00:00:00"}],
+    "total": 1,
+    "sum": {"fix": 0.0, "month": 0.0, "bus": 0.0, "flowtime": 0.0},
+}
+FAKE_CHARGE = {
+    "rows": [{"kind": "充值", "money": 50.0, "flag": "1",
+              "time": "2026-09-01 12:00:00", "sub_code": "",
+              "carrier": "电信", "plan": "", "area": "电信",
+              "state": "已支付", "created": "", "handled": ""}],
+    "total": 1,
+}
+FAKE_BUSPKG = {"rows": [], "total": 0}
+
 FAKE_DATA = {
     "status": "正常",
     "plan": "校园网电信融合套餐",
@@ -159,6 +197,11 @@ FAKE_DATA = {
     "bill": FAKE_BILL,
     "stop": FAKE_STOP,
     "package": FAKE_PACKAGE,
+    # --- A 档第二批（2026-10-16 加）---
+    "base": FAKE_BASE,
+    "fee": FAKE_FEE,
+    "charge": FAKE_CHARGE,
+    "buspkg": FAKE_BUSPKG,
     "center_error": "",
 }
 
@@ -229,6 +272,11 @@ class FakeSvc(object):
             d["bill"] = None
             d["stop"] = None
             d["package"] = None
+            # A 档第二批也一起挂掉 —— 验「四项都没读到时界面明说」
+            d["base"] = None
+            d["fee"] = None
+            d["charge"] = None
+            d["buspkg"] = None
             d["center_error"] = "详单接口抽风"
         return d
 
@@ -1040,6 +1088,129 @@ def test_center_cards(root):
         w.close()
 
 
+# ---------------------------------------------------------------- A 档第二批
+
+def test_center_cards2(root):
+    """⑯ 账号资料 / 费用记录 / 可购套餐（A 档第二批，2026-10-16）。
+
+    ⚠️ 直接塞 `w.data` 再 `_render()` —— 同步流程由 ④ 和 ⑮③ 覆盖，
+       这条只管「数据到了界面该长什么样」。
+    """
+    print("\n⑯ 账号资料 / 费用记录 / 可购套餐")
+    reset_fake()
+    reset_history()
+    FakeSvc.script = {"has_session": "yes", "login": "ok"}
+    w = open_panel(root)
+    pump(root, 0.4)
+    try:
+        w.data = json.loads(json.dumps(FAKE_DATA))
+        w._render()
+        pump(root, 0.5)
+        blob = "\n".join(texts_of(w.win))
+
+        # --- 三张卡的标题 ---
+        for title in ("账号资料", "费用记录", "可购套餐"):
+            check_true("有「%s」卡" % title, title in blob, "")
+
+        # --- 详细资料：有值的字段要画出来 ---
+        check("开通日期", row_value(w.win, "开通日期"), "2024-09-01")
+        check("认证结果", row_value(w.win, "认证结果"), "成功")
+        check("认证结果成功 ⇒ 绿色", row_fg(w.win, "认证结果"), C.OK)
+        check("登录次数", row_value(w.win, "登录次数"), "42 次")
+        # 流量 + 时长同一行（单位由 fmt_* 各自处理）
+        check("累计（流量 + 时长同一行）", row_value(w.win, "累计"),
+              "674.68 GB　时长 3359.50 小时")
+        check("本月", row_value(w.win, "本月"),
+              "18.02 GB　时长 104.02 小时")
+
+        # 🔴 空字段**不许**画成空行（画一排「-」会让卡片看着像坏了）
+        check("空字段不画成行（expirationDate 是空的）",
+              row_value(w.win, "到期日期"), None)
+        check("空字段不画成行（proxyCtrlStopTime 是空的）",
+              row_value(w.win, "上次处理时间"), None)
+
+        # --- 代理 / 共享检测：有值就画 + 必须带解释 ---
+        check("代理检测结果", row_value(w.win, "检测结果"), "未发现")
+        check("代理检测次数", row_value(w.win, "检测次数"), "0 次")
+        check_true("🔴 代理检测有一句解释（学校网页上不会解释这个数是干嘛的）",
+                   "多人共享" in blob, "")
+
+        # --- MAC 绑定槽位 ---
+        check_true("列出了绑定槽位数", "已绑定的设备（1 个槽位）" in blob, "")
+        check_true("槽位的 MAC 画出来了", "84:9E:56:40:69:1D" in blob, "")
+        # 🔴 只许 MAC + `os`，**不许**带 `kind`（`terminalType` 实测是 "a" 这种代码，
+        #    含义没验证过 —— 显示它等于编）。第一版这里真写着「Windows　a」，
+        #    是**看截图**看出来的，不是断言看出来的 ⇒ 补一条钉住。
+        mac_line = [x for x in texts_of(w.win)
+                    if x.startswith("84:9E:56:40:69:1D")]
+        check("绑定槽位那行只带 MAC + 系统，不带 kind 代码",
+              mac_line, ["84:9E:56:40:69:1D　Windows"])
+
+        # --- 费用记录：两个**方向相反**的集合必须分得清 ---
+        check_true("有「学校扣你的」小标题",
+                   "学校扣你的" in blob, "")
+        check_true("有「你交给学校的」小标题",
+                   "你交给学校的" in blob, "")
+        check("四类汇总：月租（0 也要画，0 是有效信息）",
+              row_value(w.win, "月租"), "0.00 元")
+        check("四类汇总：固定费", row_value(w.win, "固定费"), "0.00 元")
+        check_true("扣费明细画出来了（含类型）", "月租" in blob, "")
+        check_true("缴费明细画出来了（含状态）", "已支付" in blob, "")
+
+        # --- 可购套餐：空列表**不许**说成「你没有」 ---
+        check_true("空套餐说成「学校返回的是空的」",
+                   "学校返回的可购套餐列表是空的" in blob, "")
+        check_true("🔴 空套餐没有说成「你没有可购套餐」",
+                   "你没有可购套餐" not in blob, "")
+        check_true("空套餐给出了去处（去学校网页办）",
+                   "本软件不代办" in blob, "")
+
+        # --- 明细超过上限要有说明 ---
+        d = json.loads(json.dumps(FAKE_DATA))
+        d["fee"]["rows"] = d["fee"]["rows"] * 8      # 8 条，上限 6
+        w.data = d
+        w._render()
+        pump(root, 0.3)
+        check_true("扣费超上限时写「只列最近 N 条」",
+                   "这里只列最近 6 条" in "\n".join(texts_of(w.win)), "")
+
+        # ② 🔴 四项都没读到：必须**明说**，不能假装「没有记录」
+        d2 = json.loads(json.dumps(FAKE_DATA))
+        for k in ("base", "fee", "charge", "buspkg"):
+            d2[k] = None
+        d2["center_error"] = "详细资料等四项接口抽风"
+        w.data = d2
+        w._render()
+        pump(root, 0.5)
+        blob2 = "\n".join(texts_of(w.win))
+        for what in ("账号资料", "扣费记录", "缴费记录", "可购套餐"):
+            check_true("🔴 明说「这次没读到%s」" % what,
+                       "这次没读到%s" % what in blob2, "")
+        check_true("页脚写出原因", "详细资料等四项接口抽风" in blob2, "")
+        check_true("🔴 页脚说清「不代表没有」", "不代表「没有」" in blob2, "")
+        # 主数据必须照常
+        check("主数据照常：账号状态", row_value(w.win, "账号状态"), "正常")
+        check_true("主数据照常：图表卡还在", "数据流量" in blob2, "")
+
+        # ③ 走一遍真流程：同步后 data 里带着第二批（验 `full()` 真的带回来了）
+        reset_fake()
+        FakeSvc.script = {"has_session": "yes", "login": "ok"}
+        w2 = open_panel(root)
+        try:
+            pump(root, 0.4)
+            w2.start_sync()
+            ok = pump(root, 6.0, lambda: w2.data is not None)
+            check_true("同步后拿到数据", ok, "")
+            check("同步后账号资料卡也画出来了",
+                  row_value(w2.win, "开通日期"), "2024-09-01")
+            check_true("同步后费用记录卡也画出来了",
+                       "学校扣你的" in "\n".join(texts_of(w2.win)), "")
+        finally:
+            w2.close()
+    finally:
+        w.close()
+
+
 # ---------------------------------------------------------------- 收尾
 
 def main():
@@ -1078,6 +1249,7 @@ def main():
             test_chart_views(root)
             test_devices_layout(root)
             test_center_cards(root)
+            test_center_cards2(root)
         finally:
             root.destroy()
         test_off_main_thread()
