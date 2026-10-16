@@ -546,8 +546,13 @@ def close_panel(w):
 # 测试用的「主窗口内容区」尺寸。**不是随便挑的**：按真实主窗口算出来的
 # —— 窗口宽 `window_geometry(1707, 1067, 827)` = 1160，
 # 减去 shell 两侧留白(28) + 导航栏(168) + 缝(16) = 948。
-HOST_W = 948
-HOST_H = 780
+#
+# ⚠️ 948 / 780 是**设计像素**，而 `place()` 要的是**物理像素** ⇒ 过 `C.dp()`。
+#    开高 DPI 感知之后（2026-10-16）150% 的屏上两者差 1.5 倍：
+#    「够不够分两列」的门槛是 `dp(760)=1140`，这里只给 948 的话**永远单列**，
+#    ⑳ 那一段两列排版的断言就全成了假绿（跑了，但测的是单列）。
+HOST_W = C.dp(948)
+HOST_H = C.dp(780)
 
 
 def reset_fake():
@@ -726,12 +731,16 @@ def test_sync_full_flow(root):
     # 验证码图必须真的活着
     check("原图尺寸", (w._cap_small.width(), w._cap_small.height()),
           (CAPTCHA_W, CAPTCHA_H))
+    # ⚠️ 倍数用 `C.CAPTCHA_ZOOM` 而**不是**写死的 4 —— 它走 `dp()`
+    #    （2026-10-16 加高 DPI 之后，150% 屏上是 6 倍 = 780x240）。
+    #    写死 4 的话这条会红，而它红得「有道理」：界面确实变了。
     check("放大后的尺寸", (w._cap_big.width(), w._cap_big.height()),
-          (CAPTCHA_W * 4, CAPTCHA_H * 4))
+          (CAPTCHA_W * C.CAPTCHA_ZOOM, CAPTCHA_H * C.CAPTCHA_ZOOM))
     gc.collect()
     root.update()
     check("GC 之后 Tk 里的图片仍在（没被回收）",
-          tk_image_size(root, str(w._cap_big)), (CAPTCHA_W * 4, CAPTCHA_H * 4))
+          tk_image_size(root, str(w._cap_big)),
+          (CAPTCHA_W * C.CAPTCHA_ZOOM, CAPTCHA_H * C.CAPTCHA_ZOOM))
 
     # 输入并提交
     w._entry.insert(0, "a1b2")

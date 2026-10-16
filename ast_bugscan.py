@@ -28,6 +28,14 @@ _IGNORE_NAMES = {"_", "__", "s", "e", "ex", "exc", "v", "k", "i", "j", "n", "x",
 # 但它是"排查时最该先看的一类"，所以仍然报出来，只是不拦人。
 WARN_CODES = {"EMPTYEXC"}
 
+# 允许出现在**函数默认值**里的调用（见下面 CALLDEF 那条规则）。
+#
+# ⚠️ `dp` 是纯函数：把「设计像素」换算成当前屏幕的物理像素，同样的入参在
+#    进程内结果恒定（`UI_SCALE` 只在模块导入时算一次，之后不再变）。
+#    CALLDEF 的本意是防「时间/随机数被冻结成定义那一刻的值」，`dp` 不属于那类。
+#    白名单是**显式**的 —— 换个函数名照旧一律报错，没有放宽判据。
+SAFE_DEFAULT_CALLS = {"dp"}
+
 
 class Scan(ast.NodeVisitor):
     def __init__(self, path):
@@ -82,7 +90,9 @@ class Scan(ast.NodeVisitor):
                             "%s 的可变默认参数跨调用共享同一个对象，应改用 None + 内部初始化"
                             % node.name)
             # 9. 默认值里的调用
-            elif isinstance(d, ast.Call):
+            elif (isinstance(d, ast.Call)
+                  and not (isinstance(d.func, ast.Name)
+                           and d.func.id in SAFE_DEFAULT_CALLS)):
                 self.report(d, "CALLDEF",
                             "%s 的默认值在定义时求值一次（不是每次调用），若含时间/随机数会冻结"
                             % node.name)

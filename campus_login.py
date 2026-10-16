@@ -4125,12 +4125,12 @@ class PasswordField(object):
         self.entry = tk.Entry(_body, font=font_main, relief="flat", bd=0,
                               bg=CARD, fg=fg, highlightthickness=0,
                               insertbackground=fg)
-        self.entry.pack(side="left", fill="x", expand=True, ipady=2, padx=(3, 0))
+        self.entry.pack(side="left", fill="x", expand=True, ipady=dp(2), padx=(dp(3), dp(0)))
         self.button = tk.Button(_body, text="显示", font=font_small,
                                 relief="flat", bd=0, bg=CARD, fg=BLUE_DARK,
                                 activebackground=BLUE_SOFT, activeforeground=BLUE_DARK,
-                                cursor="hand2", padx=10, command=self.toggle_reveal)
-        self.button.pack(side="right", padx=(4, 1), ipady=2)
+                                cursor="hand2", padx=dp(10), command=self.toggle_reveal)
+        self.button.pack(side="right", padx=(dp(4), dp(1)), ipady=dp(2))
 
         self.entry.bind("<KeyPress>", self._on_key)
         self.entry.bind("<FocusIn>", lambda e: self.set_focus(True))
@@ -4302,12 +4302,75 @@ def pwd_wiring_check(field, loaded=None):
     return "密码框接线自检通过（显示打码 / get() 给真密码 / 配置往返一致）"
 
 
+# ==================== 高 DPI（界面清晰度） ====================
+# 🔴 2026-10-16 加。用户反馈「软件里面的文字不太清晰」——根因不在字体，
+#    在**这个开关没开**。详见 `_init_dpi()` 的说明。
+def _init_dpi():
+    """开高 DPI 感知，返回缩放因子（96 DPI = 1.0）。
+
+    🔴 为什么必须开：
+       本机屏幕是 2560x1600、Windows 缩放 150%。**不开**这个开关时，
+       Tk 只知道「屏幕 1707x1067」（2560÷1.5，Windows 报给不知情进程的
+       虚拟值），于是按 1707 把界面画好、再由 Windows 把**整张位图**
+       放大 1.5 倍贴到屏幕上。位图放大 = 一堆放大后的像素块 = 字发虚。
+       这跟字体选得对不对**没关系** —— 界面上用的本来就是微软雅黑。
+       开了之后 Tk 直接按物理像素渲染，字就锐利了。
+
+    🔴 为什么还要返回一个缩放因子：
+       开了之后 `winfo_screenwidth()` 从「1707」变成「2560」，而界面里
+       所有尺寸常量都是**按 96 DPI 设计**的（`OUTER_PAD=14`、`NAV_W=168`、
+       `CONTENT_H=827`…）。不补偿的话整个界面会缩水到 2/3、字挤成一团。
+       乘上这个因子之后「设计像素 → 物理像素」的换算就补回来了：
+       界面物理尺寸和以前**一模一样**，只是渲染变清晰。
+
+    ⚠️ 必须在**建任何 Tk 窗口之前**调用（Tk 只在创建时读一次 DPI）。
+       所以这段直接放在模块顶层 —— import 时就会跑，比任何调用点都早。
+    ⚠️ 拿不到 DPI 时返回 1.0（退回旧样子）：清晰度没改善，但界面不会错乱。
+       宁可少一个改进，也不要出一个排版崩掉的版本。
+    """
+    if os.name != "nt":
+        return 1.0
+    try:
+        import ctypes
+        try:
+            # 2 = PER_MONITOR_AWARE：多显示器各自缩放不同时也各自正确
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        except Exception:
+            # Win7/8 没有 shcore.dll，退回系统级感知（老 API，够用）
+            ctypes.windll.user32.SetProcessDPIAware()
+        hdc = ctypes.windll.user32.GetDC(0)
+        try:
+            dpi = ctypes.windll.gdi32.GetDeviceCaps(hdc, 88)   # LOGPIXELSX
+        finally:
+            ctypes.windll.user32.ReleaseDC(0, hdc)
+        return max(1.0, dpi / 96.0) if dpi else 1.0
+    except Exception:
+        return 1.0
+
+
+UI_SCALE = _init_dpi()
+
+
+def dp(v):
+    """「设计像素」→ 当前屏幕的物理像素。
+
+    界面里所有尺寸都写设计值：`dp(14)` 就是「按 96 DPI 设计的 14px」。
+    100% 缩放的屏上原样返回，150% 的屏上自动 ×1.5 —— 两种屏看起来一样大。
+    ⚠️ 只用在**尺寸**上，别用在秒数、次数、倍率（那些跟屏幕无关）。
+    """
+    return int(round(v * UI_SCALE))
+
+
 # ==================== 窗口几何 ====================
 # 抽成纯函数是为了能测：这段算错在受控会话里很难复现（要改屏幕分辨率），
 # 而它恰恰是「小屏幕上底部控件够不到」这类问题的根源。
+#
+# ⚠️ `window_geometry()` 的入参和返回值**都是设计像素**（不是物理像素）——
+#    这样上面那些标定值（1000/1320/560/80）和 `geometry_test.py` 的断言
+#    全都不用动。调用点负责换算（见 `run_gui`）。
 
-OUTER_PAD = 14      # 最外层留白
-INNER_PAD = 14      # 卡片内留白
+OUTER_PAD = dp(14)      # 最外层留白
+INNER_PAD = dp(14)      # 卡片内留白
 
 # ---- 「一个窗口、多个页面」的骨架（2026-10-16） ----
 # 🔴 用户原话：「如果咱们软件每加一个新功能就要加一个窗口，那用户同时看好几个
@@ -4318,8 +4381,8 @@ INNER_PAD = 14      # 卡片内留白
 #    竖向空间是本项目最紧的资源（内容 827px / 上限 906px，`content_h_probe.py`
 #    量过），横向却很富裕（窗口在 1707 宽的屏上只占 1050）。标签栏要吃掉
 #    ~40px 高，侧边栏只吃横向 —— 花在横向上才是划算的那一边。
-NAV_W = 168         # 导航栏宽度（含它自己那张圆角面板）
-NAV_GAP = 16        # 导航栏与内容区之间的缝
+NAV_W = dp(168)     # 导航栏宽度（含它自己那张圆角面板）
+NAV_GAP = dp(16)    # 导航栏与内容区之间的缝
 # 0.3.6 起改成 0。它原本记的是「给标题栏/边框留的余量」，但 Tk 的
 # `geometry("WxH")` 里的 H **就是客户区高度、不含标题栏**（实测：
 # 传 851 → winfo_height()=851、holder 实际也拿到 851-28=823）。
@@ -4328,17 +4391,24 @@ NAV_GAP = 16        # 导航栏与内容区之间的缝
 # + 40 这个 EXTRA_H）全是富余。窗口不吃紧时无所谓，在 16:10 上就是白高 40px。
 # 留着这个常量是为了不改调用点的签名，值归零即「不再额外加高」。
 EXTRA_H = 0
+# ⚠️ 下面这几个是**设计像素**，不是物理像素 —— 它们只被 `window_geometry()` /
+#    `minsize_for()` 用，而那两个函数**整段都在设计像素里运算**
+#    （入参设计、返回也设计，见它们各自的 docstring）。**不要**给它们套 `dp()`，
+#    套了就变成「设计 × 缩放」叠了一层，窗口会大得离谱。
 SCREEN_MARGIN_H = 80    # 给任务栏 + 标题栏留的余量
 # 窗口高度最多占屏幕的比例。0.85 —— 留出上方标题栏和下方任务栏，也让窗口
 # 四周有点桌面透出来，不至于「贴满上下沿」。**这个比例就是「16:10 屏上显得
 # 太长」的正解**：16:10 的高本来就只有宽的 62.5%，如果高度再按内容硬撑，
 # 就会一路顶到屏幕边。按下限和上限同时收口，窗口才是「跟着屏幕走」的。
 SCREEN_H_RATIO = 0.85
-MIN_H = 560         # 再矮也不小于这个（低于它就一定挂滚动条了）
-# 最小宽度 = 内容区最少 700px + 导航栏那一块。
+MIN_H = 560         # 再矮也不小于这个（低于它就一定挂滚动条了）。设计像素。
+# 最小宽度 = 内容区最少 700px + 导航栏(168) + 缝(16)。**设计像素**。
 # ⚠️ 700 是**内容区**的最小值（设置页里有 wraplength 680/700 的说明文字，
 #    再窄就会被静默裁掉），加上导航栏和缝才是窗口的最小宽度。
-MIN_W = 700 + NAV_W + NAV_GAP
+# ⚠️ 这里写 168 / 16 字面量，**不要**换成 `NAV_W` / `NAV_GAP` —— 那两个是
+#    **物理像素**（`NAV_W = dp(168)`），混进来这个算式就成了「设计 + 物理」
+#    的四不像，在 150% 的屏上会算出偏大的最小宽度。
+MIN_W = 700 + 168 + 16
 
 
 def window_geometry(sw, sh, reqh):
@@ -4403,6 +4473,9 @@ def minsize_for(sw, sh):
        `wraplength` 是 680/700（`warn_auto`、`self.msg`）。Label 的
        `create_window` 是按**自己要求**的尺寸摆的，比容器宽就直接被裁掉，
        **不报任何错**。所以最小宽度得把导航栏那 184px 一起算进去。
+
+    ⚠️ 入参和返回**都是设计像素**（和 `window_geometry` 同一套约定）——
+       调用点自己过 `dp()`。理由见 `window_geometry` 上面那段说明。
     """
     return (min(MIN_W, max(360, sw - 40), int(sw * 0.86)),
             min(520, max(320, sh - SCREEN_MARGIN_H)))
@@ -4982,8 +5055,8 @@ def pill_radius(height):
     return max(4, int(height) // 2 - 1)
 
 
-def round_chip(parent, tk, text, font, fg, soft, page=CARD, pad_x=9,
-               height=18, radius=None, command=None, cursor="hand2",
+def round_chip(parent, tk, text, font, fg, soft, page=CARD, pad_x=dp(9),
+               height=dp(18), radius=None, command=None, cursor="hand2",
                hover=None):
     """圆角小标签（徽章）。可以当纯标签（不传 command），也可以当小按钮用。
 
@@ -5092,7 +5165,7 @@ def round_chip(parent, tk, text, font, fg, soft, page=CARD, pad_x=9,
     return cv
 
 
-def nav_button(parent, tk, text, icon, font, command, width, height=38,
+def nav_button(parent, tk, text, icon, font, command, width, height=dp(38),
                fg=SUB, active_fg=BLUE_DARK, active_fill=BLUE_SOFT, page=BG,
                hover="#eef2f7"):
     """左侧导航栏里的一项：**左边图标 + 右边一行字**，整条可点。
@@ -5170,7 +5243,7 @@ def nav_button(parent, tk, text, icon, font, command, width, height=38,
 
 
 def round_check(parent, tk, text, var, command, font, page=CARD, fg=FG,
-                box=18, radius=5, gap=9, pad_y=3, disabled_fg="#a3adbb"):
+                box=dp(18), radius=dp(5), gap=dp(9), pad_y=dp(3), disabled_fg="#a3adbb"):
     """圆角复选框：Canvas 画的圆角方框 + 对勾，右边跟一句说明文字。返回外层 Frame。
 
     ⚠️ 为什么不用 `tk.Checkbutton`：
@@ -5217,7 +5290,7 @@ def round_check(parent, tk, text, var, command, font, page=CARD, fg=FG,
         if on:
             # 对勾。坐标按 box 归一化，改 box 大小不用重算。
             cv.create_line(box * 0.26, box * 0.53, box * 0.43, box * 0.70,
-                           box * 0.75, box * 0.31, fill="#ffffff", width=2.1,
+                           box * 0.75, box * 0.31, fill="#ffffff", width=2.1 * UI_SCALE,
                            capstyle="round", joinstyle="round")
 
     def sync(*_a):
@@ -5490,7 +5563,7 @@ def _draw_icon(cv, name, color, cx, cy, size=14.0, width=_ICON_STROKE,
     return n
 
 
-def icon_badge(parent, tk, name, fg, soft, box=22, radius=7, icon=13.0,
+def icon_badge(parent, tk, name, fg, soft, box=dp(22), radius=dp(7), icon=13.0,
                page=CARD):
     """圆角彩色小徽章：浅色圆角底 + 同色系线性图标。返回那个 Canvas。
 
@@ -5508,7 +5581,7 @@ def icon_badge(parent, tk, name, fg, soft, box=22, radius=7, icon=13.0,
 
 
 def round_button(parent, text, command, font, bg, fg, hover, active, parent_bg,
-                 height=38, radius=9, width=None, pad_x=30,
+                 height=dp(38), radius=dp(9), width=None, pad_x=dp(30),
                  disabled_bg="#eef1f6", disabled_fg="#a3adbb"):
     """造一个圆角按钮，返回控件。
 
@@ -5557,7 +5630,7 @@ def round_button(parent, text, command, font, bg, fg, hover, active, parent_bg,
             import tkinter.font as tkfont
             width = tkfont.Font(font=font).measure(text) + pad_x
         except Exception:
-            width = 120
+            width = dp(120)
 
     class _RoundButton(tk.Canvas):
         def __init__(self, master):
@@ -5650,12 +5723,32 @@ def round_button(parent, text, command, font, bg, fg, hover, active, parent_bg,
 
 
 def _ui_font(root, tkfont):
-    """按屏幕高度挑字号 + 挑一个装得上的中文字体。返回 (字体名, 字号)。"""
+    """按屏幕高度挑字号 + 挑一个装得上的中文字体。返回 (字体名, 字号)。
+
+    🔴 2026-10-16 两处改动（用户反馈「字太小了」）：
+
+      ① **现在拿到的是物理高度**。高 DPI 感知打开之后（见 `_init_dpi`），
+         本机 2560x1600 的屏不再被报成「1067」—— 以前那 1067 小于 1400，
+         于是永远走小字号档。光是这一条就把 base 从 10 提到了 12。
+      ② **档位整体上调一档**。用户明确说「现在软件里字太小了」，
+         所以 1080p 给 12、2K 给 14（本机 1600 走这档）、4K 给 16。
+
+    ⚠️ 字号是**点**（pt），Tk 会自己按 DPI 换算成像素，所以这里**不要**
+       再乘 `dp()` —— 乘了就变成「DPI 缩放叠 DPI 缩放」，字会大得离谱。
+       这跟 `OUTER_PAD` 那些像素常量是两套机制，别混。
+    """
     try:
         sh = root.winfo_screenheight()
     except Exception:
         sh = 1080
-    base = 12 if sh >= 1400 else 10
+    if sh >= 2000:          # 4K 级别
+        base = 16
+    elif sh >= 1440:        # 2K / 16:10 高分屏（本机 1600 走这档）
+        base = 14
+    elif sh >= 1200:
+        base = 13
+    else:                   # 1080p 及以下
+        base = 12
     fam = "Microsoft YaHei UI"
     try:
         if fam not in tkfont.families():
@@ -5690,11 +5783,11 @@ def text_panel(parent, tk, fam, base, text, pad=OUTER_PAD):
     wrap = tk.Frame(parent, bg=BG)
     wrap.pack(fill="both", expand=True, padx=pad, pady=(pad, 0))
     sb = tk.Scrollbar(wrap)
-    sb.pack(side="right", fill="y", padx=(8, 0))
+    sb.pack(side="right", fill="y", padx=(dp(8), dp(0)))
     body_cv, body = round_panel(wrap, tk, 15, 13, 12, stretch=True)
     body_cv.pack(side="left", fill="both", expand=True)
     txt = tk.Text(body, wrap="word", font=(fam, base), bg=CARD, fg=FG,
-                  relief="flat", bd=0, padx=14, pady=12, cursor="arrow",
+                  relief="flat", bd=0, padx=dp(14), pady=dp(12), cursor="arrow",
                   selectbackground=BLUE_SOFT, selectforeground=FG,
                   spacing1=2, spacing3=2)
     sb.configure(command=txt.yview)
@@ -5722,7 +5815,10 @@ def text_panel_bar(parent, tk, fam, base, command, label="知道了",
     return bar
 
 
-def show_text_window(title, text, width=780, height=640):
+def show_text_window(title, text, width=None, height=None):
+    """命令行 `--help` 用的独立说明窗口。尺寸走设计像素（见 `dp`）。"""
+    width = dp(780) if width is None else width
+    height = dp(640) if height is None else height
     """把一个长文本用「可滚动、可复制」的只读窗口显示出来。
 
     为什么需要它（2026-09-19 实测）：打包版是 `--windowed`，`sys.stdout` 是 None，
@@ -5769,17 +5865,20 @@ def show_text_window(title, text, width=780, height=640):
 #    （服务端返回的 errmsg 能区分「验证码错」和「密码错」，见 self_service.SelfError）
 SELF_LOGIN_MAX = 3
 
-# 验证码图的原始尺寸（学校那边实测 130x40）和放大倍数。
+# 验证码图的原始尺寸（学校那边实测 130x40）和显示倍数。
 # 🔴 这几个数和**窗口宽度**绑在一起：面板宽度就是按「放下放大后的验证码」定的，
 #    改放大倍数必须同时改 `PANEL_W`（下面几行就是按这个算出来的）。
+# 🔴 倍数走 `dp()`：4 是「96 DPI 下的设计倍数」，150% 的屏上要放大 6 倍，
+#    图才和面板一样大。不乘的话在 150% 屏上验证码会缩成一小块（更好笑的是
+#    它还能读，只是费劲 —— 这类「能跑但变差」的问题最难被发现）。
 CAPTCHA_W, CAPTCHA_H = 130, 40
-CAPTCHA_ZOOM = 4
+CAPTCHA_ZOOM = dp(4)
 
 # 卡片的内边距（和 `round_panel(pad_x=14, pad_y=12, radius=11)` 对应）。
 # 放在这里是为了让下面的宽度算式**只有一处** —— 面板宽度、画布宽度、
 # 验证码放不放得下，全从这几个数推出来。
-_PANEL_PAD = 14
-_CARD_PAD_X = 14
+_PANEL_PAD = dp(14)
+_CARD_PAD_X = dp(14)
 
 # 面板宽度：**至少**放得下放大后的验证码。
 # ⚠️ 为什么要给下限：正文卡片是 `round_panel` 返回的 **Canvas**，而
@@ -5788,6 +5887,8 @@ _CARD_PAD_X = 14
 #    窗口会停在标题行撑出来的 ~406px，验证码图右边 1/3 被**静默裁掉** ——
 #    用户读不全 4 个字符，功能等于不可用，而 Tk 一声不吭。
 #    （2026-10-12 靠 `selfwin_test.py` 量 `winfo_width` 才发现的。）
+# ⚠️ 这个常量只给**独立窗口模式**兜底（`host=None`，测试和 `--help` 那条路）；
+#    嵌进主窗口之后宽度是**现场量**的（`_body_w()`），跟它无关。
 PANEL_W = CAPTCHA_W * CAPTCHA_ZOOM + 2 * OUTER_PAD + 2 * _CARD_PAD_X
 
 # 右侧给滚动条留的**固定**列宽。
@@ -5797,12 +5898,12 @@ PANEL_W = CAPTCHA_W * CAPTCHA_ZOOM + 2 * OUTER_PAD + 2 * _CARD_PAD_X
 #    滚动」会反过来改变「图表放不放得下」。那是个**循环依赖**：内容多一点 ⇒
 #    出滚动条 ⇒ 画布变窄 ⇒ 图表被裁 ⇒ 更难看。预留一个固定列就把这个环切断了：
 #    画布宽度**恒定**，图表永远放得下，代价只是没滚动条时右边多一点留白。
-_SCROLL_COL = 18
+_SCROLL_COL = dp(18)
 
 # 图表画布的宽度 = 面板宽 - 两侧外层留白 - 滚动条列 - body 的右边距 - 卡片两侧内边距。
 # （从 PANEL_W 推出来，别写死一个数 —— 写死的话改了面板宽度就对不齐。）
-CHART_W = PANEL_W - 2 * OUTER_PAD - _SCROLL_COL - 2 - 2 * _CARD_PAD_X
-CHART_H = 190                     # 柱状图区高度（不含底下的日期刻度）
+CHART_W = PANEL_W - 2 * OUTER_PAD - _SCROLL_COL - dp(2) - 2 * _CARD_PAD_X
+CHART_H = dp(190)                 # 柱状图区高度（不含底下的日期刻度）
 
 
 def self_service_available(cfg=None):
@@ -5971,9 +6072,9 @@ class SelfServiceWindow(object):
         #    而本机历史是按账号存的 —— 不写清楚是哪个账号，用户会以为看的是
         #    另一个（而且两边数据都「看着正常」，看不出错）。
         round_chip(self.head, tk, account, (fam, base - 2), SUB, "#e9edf3",
-                   page=BG).pack(side="left", padx=(10, 0))
+                   page=BG).pack(side="left", padx=(dp(10), dp(0)))
         round_chip(self.head, tk, "学校自助服务 · 只读", (fam, base - 2), SUB,
-                   "#e9edf3", page=BG).pack(side="left", padx=(6, 0))
+                   "#e9edf3", page=BG).pack(side="left", padx=(dp(6), dp(0)))
         h = base * 2 + 14
         self.btn_sync = round_button(
             self.head, "同步数据", self.start_sync, (fam, base),
@@ -5997,7 +6098,7 @@ class SelfServiceWindow(object):
         self.canvas.pack(side="left", fill="both", expand=True)
         self.holder = tk.Frame(self.canvas, bg=BG)
         self.body = tk.Frame(self.holder, bg=BG)
-        self.body.pack(fill="both", expand=True, padx=(0, 2))
+        self.body.pack(fill="both", expand=True, padx=(dp(0), dp(2)))
         self._holder_id = self.canvas.create_window((0, 0), window=self.holder,
                                                     anchor="nw")
         self.holder.bind("<Configure>", self._on_holder)
@@ -6015,7 +6116,7 @@ class SelfServiceWindow(object):
 
         # --- 底部 ---
         self.foot = tk.Frame(self.win, bg=BG)
-        self.foot.pack(fill="x", padx=pad, pady=(6, 0) if self.embedded
+        self.foot.pack(fill="x", padx=pad, pady=(dp(6), dp(0)) if self.embedded
                        else OUTER_PAD)
         h = base * 2 + 16
         # 🔴 嵌入模式下**不画「关闭」**：退出这一页靠左边的导航栏。
@@ -6030,7 +6131,7 @@ class SelfServiceWindow(object):
         # 单独的入口，让想删的人删得掉。
         round_chip(self.foot, tk, "清掉本机历史", (fam, base - 1), SUB,
                    "#e9edf3", page=BG, height=h, hover="#dbe1eb",
-                   command=self.clear_history).pack(side="right", padx=(0, 10))
+                   command=self.clear_history).pack(side="right", padx=(dp(0), dp(10)))
 
         self.win.after(80, self._pump)
         self._load_local()
@@ -6061,7 +6162,7 @@ class SelfServiceWindow(object):
         if self._laid_w < 0:
             self._laid_w = e.width
             return
-        if abs(e.width - self._laid_w) < 24:
+        if abs(e.width - self._laid_w) < dp(24):
             return
         if self._relayout_job is not None:
             try:
@@ -6124,9 +6225,9 @@ class SelfServiceWindow(object):
             self.win.update_idletasks()
             if not self.embedded:
                 h = (self.head.winfo_reqheight() + self.foot.winfo_reqheight()
-                     + self.holder.winfo_reqheight() + 3 * OUTER_PAD + 12)
+                     + self.holder.winfo_reqheight() + 3 * OUTER_PAD + dp(12))
                 limit = int(self.win.winfo_screenheight() * 0.86)
-                h = max(320, min(h, limit))
+                h = max(dp(320), min(h, limit))
                 self.win.geometry("%dx%d" % (PANEL_W, h))
             self._on_holder()
         except Exception:
@@ -6593,8 +6694,11 @@ class SelfServiceWindow(object):
     #    说明文字折行还好，图表挤成 31 根细柱子但**不会被裁**（宽度是算出来的，
     #    不是写死的），两列把总高度砍掉近一半，这个交换划算。
     #    低于 760（每列不到 372）时说明文字会折成很多行，两列反而更难看。
-    MIN_2COL_W = 760
-    COL_GAP = 16              # 两列之间的缝
+    # ⚠️ 760 / 16 都是**设计像素**（上面整段推理都是按 96 DPI 算的），
+    #    而 `avail` 是**物理像素** ⇒ 必须过 `dp()` 才能比，不然在 150% 的屏上
+    #    门槛会显得高 1.5 倍，好好的宽屏会被判成「太窄」而退回单列。
+    MIN_2COL_W = dp(760)
+    COL_GAP = dp(16)          # 两列之间的缝
 
     def _body_w(self):
         """量出正文**实际**能用的宽度（像素）。
@@ -6609,13 +6713,13 @@ class SelfServiceWindow(object):
             self.win.update_idletasks()
         except Exception:
             pass
-        for wdg, minus in ((self.canvas, 0), (self.win, _SCROLL_COL + 2)):
+        for wdg, minus in ((self.canvas, 0), (self.win, _SCROLL_COL + dp(2))):
             try:
                 v = wdg.winfo_width()
             except Exception:
                 v = 0
-            if v and v > 10:
-                return max(200, v - minus)
+            if v and v > dp(10):
+                return max(dp(200), v - minus)
         return CHART_W + 2 * _CARD_PAD_X        # 兜底：老的单列宽度
 
     def _start_cols(self):
@@ -6666,14 +6770,14 @@ class SelfServiceWindow(object):
         if title:
             self.tk.Label(parent, text=title, bg=BG, fg=SUB,
                           font=(self.fam, self.base - 1)
-                          ).pack(anchor="w", pady=(8, 4))
+                          ).pack(anchor="w", pady=(dp(8), dp(4)))
         cv, inner = round_panel(parent, self.tk, _CARD_PAD_X, 12, 11)
         cv.pack(fill="x")
         return inner
 
     def _row(self, parent, name, value, fg=None, bold=False):
         f = self.tk.Frame(parent, bg=CARD)
-        f.pack(fill="x", pady=2)
+        f.pack(fill="x", pady=dp(2))
         self.tk.Label(f, text=name, bg=CARD, fg=SUB,
                       font=(self.fam, self.base)).pack(side="left")
         self.tk.Label(f, text=value, bg=CARD, fg=fg or FG,
@@ -6692,7 +6796,7 @@ class SelfServiceWindow(object):
         h = self.base * 2 + 8
         return round_button(parent, text, command, (self.fam, self.base - 1),
                             bg=bg, fg=fg, hover=hover, active=active,
-                            parent_bg=CARD, height=h, pad_x=14,
+                            parent_bg=CARD, height=h, pad_x=dp(14),
                             radius=pill_radius(h))
 
     def _busy_note(self, text):
@@ -6817,11 +6921,11 @@ class SelfServiceWindow(object):
                     % self.data["center_error"])
         self.tk.Label(self.body, text=txt, bg=BG, fg=SUB, justify="left",
                       wraplength=self.cw, font=(self.fam, self.base - 2)
-                      ).pack(anchor="w", pady=(8, 0))
+                      ).pack(anchor="w", pady=(dp(8), dp(0)))
         if getattr(self, "note", ""):
             self.tk.Label(self.body, text=self.note, bg=BG, fg=BLUE_DARK,
                           justify="left", wraplength=self.cw,
-                          font=(self.fam, self.base - 2)).pack(anchor="w", pady=(2, 0))
+                          font=(self.fam, self.base - 2)).pack(anchor="w", pady=(dp(2), dp(0)))
 
     # ------------------------------------------------------------ 账号卡
 
@@ -6863,12 +6967,12 @@ class SelfServiceWindow(object):
                     self._mini_button(
                         inner, "停机", self._stop_now,
                         "#fdecec", DANGER, "#fbdcdc", "#f8caca"
-                    ).pack(anchor="e", pady=(6, 0))
+                    ).pack(anchor="e", pady=(dp(6), dp(0)))
                 elif state == "停机中":
                     self._mini_button(
                         inner, "复机", self._recover,
                         BLUE_SOFT, BLUE_DARK, "#dbe6ff", "#cddcff"
-                    ).pack(anchor="e", pady=(6, 0))
+                    ).pack(anchor="e", pady=(dp(6), dp(0)))
 
         self._row(inner, "上网套餐", d.get("plan") or "-")
         self._row(inner, "套餐到期", d.get("expire") or "-")
@@ -6897,7 +7001,7 @@ class SelfServiceWindow(object):
         if lim:
             self.tk.Label(inner, text="限额：" + "　".join(lim), bg=CARD, fg=SUB,
                           font=(self.fam, self.base - 1)
-                          ).pack(anchor="w", pady=(6, 0))
+                          ).pack(anchor="w", pady=(dp(6), dp(0)))
         # 累计是**学校那边**的数（本机历史里没有它 —— 我们只攒每日明细，
         # 而每日明细只覆盖服务端给的那 30 天窗口）。
         # 明确写「学校」二字，免得和上面图表里的「共计」混淆 ——
@@ -6907,7 +7011,7 @@ class SelfServiceWindow(object):
                            % (self_service.fmt_flow(f.get("total")),
                               self_service.fmt_hours(t.get("total") or 0)),
                       bg=CARD, fg=SUB, font=(self.fam, self.base - 2)
-                      ).pack(anchor="w", pady=(6, 0))
+                      ).pack(anchor="w", pady=(dp(6), dp(0)))
 
     # ------------------------------------------------------------ 详单卡
 
@@ -6975,18 +7079,18 @@ class SelfServiceWindow(object):
                            "「学校记录：累计」不是同一个数 —— 两个都对。）",
                       bg=CARD, fg=SUB, justify="left",
                       wraplength=self.cw - 20,
-                      font=(self.fam, self.base - 3)).pack(anchor="w", pady=(3, 0))
+                      font=(self.fam, self.base - 3)).pack(anchor="w", pady=(dp(3), dp(0)))
         if tot and got and tot != got:
             self.tk.Label(inner, text="⚠️ 服务端共 %d 次，只取回 %d 次"
                           % (tot, got), bg=CARD, fg=WARN,
-                          font=(self.fam, self.base - 2)).pack(anchor="w", pady=(4, 0))
+                          font=(self.fam, self.base - 2)).pack(anchor="w", pady=(dp(4), dp(0)))
 
         # --- 最近几条会话 ---
         show = ss[:self.BILL_SHOW]
-        self.tk.Frame(inner, bg=LINE, height=1).pack(fill="x", pady=(8, 0))
+        self.tk.Frame(inner, bg=LINE, height=dp(1)).pack(fill="x", pady=(dp(8), dp(0)))
         for x in show:
             top = self.tk.Frame(inner, bg=CARD)
-            top.pack(fill="x", pady=(7, 0))
+            top.pack(fill="x", pady=(dp(7), dp(0)))
             self.tk.Label(top,
                           text="%s → %s" % (self._mmdd(x.get("start")),
                                             self._mmdd(x.get("end"))),
@@ -7009,7 +7113,7 @@ class SelfServiceWindow(object):
         if len(ss) > len(show):
             self.tk.Label(inner, text="（共 %d 次，这里只列最近 %d 次）"
                           % (len(ss), len(show)), bg=CARD, fg=SUB,
-                          font=(self.fam, self.base - 3)).pack(anchor="w", pady=(8, 0))
+                          font=(self.fam, self.base - 3)).pack(anchor="w", pady=(dp(8), dp(0)))
 
     # ------------------------------------------------------------ 设备卡
 
@@ -7021,7 +7125,7 @@ class SelfServiceWindow(object):
             return
         for i, x in enumerate(dev):
             if i:
-                self.tk.Frame(inner, bg=LINE, height=1).pack(fill="x", pady=6)
+                self.tk.Frame(inner, bg=LINE, height=dp(1)).pack(fill="x", pady=dp(6))
             # 🔴 排版顺序是**用户要求的**（2026-10-12）：
             #    ① 设备类型（Windows / Android…）② 上线时间 ③ 其余写小字。
             #    原来第一行是 IP + MAC，一眼看不出「这是哪台设备」。
@@ -7052,7 +7156,7 @@ class SelfServiceWindow(object):
                 self._mini_button(
                     inner, "下线这台", (lambda x=x: self._kick(x)),
                     "#fdecec", DANGER, "#fbdcdc", "#f8caca"
-                ).pack(anchor="e", pady=(6, 0))
+                ).pack(anchor="e", pady=(dp(6), dp(0)))
 
     # ------------------------------------------------------------ 账号资料卡
 
@@ -7060,7 +7164,7 @@ class SelfServiceWindow(object):
         """卡片**内部**的小分区标题（比卡片标题小一档、用加粗压住正文）。"""
         self.tk.Label(parent, text=text, bg=CARD, fg=SUB,
                       font=(self.fam, self.base - 1, "bold")
-                      ).pack(anchor="w", pady=(9, 2))
+                      ).pack(anchor="w", pady=(dp(9), dp(2)))
 
     def _card_profile(self, d):
         """账号资料卡（A 档 `getbaseinfo.do`，2026-10-16 加）。
@@ -7152,7 +7256,7 @@ class SelfServiceWindow(object):
                           bg=CARD, fg=SUB, justify="left",
                           wraplength=self.cw - 20,
                           font=(self.fam, self.base - 3)
-                          ).pack(anchor="w", pady=(3, 0))
+                          ).pack(anchor="w", pady=(dp(3), dp(0)))
 
         # --- 学校记账 ---
         # ⚠️ 口径和上面的图表卡**不同**：这里全是**学校那边**的数。
@@ -7187,7 +7291,7 @@ class SelfServiceWindow(object):
                 self.tk.Label(inner, text=line, bg=CARD, fg=FG, justify="left",
                               wraplength=self.cw - 20,
                               font=(self.fam, self.base - 1)
-                              ).pack(anchor="w", pady=(2, 0))
+                              ).pack(anchor="w", pady=(dp(2), dp(0)))
                 # --- 「解绑」按钮（B 档，2026-10-16 加）---
                 # ⚠️ `clear_type` 就是**这个槽位**的号（1~6），直接取着传下去；
                 #    界面**不提供**「按序号解绑」那种入口（容易解错槽）。
@@ -7195,7 +7299,7 @@ class SelfServiceWindow(object):
                     self._mini_button(
                         inner, "解绑", (lambda y=x: self._unbind(y)),
                         "#fdecec", DANGER, "#fbdcdc", "#f8caca"
-                    ).pack(anchor="e", pady=(4, 0))
+                    ).pack(anchor="e", pady=(dp(4), dp(0)))
 
         if not shown[0] and not binds:
             self.tk.Label(inner, text="（学校这次没有返回可显示的账号资料字段）",
@@ -7209,12 +7313,12 @@ class SelfServiceWindow(object):
     def _rec_row(self, parent, when, what, money):
         """费用记录的一行：左边「时间 + 类型」，右边金额。"""
         f = self.tk.Frame(parent, bg=CARD)
-        f.pack(fill="x", pady=1)
+        f.pack(fill="x", pady=dp(1))
         self.tk.Label(f, text=when or "-", bg=CARD, fg=SUB,
                       font=(self.fam, self.base - 2)).pack(side="left")
         self.tk.Label(f, text=what or "", bg=CARD, fg=FG,
                       font=(self.fam, self.base - 1)
-                      ).pack(side="left", padx=(8, 0))
+                      ).pack(side="left", padx=(dp(8), dp(0)))
         self.tk.Label(f,
                       text="-" if money is None else "%.2f 元" % float(money),
                       bg=CARD, fg=FG,
@@ -7249,7 +7353,7 @@ class SelfServiceWindow(object):
             if not rows:
                 self.tk.Label(inner, text="（没有扣费明细）", bg=CARD, fg=SUB,
                               font=(self.fam, self.base - 1)
-                              ).pack(anchor="w", pady=(3, 0))
+                              ).pack(anchor="w", pady=(dp(3), dp(0)))
             for x in rows[:self.FEE_SHOW]:
                 self._rec_row(inner, (x.get("time") or "")[:10],
                               x.get("kind") or "", x.get("money"))
@@ -7257,13 +7361,13 @@ class SelfServiceWindow(object):
                 self.tk.Label(inner, text="（共 %d 条，这里只列最近 %d 条）"
                               % (len(rows), self.FEE_SHOW), bg=CARD, fg=SUB,
                               font=(self.fam, self.base - 3)
-                              ).pack(anchor="w", pady=(3, 0))
+                              ).pack(anchor="w", pady=(dp(3), dp(0)))
 
         # --- 缴费 ---
         if not isinstance(chg, dict):
             self.tk.Label(inner, text="（这次没读到缴费记录，见下方说明）",
                           bg=CARD, fg=SUB,
-                          font=(self.fam, self.base)).pack(anchor="w", pady=(8, 0))
+                          font=(self.fam, self.base)).pack(anchor="w", pady=(dp(8), dp(0)))
         else:
             rows = chg.get("rows") or []
             self._sub(inner, "缴费（你交给学校的）")
@@ -7280,7 +7384,7 @@ class SelfServiceWindow(object):
                 self.tk.Label(inner, text="（共 %d 条，这里只列最近 %d 条）"
                               % (len(rows), self.FEE_SHOW), bg=CARD, fg=SUB,
                               font=(self.fam, self.base - 3)
-                              ).pack(anchor="w", pady=(3, 0))
+                              ).pack(anchor="w", pady=(dp(3), dp(0)))
 
     # ------------------------------------------------------------ 可购套餐卡
 
@@ -7307,11 +7411,11 @@ class SelfServiceWindow(object):
                           bg=CARD, fg=SUB, justify="left",
                           wraplength=self.cw - 20,
                           font=(self.fam, self.base - 2)
-                          ).pack(anchor="w", pady=(3, 0))
+                          ).pack(anchor="w", pady=(dp(3), dp(0)))
             return
         for x in rows:
             f = self.tk.Frame(inner, bg=CARD)
-            f.pack(fill="x", pady=1)
+            f.pack(fill="x", pady=dp(1))
             self.tk.Label(f, text=x.get("name") or "（未命名套餐）", bg=CARD, fg=FG,
                           font=(self.fam, self.base - 1)).pack(side="left")
             right = []
@@ -7364,13 +7468,13 @@ class SelfServiceWindow(object):
     def _link_row(self, parent, label, url):
         """一行「左边说明 + 右边『打开』」。"""
         f = self.tk.Frame(parent, bg=CARD)
-        f.pack(fill="x", pady=2)
+        f.pack(fill="x", pady=dp(2))
         self.tk.Label(f, text=label, bg=CARD, fg=FG, justify="left",
                       wraplength=self.cw - 96,
                       font=(self.fam, self.base - 1)).pack(side="left")
         h = self.base * 2 + 6
         round_chip(f, self.tk, "打开", (self.fam, self.base - 2), BLUE_DARK,
-                   BLUE_SOFT, page=CARD, height=h, pad_x=13,
+                   BLUE_SOFT, page=CARD, height=h, pad_x=dp(13),
                    command=(lambda u=url: self._open_url(u))).pack(side="right")
 
     def _card_links(self):
@@ -7414,10 +7518,10 @@ class SelfServiceWindow(object):
             on = (self.view == key)
             round_chip(bar, self.tk, label, (self.fam, self.base - 1),
                        "#ffffff" if on else SUB,
-                       BLUE if on else "#eef1f6", page=CARD, height=22,
+                       BLUE if on else "#eef1f6", page=CARD, height=dp(22),
                        hover=None if on else "#e2e8f0",
                        command=(lambda k=key: self.set_view(k))).pack(
-                side="left", padx=(0, 6))
+                side="left", padx=(dp(0), dp(6)))
         if self.view == "day" and days:
             self._month_nav(bar, days)
         self.tk.Label(bar, text="单位：MB / GB", bg=CARD, fg=SUB,
@@ -7425,7 +7529,7 @@ class SelfServiceWindow(object):
 
         if not days:
             cv = self.tk.Canvas(inner, bg=CARD, highlightthickness=0, bd=0,
-                                width=self.cw, height=110)
+                                width=self.cw, height=dp(110))
             cv.pack(fill="x")
             cv.create_text(self.cw / 2, 50, text="（本机还没有流量数据）",
                            fill=SUB, font=(self.fam, self.base))
@@ -7445,7 +7549,7 @@ class SelfServiceWindow(object):
             self.ym = months[-1]
         i = months.index(self.ym)
         nav = self.tk.Frame(parent, bg=CARD)
-        nav.pack(side="left", padx=(6, 0))
+        nav.pack(side="left", padx=(dp(6), dp(0)))
         prev = "‹" if i > 0 else " "
         nxt = "›" if i < len(months) - 1 else " "
         for sym, delta, enabled in ((prev, -1, i > 0),
@@ -7453,12 +7557,12 @@ class SelfServiceWindow(object):
             if sym == " ":
                 continue
             round_chip(nav, self.tk, sym, (self.fam, self.base), BLUE_DARK,
-                       BLUE_SOFT, page=CARD, height=20, hover="#d3e0ff",
+                       BLUE_SOFT, page=CARD, height=dp(20), hover="#d3e0ff",
                        command=(lambda d=delta: self.shift_month(d))
-                       ).pack(side="left", padx=(0, 4))
+                       ).pack(side="left", padx=(dp(0), dp(4)))
         self.tk.Label(nav, text="%s 年 %s 月" % (self.ym[:4], int(self.ym[5:])),
                       bg=CARD, fg=FG, font=(self.fam, self.base - 1, "bold")
-                      ).pack(side="left", padx=(4, 0))
+                      ).pack(side="left", padx=(dp(4), dp(0)))
 
     def set_view(self, key):
         if key not in ("day", "month") or key == self.view:
@@ -7581,17 +7685,17 @@ class SelfServiceWindow(object):
         days = self_history.days_of(self.store, self.account)
         s = self_history.summarize(days)
         grid = self.tk.Frame(parent, bg=CARD)
-        grid.pack(fill="x", pady=(10, 0))
+        grid.pack(fill="x", pady=(dp(10), dp(0)))
 
         def cell(r, c, name, value, bold=False):
             self.tk.Label(grid, text=name, bg=CARD, fg=SUB,
                           font=(self.fam, self.base - 1)
-                          ).grid(row=r, column=c * 2, sticky="w", padx=(0, 4))
+                          ).grid(row=r, column=c * 2, sticky="w", padx=(dp(0), dp(4)))
             self.tk.Label(grid, text=value, bg=CARD, fg=FG,
                           font=(self.fam, self.base - 1,
                                 "bold" if bold else "normal")
                           ).grid(row=r, column=c * 2 + 1, sticky="w",
-                                 padx=(0, 18))
+                                 padx=(dp(0), dp(18)))
 
         def part(v, known, n):
             """带「算了几天的」后缀 —— 全部都有值时就不加，免得啰嗦。"""
@@ -7620,7 +7724,7 @@ class SelfServiceWindow(object):
                              self_service.fmt_flow(got / len(bars))),
                           bg=CARD, fg=SUB, font=(self.fam, self.base - 2)
                           ).grid(row=3, column=0, columnspan=4, sticky="w",
-                                 pady=(4, 0))
+                                 pady=(dp(4), dp(0)))
 
     # ------------------------------------------------------------ 验证码 / 失败
 
@@ -7632,12 +7736,12 @@ class SelfServiceWindow(object):
                       font=(self.fam, self.base, "bold")).pack(anchor="w")
         self.tk.Label(inner, text=msg, bg=CARD, fg=FG, wraplength=self.cw - 20,
                       justify="left", font=(self.fam, self.base)
-                      ).pack(anchor="w", pady=(6, 0))
+                      ).pack(anchor="w", pady=(dp(6), dp(0)))
         self.tk.Label(inner,
                       text="（这个功能要连上校园网、并且学校自助服务能访问才行。\n"
                            "　本机已经存下来的流量历史不受影响，下次点「同步数据」再试）",
                       bg=CARD, fg=SUB, wraplength=self.cw - 20, justify="left",
-                      font=(self.fam, self.base - 1)).pack(anchor="w", pady=(6, 0))
+                      font=(self.fam, self.base - 1)).pack(anchor="w", pady=(dp(6), dp(0)))
         self._back_row(inner)
         self._autosize()
 
@@ -7668,17 +7772,17 @@ class SelfServiceWindow(object):
             self._cap_small = self._cap_big = None
 
         if self._cap_big is not None:
-            self.tk.Label(inner, image=self._cap_big, bg=CARD).pack(pady=(2, 8))
+            self.tk.Label(inner, image=self._cap_big, bg=CARD).pack(pady=(dp(2), dp(8)))
         else:
             self.tk.Label(inner, text="（验证码图片显示不出来）", bg=CARD,
-                          fg=WARN, font=(self.fam, self.base)).pack(pady=(2, 8))
+                          fg=WARN, font=(self.fam, self.base)).pack(pady=(dp(2), dp(8)))
 
         self.tk.Label(inner, text="请输入图片里的 4 个字符", bg=CARD, fg=SUB,
                       font=(self.fam, self.base - 1)).pack()
         e = self.tk.Entry(inner, font=(self.fam, self.base + 8), width=8,
                           justify="center", bg=FIELD, fg=FG, relief="flat",
                           insertbackground=FG)
-        e.pack(pady=(6, 2), ipady=4)
+        e.pack(pady=(dp(6), dp(2)), ipady=dp(4))
         e.focus_set()
         e.bind("<Return>", lambda _ev: self._submit())
         self._entry = e
@@ -7692,7 +7796,7 @@ class SelfServiceWindow(object):
                                 "验证码不对，而且新的没取到 ——\n"
                                 "点「换一张」再试一次"),
                           bg=CARD, fg=DANGER, justify="left",
-                          font=(self.fam, self.base - 1)).pack(pady=(4, 0))
+                          font=(self.fam, self.base - 1)).pack(pady=(dp(4), dp(0)))
 
         left = self.tries >= SELF_LOGIN_MAX
         if left:
@@ -7700,19 +7804,19 @@ class SelfServiceWindow(object):
                           text="已经试了 %d 次。为避免账号被锁，这里停下来了 ——\n"
                                "请确认密码没错，然后关掉窗口重开。" % self.tries,
                           bg=CARD, fg=DANGER, justify="left",
-                          font=(self.fam, self.base - 1)).pack(pady=(6, 0))
+                          font=(self.fam, self.base - 1)).pack(pady=(dp(6), dp(0)))
 
         btns = self.tk.Frame(inner, bg=CARD)
-        btns.pack(pady=(10, 2))
+        btns.pack(pady=(dp(10), dp(2)))
         h = self.base * 2 + 8
         if not left:
             round_button(btns, "确定", self._submit, (self.fam, self.base),
                          bg=BLUE, fg="#ffffff", hover=BLUE_DARK,
                          active="#1e40af", parent_bg=CARD, height=h,
-                         radius=pill_radius(h)).pack(side="left", padx=(0, 8))
+                         radius=pill_radius(h)).pack(side="left", padx=(dp(0), dp(8)))
         round_chip(btns, self.tk, "换一张", (self.fam, self.base),
                    BLUE_DARK, BLUE_SOFT, page=CARD, height=h,
-                   command=self._renew).pack(side="left", padx=(0, 8))
+                   command=self._renew).pack(side="left", padx=(dp(0), dp(8)))
         round_chip(btns, self.tk, "取消", (self.fam, self.base), SUB,
                    "#eef1f6", page=CARD, height=h, hover="#e2e8f0",
                    command=self._cancel).pack(side="left")
@@ -7721,7 +7825,7 @@ class SelfServiceWindow(object):
     def _back_row(self, inner):
         """一行「返回」——失败页/验证码页用它回到数据页。"""
         btns = self.tk.Frame(inner, bg=CARD)
-        btns.pack(pady=(10, 2))
+        btns.pack(pady=(dp(10), dp(2)))
         h = self.base * 2 + 8
         round_chip(btns, self.tk, "返回", (self.fam, self.base), BLUE_DARK,
                    BLUE_SOFT, page=CARD, height=h,
@@ -7741,13 +7845,13 @@ class SelfServiceWindow(object):
                       font=(self.fam, self.base, "bold")).pack(anchor="w")
         self.tk.Label(inner, text=msg, bg=CARD, fg=FG, wraplength=self.cw - 20,
                       justify="left", font=(self.fam, self.base)
-                      ).pack(anchor="w", pady=(6, 0))
+                      ).pack(anchor="w", pady=(dp(6), dp(0)))
         self.tk.Label(inner,
                       text="这不是验证码的问题。\n"
                            "如果提示密码不对，请先在主界面把密码改对再试。\n"
                            "（这里**故意不再重试** —— 反复登录失败可能被学校锁号）",
                       bg=CARD, fg=SUB, wraplength=CHART_W - 20, justify="left",
-                      font=(self.fam, self.base - 1)).pack(anchor="w", pady=(6, 0))
+                      font=(self.fam, self.base - 1)).pack(anchor="w", pady=(dp(6), dp(0)))
         self._back_row(inner)
         self._autosize()
 
@@ -7899,7 +8003,7 @@ class LoginApp:
 
         holder = tk.Frame(canvas, bg=BG)
         inner = tk.Frame(holder, bg=BG)
-        inner.pack(fill="both", expand=True, padx=(0, 2), pady=0)
+        inner.pack(fill="both", expand=True, padx=(dp(0), dp(2)), pady=dp(0))
         holder_id = canvas.create_window((0, 0), window=holder, anchor="nw")
 
         # 这四个要跨方法用（on_wheel / card / run），挂到 self 上。
@@ -7949,7 +8053,7 @@ class LoginApp:
         # 的说明：16:10 屏上窗口本来就吃紧，每一段 pady 都在叠加成「太高」。
         # 标题行**不套卡片**，直接坐在灰底上 —— 它相当于页面标题，套卡反而变矮胖。
         head = tk.Frame(inner, bg=BG)
-        head.pack(fill="x", pady=(2, 10))
+        head.pack(fill="x", pady=(dp(2), dp(10)))
         self.lbl(head, "%s · 设置" % APP_TITLE, self.TITLE, True, bg=BG).pack(side="left")
         # 版本号紧跟在标题右边，小字弱色。用户要报问题时第一眼就能看到它。
         # **同时它也是「检查更新」的入口**（做成链接样式的小字，不新增第四个按钮 ——
@@ -7968,7 +8072,7 @@ class LoginApp:
                                   (self.fam, self.SMALL, "underline"), BLUE_DARK, BLUE_SOFT,
                                   page=BG, height=self.SMALL + 14, hover="#d3e0ff",
                                   command=lambda: self.on_check_update())
-        self.btn_ver.pack(side="left", padx=(10, 0))
+        self.btn_ver.pack(side="left", padx=(dp(10), dp(0)))
         # ⚠️ 静止态底色**必须比页面底色 BG 明显深一点**（2026-10-04 实测踩到）：
         #    第一版这里写的是 `bg="#eef1f6"` —— 那正是 BG 本身，于是按钮和背景完全
         #    融成一片，截图里就剩四个灰字，和普通说明文字毫无区别，用户根本不会去点。
@@ -7993,10 +8097,10 @@ class LoginApp:
         # ⚠️ 内边距 12/17 是量出来的：旧实现是「1px 描边 + pady=11」= 24，
         #    这里 2×12 = 24，**逐像素等价**。半径必须 <= 内边距（round_panel 会断言）。
         status_cv, status_body = round_panel(inner, tk, 17, 12, 11)
-        status_cv.pack(fill="x", pady=(0, 10))
-        st_icon = tk.Canvas(status_body, width=22, height=22, bg=CARD,
+        status_cv.pack(fill="x", pady=(dp(0), dp(10)))
+        st_icon = tk.Canvas(status_body, width=dp(22), height=dp(22), bg=CARD,
                             highlightthickness=0, bd=0)
-        st_icon.pack(side="left", padx=(0, 10))
+        st_icon.pack(side="left", padx=(dp(0), dp(10)))
         status_text = self.lbl(status_body, "正在检测网络状态…", self.BASE, bg=CARD, fg=FG)
         status_text.pack(side="left")
         self.st_icon = st_icon
@@ -8061,10 +8165,10 @@ class LoginApp:
         #       不能图省事写死一个更大的数 —— 一旦超过 22，整行被撑高，
         #       内容高度跟着涨，而**这不会有任何报错**。
         self.sec(c_form, "账号信息", right=self.school_selector)
-        self.lbl(c_form, "学号 / 账号", self.SMALL, fg=SUB).pack(anchor="w", pady=(0, 5))
+        self.lbl(c_form, "学号 / 账号", self.SMALL, fg=SUB).pack(anchor="w", pady=(dp(0), dp(5)))
         self.var_uid = tk.StringVar()
         self.entry_box(c_form, self.var_uid)
-        self.lbl(c_form, "密码", self.SMALL, fg=SUB).pack(anchor="w", pady=(12, 5))
+        self.lbl(c_form, "密码", self.SMALL, fg=SUB).pack(anchor="w", pady=(dp(12), dp(5)))
 
         # --- 密码框（带隐私保护）---
         # 规则都在 PasswordField 里（那样才能单独建窗口测交互），这里只负责摆放。
@@ -8075,7 +8179,7 @@ class LoginApp:
         # --- 按钮（从上到下排列，每个占一整行）---
         # 🔴 三个主按钮是界面铁律：`set_busy` 的控件元组就是这三个，改数量要同步改它。
         btns = tk.Frame(c_form, bg=CARD)
-        btns.pack(fill="x", pady=(16, 0))
+        btns.pack(fill="x", pady=(dp(16), dp(0)))
         self.btn_switch = self.mkbtn(btns, "切换到此账号",
                                      lambda: self.on_switch(), "primary")
         self.btn_save = self.mkbtn(btns, "仅保存", lambda: self.on_save())
@@ -8089,9 +8193,9 @@ class LoginApp:
         msg_holder = tk.Frame(inner, bg=BG)
         msg_holder.pack(fill="x")
         self.msg = self.lbl(msg_holder, "", self.BASE, bg=BLUE_SOFT, fg=FG, anchor="w",
-                            justify="left", wraplength=700, padx=14, highlightthickness=1,
+                            justify="left", wraplength=dp(700), padx=dp(14), highlightthickness=1,
                             highlightbackground=LINE)
-        self.msg.pack(fill="x", ipady=10, pady=(0, 10))
+        self.msg.pack(fill="x", ipady=dp(10), pady=(dp(0), dp(10)))
         self.msg.pack_forget()
 
         # --- 开机自启 ---
@@ -8113,7 +8217,7 @@ class LoginApp:
         #    挂在内层卡片里，末尾就是勾选框下面 —— 正好；挂在最外层 inner 上，
         #    它就会跑到整个窗口最底部（隐私区下面），离勾选框隔了一屏。
         self.warn_auto = self.lbl(c_auto, "", self.SMALL, False, WARN,
-                                  justify="left", wraplength=680)
+                                  justify="left", wraplength=dp(680))
 
         # --- 隐私 / 清除本机凭据 ---
         # 为什么要有这个入口（2026-09-21）：以前清凭据只有命令行 `--purge`，
@@ -8121,7 +8225,7 @@ class LoginApp:
         # 不该逼他先学会开终端。
         # 做成和「检查更新」同款的小链接，**不新增第四个主按钮**（主按钮固定三个
         # 是界面铁律；这里也不进 set_busy 的控件元组 —— 忙碌拦截由 on_purge 自己做）。
-        c_priv = self.card(pady=(0, 0))
+        c_priv = self.card(pady=(dp(0), dp(0)))
         self.sec(c_priv, "隐私")
         self.lbl(c_priv, "账号密码只存在这台电脑上，不会上传到任何服务器。",
                  self.SMALL, fg=SUB).pack(anchor="w")
@@ -8132,7 +8236,7 @@ class LoginApp:
                                     (self.fam, self.SMALL, "underline"), DANGER, DANGER_SOFT,
                                     height=self.SMALL + 14, hover="#fbdada",
                                     command=lambda: self.on_purge())
-        self.btn_purge.pack(anchor="w", pady=(10, 0))
+        self.btn_purge.pack(anchor="w", pady=(dp(10), dp(0)))
 
         # --- 状态 ---
         self.state = {"busy": False, "queue": None, "buttons": None,
@@ -8171,7 +8275,7 @@ class LoginApp:
             b = nav_button(body, self.tk, label, icon, (self.fam, self.BASE),
                            (lambda k=key: self.show_page(k)),
                            width=inner_w, height=h, page=CARD)
-            b.pack(fill="x", pady=(0, 4))
+            b.pack(fill="x", pady=(dp(0), dp(4)))
             self.nav_btns[key] = b
 
     def show_page(self, key):
@@ -8313,7 +8417,7 @@ class LoginApp:
                              font=(self.fam, size or self.BASE,
                                    "bold" if bold else "normal"), **kw)
 
-    def card(self, pady=(0, 9), padx=CARD_PAD_X, ipady=CARD_PAD_Y, radius=CARD_R):
+    def card(self, pady=(dp(0), dp(9)), padx=CARD_PAD_X, ipady=CARD_PAD_Y, radius=CARD_R):
         """一张圆角分区卡片，撑满宽度。返回往里塞控件的 Frame。
 
         所有分区都走这里 —— 间距就只有一个来源，以后调整体疏密只改默认值。
@@ -8361,9 +8465,9 @@ class LoginApp:
         head = self.tk.Frame(parent, bg=CARD)
         # ⚠️ 原来是 `anchor="w"`。改成 `fill="x"` 才能把 right 推到最右边；
         #    对没有 right 的分区没有任何视觉影响（子控件本来就是左对齐的）。
-        head.pack(fill="x", pady=(0, 7))
+        head.pack(fill="x", pady=(dp(0), dp(7)))
         icon_badge(head, self.tk, icon, fg, soft).pack(side="left")
-        self.lbl(head, text, self.SMALL, True, SEC_FG).pack(side="left", padx=(8, 0))
+        self.lbl(head, text, self.SMALL, True, SEC_FG).pack(side="left", padx=(dp(8), dp(0)))
         if right is not None:
             right(head).pack(side="right")
         return head
@@ -8393,13 +8497,13 @@ class LoginApp:
            （和当初把 Label 换成 round_chip 是同一个理由）。
         """
         row = self.tk.Frame(head, bg=CARD)
-        self.lbl(row, "学校", self.SMALL, fg=SUB).pack(side="left", padx=(0, 6))
+        self.lbl(row, "学校", self.SMALL, fg=SUB).pack(side="left", padx=(dp(0), dp(6)))
         # 文字里带个 ▾ —— 一眼看出「这里能点开」。少了它，浅底小片看着就是个静态标签。
         self.var_school = self.tk.StringVar(value=school_key())
         holder = {}
         self.chip_school = round_chip(
             row, self.tk, self._school_chip_text(), (self.fam, self.SMALL),
-            BLUE_DARK, BLUE_SOFT, page=CARD, pad_x=11, height=self.title_row_h(),
+            BLUE_DARK, BLUE_SOFT, page=CARD, pad_x=dp(11), height=self.title_row_h(),
             hover="#d3e0ff", command=lambda: self._open_school_menu(holder["cv"]))
         holder["cv"] = self.chip_school
         self.chip_school.pack(side="left")
@@ -8450,7 +8554,7 @@ class LoginApp:
         e = self.tk.Entry(box, font=(self.fam, self.BASE), relief="flat", bd=0,
                           bg=FIELD, fg=FG, highlightthickness=0, insertbackground=FG,
                           textvariable=textvariable)
-        e.pack(fill="x", padx=3, ipady=2)
+        e.pack(fill="x", padx=dp(3), ipady=dp(2))
         e.bind("<FocusIn>", lambda ev: panel_set_line(cv, BLUE))
         e.bind("<FocusOut>", lambda ev: panel_set_line(cv, LINE))
         return cv, e
@@ -8467,7 +8571,7 @@ class LoginApp:
         b = round_button(parent, text, cmd, (self.fam, self.BASE),
                          bg=style[0], fg=style[1], hover=style[2], active=style[3],
                          parent_bg=CARD, height=h, radius=pill_radius(h))
-        b.pack(fill="x", pady=(0, 7))
+        b.pack(fill="x", pady=(dp(0), dp(7)))
         return b
 
     # ------------------------------------------------------------ 状态与刷新
@@ -8521,14 +8625,14 @@ class LoginApp:
             self.warn_auto.configure(
                 text="⚠ 开机自启项指向的是 exe 的「旧位置」，开机时实际不会生效。\n"
                      "   把下面的勾取消、再重新勾选一次即可修好。")
-            self.warn_auto.pack(anchor="w", pady=(8, 0))
+            self.warn_auto.pack(anchor="w", pady=(dp(8), dp(0)))
         elif old_args:
             # 0.2.0 装的 .lnk 参数是 `--auto`，没有 `--guard` —— 开机照常登录，
             # 但掉线后不会自动重连。不提示的话用户会以为新版本没修好。
             self.warn_auto.configure(
                 text="⚠ 开机自启还是「旧设置」：开机照常登录，但掉线后不会自动重连。\n"
                      "   把下面的勾取消、再重新勾选一次即可升级。")
-            self.warn_auto.pack(anchor="w", pady=(8, 0))
+            self.warn_auto.pack(anchor="w", pady=(dp(8), dp(0)))
         else:
             self.warn_auto.pack_forget()
 
@@ -8537,7 +8641,7 @@ class LoginApp:
                  "err": (DANGER_SOFT, "#7f1d1d"),
                  "info": (BLUE_SOFT, "#1e3a8a")}[kind]
         self.msg.configure(text=text, bg=color[0], fg=color[1])
-        self.msg.pack(fill="x", ipady=10, pady=(0, 10))
+        self.msg.pack(fill="x", ipady=dp(10), pady=(dp(0), dp(10)))
 
     def set_busy(self, b):
         self.state["busy"] = b
@@ -8603,25 +8707,25 @@ class LoginApp:
 
         if not ids:
             self.lbl(self.list_inner, "暂无保存的账号", self.SMALL,
-                     fg=SUB).pack(anchor="w", padx=14, pady=14)
+                     fg=SUB).pack(anchor="w", padx=dp(14), pady=dp(14))
             return
         for i, uid in enumerate(ids):
             a = store["accounts"][uid]
             row = self.tk.Frame(self.list_inner, bg=CARD)
             row.pack(fill="x")
             if i:
-                self.tk.Frame(self.list_inner, bg=LINE, height=1).pack(fill="x")
+                self.tk.Frame(self.list_inner, bg=LINE, height=dp(1)).pack(fill="x")
             left = self.tk.Frame(row, bg=CARD)
-            left.pack(side="left", fill="x", expand=True, padx=14, pady=9)
+            left.pack(side="left", fill="x", expand=True, padx=dp(14), pady=dp(9))
             line = self.tk.Frame(left, bg=CARD)
             line.pack(anchor="w")
             self.lbl(line, uid, self.BASE, True).pack(side="left")
             if uid == cur:
                 round_chip(line, self.tk, "当前使用", (self.fam, self.SMALL - 1),
-                           BLUE_DARK, BLUE_SOFT).pack(side="left", padx=(8, 0))
+                           BLUE_DARK, BLUE_SOFT).pack(side="left", padx=(dp(8), dp(0)))
             if uid == store.get("lastOnline"):
                 round_chip(line, self.tk, "上次登录", (self.fam, self.SMALL - 1),
-                           "#15803d", OK_SOFT).pack(side="left", padx=(4, 0))
+                           "#15803d", OK_SOFT).pack(side="left", padx=(dp(4), dp(0)))
             # 🔴 这个账号是在**另一所学校**下保存的（2026-10-12 加）。
             #    账号库两校共用，所以列表里会混着别的学校的账号 ——
             #    点错一次就会把 A 校的密码发到 B 校的门户（把密码交给第三方）。
@@ -8638,12 +8742,12 @@ class LoginApp:
             if a_school and a_school != school_key():
                 round_chip(line, self.tk, school_name(a_school),
                            (self.fam, self.SMALL - 1), WARN, WARN_SOFT
-                           ).pack(side="left", padx=(4, 0))
+                           ).pack(side="left", padx=(dp(4), dp(0)))
             if a.get("lastSuccess"):
                 self.lbl(left, "上次成功：%s" % a["lastSuccess"], self.SMALL - 1,
-                         fg=SUB).pack(anchor="w", pady=(3, 0))
+                         fg=SUB).pack(anchor="w", pady=(dp(3), dp(0)))
             right = self.tk.Frame(row, bg=CARD)
-            right.pack(side="right", padx=14)
+            right.pack(side="right", padx=dp(14))
             # ⚠️ 这里**故意不做整行 hover**（2026-10-04 试过又撤了）：
             #    圆角按钮是 Canvas 画的，它四个角露出的是自己的 bg（=CARD 白）。
             #    整行一变灰，那两个按钮的角上就顶着两块白方块。
@@ -8655,8 +8759,8 @@ class LoginApp:
             round_button(right, "选用", lambda u=uid: self.pick(u),
                          (self.fam, self.SMALL),
                          bg="#f1f5f9", fg="#334155", hover="#e7ecf3", active="#dbe2ea",
-                         parent_bg=CARD, height=rh, radius=pill_radius(rh), pad_x=26
-                         ).pack(side="left", padx=(0, 6))
+                         parent_bg=CARD, height=rh, radius=pill_radius(rh), pad_x=dp(26)
+                         ).pack(side="left", padx=(dp(0), dp(6)))
             # 「删除」原来的静止态是**白底**，在白卡片上完全看不出是个按钮
             # （截图放大后才发现的）。给一层很浅的红：既看得出能点，
             # 又不会像「退出当前账号」那样抢眼。
@@ -8664,7 +8768,7 @@ class LoginApp:
                                  (self.fam, self.SMALL),
                                  bg="#fef6f6", fg=DANGER, hover=DANGER_SOFT,
                                  active="#f8caca", parent_bg=CARD,
-                                 height=rh, radius=pill_radius(rh), pad_x=26)
+                                 height=rh, radius=pill_radius(rh), pad_x=dp(26))
             b_del.pack(side="left")
             # 新建的按钮必须**按当前忙碌状态**初始化：任务结束时 handle_msg 是先
             # load_all()（会重建列表）再 set_busy(False) 的，中间那一刻如果新按钮
@@ -9295,13 +9399,20 @@ class LoginApp:
         # 这里再加一次就白高 40px。
         # 也别用 root.winfo_reqheight()：内容进了 canvas 之后它就不再反映内容高度了。
         reqh = self.holder.winfo_reqheight() + 2 * OUTER_PAD
-        w, h, x, y = window_geometry(sw, sh, reqh)
+        # 🔴 `window_geometry` 认的是**设计像素** —— 里面那些 1000 / 1320 / 560 /
+        #    0.68 全是按 96 DPI 标定的，而这里量到的是**物理像素**（高 DPI 感知
+        #    打开之后 150% 的屏上两者差 1.5 倍）。所以先把入参折回设计像素去算，
+        #    拿回来的结果再换回物理像素给 Tk。这样标定值和 `geometry_test.py`
+        #    的断言一个字都不用改。
+        w, h, x, y = window_geometry(sw / UI_SCALE, sh / UI_SCALE, reqh / UI_SCALE)
+        w, h, x, y = dp(w), dp(h), dp(x), dp(y)
         # 内容装不下才挂滚动条。一次性决定，不做动态显隐 —— 动态 pack/pack_forget
         # 会改变 canvas 宽度、又触发 <Configure>，容易自己把自己绕进去。
         if reqh > h:
             self.vsb.pack(side="right", fill="y", before=self.canvas)
         self.root.geometry("%dx%d+%d+%d" % (w, h, x, y))
-        self.root.minsize(*minsize_for(sw, sh))
+        ms = minsize_for(sw / UI_SCALE, sh / UI_SCALE)   # 同上：认设计像素
+        self.root.minsize(dp(ms[0]), dp(ms[1]))
         if self.smoke:
             self.root.update_idletasks()
             # 🔴 自检里所有模态弹窗都要换成**自动返回**的假框（2026-10-11）。
