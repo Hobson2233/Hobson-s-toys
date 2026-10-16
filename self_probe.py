@@ -18,6 +18,7 @@
     · 只登录一次，只调「查」类接口，不调任何 kick / clear / 改密码 / 缴费
     · 走 datasafe.sandbox() —— 一个字节都不会写回真实数据目录
     · 不打印密码；账号只打印长度
+    · 🔴 敏感字段（身份证号/手机号/明文密码/真实姓名）**存盘和打印前都屏蔽**
     · 输出落在临时目录，不进 git
 
 用法（**推荐走 `ask`**，它把「取码 + 放大」一步做完）：
@@ -63,13 +64,67 @@ CAPTCHA_BIG = os.path.join(STATE, "captcha_8x.png")  # 放大 8 倍，给人看�
 MAX_ATTEMPTS = 3
 
 # 只探「查」类接口。⚠️ 绝不加 kickonline / clearusermac / 缴费 / 改密码。
+#
+# 每条是 (接口, 说明, 附加参数)。附加参数会与 {"accountId": 账号} 合并 ——
+# 分页类接口（getfeerecord / getchargerecord / getbilldetail）要带 page，
+# 默认值照抄前端：pageSize=5、currentPage=1（见 app.js 的 data()）。
+# ⚠️ 前端用 `ne()` 把**空字段整个删掉**再发（日期区间留空 = 不带这俩键），
+#    所以这里**不写** startTime / endTime，等价于「不限日期」。
+#
+# A 档（2026-10-15 新增，全部 get* 只读，参数从 app.js 逆出）。
+# ⚠️ 说明按**实测**写，别照名字猜 —— 实测结果见 `郑航自助服务-接口清单.md` §3A：
+#   getshutdownformation.do  停机/复机状态    {accountId}
+#   getpackageinformation.do 套餐概览         {accountId}
+#   getbusinesspackage.do    可购套餐列表      {accountId}   → 实测 rows=[] total=0
+#   getbilldetail.do         ⭐ 上网详单（会话级流量/时长/费用/断开原因）
+#   getchargerecord.do       充值记录         → 实测 rows=[] total=0
+#   getfeerecord.do          扣费记录         → 实测 rows=[] total=0
+# 🔴 `getbilldetail.do` 是**账单明细**这个名字的误导：它返回的是**会话级上网详单**
+#    （startDate/endDate/chargingDuration/uploadFlows/downloadFlows）。
 PROBE = [
-    ("getbaseinfo.do", "基本数据（/Home/index/status 页用的）"),
-    ("getindexinfo.do", "首页概览"),
-    ("getindexchart.do", "首页图表"),
-    ("getuserinformation.do", "详细资料"),
-    ("getonline.do", "在线记录（当前在线设备）"),
+    ("getindexinfo.do", "首页概览", {}),
+    ("getindexchart.do", "首页图表", {}),
+    ("getuserinformation.do", "用户资料", {}),
+    ("getonline.do", "在线记录（当前在线设备）", {}),
+    ("getbaseinfo.do", "详细资料（🔴 最敏感，含身份证/明文密码）", {}),
+    # ---- A 档：账号中心 ----
+    ("getshutdownformation.do", "停机状态", {}),
+    ("getpackageinformation.do", "套餐概览（余额/可用流量/状态）", {}),
+    ("getbusinesspackage.do", "可购套餐列表", {}),
+    ("getbilldetail.do", "⭐ 上网详单（会话级）",
+     {"page": {"pageSize": 5, "currentPage": 1}}),
+    ("getchargerecord.do", "充值记录",
+     {"page": {"pageSize": 5, "currentPage": 1}}),
+    ("getfeerecord.do", "扣费记录",
+     {"page": {"pageSize": 5, "currentPage": 1}}),
 ]
+
+# 🔴 这些键**即使只在临时目录**也不该留原文（实测确认接口真的会返回它们）。
+#    dump.json 是调试产物，没必要把身份证号/手机号/明文密码抄一份进去。
+#    值一律换成 "<已屏蔽>" —— 键还在，**形状**仍然看得见，只是内容不留。
+REDACT_KEYS = {
+    "idCardNum", "cardNo", "accountMobile", "accNbr",
+    "operatorAccount", "operatorPwd", "accountName",
+    "password", "oldPassword", "newPassword", "newPasswordAgain",
+    "email", "accountPwd", "openid",
+}
+
+
+def _redact(obj):
+    """递归把敏感键的值换成占位符。**键保留、值抹掉。**"""
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            if k in REDACT_KEYS and v not in (None, ""):
+                out[k] = "<已屏蔽:%d 字符>" % len(str(v))
+            elif isinstance(v, (dict, list)):
+                out[k] = _redact(v)
+            else:
+                out[k] = v
+        return out
+    if isinstance(obj, list):
+        return [_redact(x) for x in obj]
+    return obj
 
 
 # ---------------------------------------------------------------- 小工具
@@ -274,12 +329,18 @@ def cmd_login(code, mode="json"):
 
     out = os.path.join(STATE, "dump.json")
     dump = {}
-    for path, desc in PROBE:
-        st, raw = post(op, path, {"accountId": account})
+    for entry in PROBE:
+        path, desc = entry[0], entry[1]
+        extra = entry[2] if len(entry) > 2 else {}
+        payload = {"accountId": account}
+        payload.update(extra)
+        st, raw = post(op, path, payload)
         try:
             jj = json.loads(raw)
         except Exception:
             jj = {"_raw": raw[:800]}
+        # 🔴 屏蔽敏感字段**再**存/再打印 —— 临时目录也不留身份证号/明文密码。
+        jj = _redact(jj)
         dump[path] = jj
         print("\n" + "=" * 66)
         print("### %s   —— %s" % (path, desc))
@@ -319,8 +380,12 @@ def cmd_probe_only():
         return 1
 
     alive = 0
-    for path, desc in PROBE:
-        st, raw = post(op, path, {"accountId": account})
+    for entry in PROBE:
+        path, desc = entry[0], entry[1]
+        extra = entry[2] if len(entry) > 2 else {}
+        payload = {"accountId": account}
+        payload.update(extra)
+        st, raw = post(op, path, payload)
         try:
             j = json.loads(raw)
         except Exception:
