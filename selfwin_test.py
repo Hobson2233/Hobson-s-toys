@@ -390,7 +390,7 @@ def pump(root, seconds=6.0, until=None):
     return bool(until is None or until())
 
 
-def open_panel(root, account="2507210230"):
+def open_panel(root, account="2025000000"):
     """开一个面板（**不跑它自己的网络流程** —— 打开面板本来就不联网）。"""
     return C.SelfServiceWindow(root, _tk(), *_font(root), account,
                                "not-a-real-pwd", "http://202.196.169.246")
@@ -412,7 +412,7 @@ def reset_history():
         pass
 
 
-def seed_history(account="2507210230", days=None):
+def seed_history(account="2025000000", days=None):
     """往沙箱里的本地历史塞几天数据，返回写进去的 store。"""
     store, _ = H.load(C.SELF_FLOW_FILE)
     H.merge(store, account, days if days is not None else FAKE_DAYS[:2])
@@ -558,19 +558,19 @@ def test_sync_full_flow(root):
     check("发给学校的验证码就是刚输入的那个",
           FakeSvc.last_login[2] if FakeSvc.last_login else None, "a1b2")
     check("登录用的账号", FakeSvc.last_login[0] if FakeSvc.last_login else None,
-          "2507210230")
+          "2025000000")
     check_true("同步完按钮恢复可用", str(w.btn_sync.cget("state")) == "normal", "")
 
     # 🔴 数据必须真的写进了本地
     check_true("本地历史文件写出来了", os.path.isfile(C.SELF_FLOW_FILE), "")
     store, why = H.load(C.SELF_FLOW_FILE)
     check("读回来没有报错", why, "")
-    got = H.days_of(store, "2507210230")
+    got = H.days_of(store, "2025000000")
     check("本地存了 4 天（3 天明细 + 今天）", len(got), 4)
     check("日期都对", [d["date"] for d in got],
           ["2026-10-09", "2026-10-10", "2026-10-11", "2026-10-12"])
     check("今天的上下行是 None（服务端不给）", got[-1]["up"], None)
-    check_true("记下了「上次同步」时间", bool(H.updated_at(store, "2507210230")), "")
+    check_true("记下了「上次同步」时间", bool(H.updated_at(store, "2025000000")), "")
     check_true("界面上说了新增/更新了几天",
                "新增 4 天" in getattr(w, "note", ""), getattr(w, "note", ""))
 
@@ -736,7 +736,7 @@ def test_clear_history(root):
     reset_fake()
     reset_history()
     store, _ = H.load(C.SELF_FLOW_FILE)
-    H.merge(store, "2507210230", FAKE_DAYS)
+    H.merge(store, "2025000000", FAKE_DAYS)
     H.merge(store, "2026999999", [{"date": "2026-10-01", "flow": 1.0}])
     H.save(C.SELF_FLOW_FILE, store)
 
@@ -747,21 +747,21 @@ def test_clear_history(root):
     pump(root, 0.4)
 
     store2, _ = H.load(C.SELF_FLOW_FILE)
-    check("当前账号的历史清掉了", H.days_of(store2, "2507210230"), [])
+    check("当前账号的历史清掉了", H.days_of(store2, "2025000000"), [])
     check("**别的账号**的历史还在", len(H.days_of(store2, "2026999999")), 1)
     check_true("界面提示清完了", "已清掉" in getattr(w, "note", ""),
                getattr(w, "note", ""))
 
     # 用户点「否」时不能清
     store3, _ = H.load(C.SELF_FLOW_FILE)
-    H.merge(store3, "2507210230", FAKE_DAYS)
+    H.merge(store3, "2025000000", FAKE_DAYS)
     H.save(C.SELF_FLOW_FILE, store3)
     w2 = open_panel(root)
     w2.ask = lambda *a: False
     pump(root, 0.4)
     w2.clear_history()
     store4, _ = H.load(C.SELF_FLOW_FILE)
-    check("点「否」就不清", len(H.days_of(store4, "2507210230")), 3)
+    check("点「否」就不清", len(H.days_of(store4, "2025000000")), 3)
 
     # 没有历史时不该弹确认框
     w3 = open_panel(root, account="2026000000")
@@ -781,7 +781,7 @@ def test_chart_views(root):
     reset_fake()
     reset_history()
     store, _ = H.load(C.SELF_FLOW_FILE)
-    H.merge(store, "2507210230", [
+    H.merge(store, "2025000000", [
         {"date": "2026-09-28", "flow": 3762.25, "up": 393.57, "down": 3368.68, "hours": 24.0},
         {"date": "2026-09-29", "flow": 32812.71, "up": 6170.45, "down": 26642.26, "hours": 16.0},
     ] + FAKE_DAYS)

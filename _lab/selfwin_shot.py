@@ -40,8 +40,8 @@ def grab(widget, name):
 
 def seed(days):
     store, _ = H.load(C.SELF_FLOW_FILE)
-    H.merge(store, "2507210230", days)
-    H.mark_updated(store, "2507210230", "2026-10-12 22:40")
+    H.merge(store, "2025000000", days)
+    H.mark_updated(store, "2025000000", "2026-10-12 22:40")
     H.save(C.SELF_FLOW_FILE, store)
 
 
@@ -76,7 +76,7 @@ def main():
 
     # ① 本机没历史（空状态）
     T.reset_history()
-    w = C.SelfServiceWindow(root, T._tk(), fam, base, "2507210230",
+    w = C.SelfServiceWindow(root, T._tk(), fam, base, "2025000000",
                             "demo-1234", "http://202.196.169.246")
     T.pump(root, 1.0)
     grab(w.win, "panel_01_还没同步过.png")
@@ -85,7 +85,7 @@ def main():
     # ② 按天（默认）
     T.reset_history()
     seed(hist)
-    w = C.SelfServiceWindow(root, T._tk(), fam, base, "2507210230",
+    w = C.SelfServiceWindow(root, T._tk(), fam, base, "2025000000",
                             "demo-1234", "http://202.196.169.246")
     T.pump(root, 1.0)
     grab(w.win, "panel_02_按天.png")
@@ -107,7 +107,7 @@ def main():
     T.reset_fake()
     T.reset_history()
     T.FakeSvc.script = {"has_session": "no", "login": "ok"}
-    w = C.SelfServiceWindow(root, T._tk(), fam, base, "2507210230",
+    w = C.SelfServiceWindow(root, T._tk(), fam, base, "2025000000",
                             "demo-1234", "http://202.196.169.246")
     w._today = lambda: "2026-10-12"
     w.start_sync()

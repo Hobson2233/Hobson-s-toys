@@ -324,7 +324,7 @@ def section_switch():
 
     # 照抄本机真实文件：4 个化石键 + 凭据。化石键**不是用户写的**，
     # 是老版本 load_config()→save_config() 顺手写下的。
-    old_style = {"userId": "2507210230", "passwd": "fake-pw",
+    old_style = {"userId": "2025000000", "passwd": "fake-pw",
                  "portalHost": "http://202.196.169.166", "wlanAcIp": "10.0.1.10",
                  "wlanAcName": "ZZHK-ZAX-BRAS", "timeoutSec": 8}
 
@@ -352,7 +352,7 @@ def section_switch():
            if k in raw], [])
     check("school 写进去了", raw.get("school"), "zjxu")
     check("凭据没被动过", (raw.get("userId"), C.decrypt_secret(raw.get("passwd"))),
-          ("2507210230", "fake-pw"))
+          ("2025000000", "fake-pw"))
     # ⚠️ 2026-10-15 改：密码现在是 DPAPI 密文，不能再拿原始文件比明文。
     #    上面那行用 decrypt_secret() 还原 —— 那才是「凭据没丢」的真实语义。
     #    顺手钉住「写盘时确实加密了」，免得哪天加密静默失效这条还是绿的。

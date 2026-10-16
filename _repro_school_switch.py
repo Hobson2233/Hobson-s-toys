@@ -49,7 +49,7 @@ def check(name, got, want):
 # ---- 造一份「老版本写出来的」config.json ------------------------------------
 # 键和值都照抄本机真实文件（凭据用假的）—— 关键在于那 4 个键**不是用户写的**。
 OLD_STYLE = {
-    "userId": "2507210230", "passwd": "fake-pw",
+    "userId": "2025000000", "passwd": "fake-pw",
     "portalHost": "http://202.196.169.166",
     "wlanAcIp": "10.0.1.10",
     "wlanAcName": "ZZHK-ZAX-BRAS",
@@ -77,7 +77,7 @@ for k in ("portalHost", "wlanAcIp", "wlanAcName", "timeoutSec"):
     check("config.json 里的化石键 %-12s 已被清掉" % k, k in raw, False)
 check("school 键写进去了", raw.get("school"), "zjxu")
 check("凭据没被动过", (raw.get("userId"), raw.get("passwd")),
-      ("2507210230", "fake-pw"))
+      ("2025000000", "fake-pw"))
 
 print("\n" + "=" * 70)
 print("3. 用户手写的「单项覆盖」必须留着（高级用户的路不能被堵死）")

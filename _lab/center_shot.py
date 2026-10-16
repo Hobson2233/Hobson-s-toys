@@ -82,13 +82,13 @@ def main():
 
     T.reset_history()
     store, _ = H.load(C.SELF_FLOW_FILE)
-    H.merge(store, "2507210230", HIST)
-    H.mark_updated(store, "2507210230", "2026-10-16 09:20")
+    H.merge(store, "2025000000", HIST)
+    H.mark_updated(store, "2025000000", "2026-10-16 09:20")
     H.save(C.SELF_FLOW_FILE, store)
 
     T.reset_fake()
     T.FakeSvc.script = {"has_session": "yes", "login": "ok"}
-    w = C.SelfServiceWindow(root, T._tk(), fam, base, "2507210230",
+    w = C.SelfServiceWindow(root, T._tk(), fam, base, "2025000000",
                             "demo-1234", "http://202.196.169.246")
     T.pump(root, 1.0)
 
