@@ -14,14 +14,21 @@
 
 🔴 四条不可破的规矩：
 
-  1. **只读。** 本模块只调这几个：
+  1. **只读。** 本模块只调这几个（**全部 `get*` / `tologin` / `login`**）：
      `tologin.do` / `login.do` / `getindexinfo.do` / `getindexchart.do` /
      `getonline.do` / `getbilldetail.do`（上网详单） /
-     `getshutdownformation.do`（停机状态） / `getpackageinformation.do`（套餐概览）。
+     `getshutdownformation.do`（停机状态） / `getpackageinformation.do`（套餐概览） /
+     `getbaseinfo.do`（详细资料） / `getfeerecord.do`（扣费记录） /
+     `getchargerecord.do`（缴费记录） / `getbusinesspackage.do`（可购套餐）。
      **绝不加** `kickonline.do`（踢设备下线）/ `clearusermac.do`（解绑 MAC）/
-     缴费 / 改密码 / `getcode.do`（发短信）—— 要加必须是单独评审过的改动。
+     `selfstopping.do` / `selfrecovery.do`（停机复机）/ `changepassword.do`（改密码）/
+     `buybusinesspackage.do`（买套餐）/ 各种 `*pay*`（付钱）/ `getcode.do`（发短信）
+     —— **写操作一律去 `self_actions.py`**（那个模块单独评审、单独测试）。
      ⚠️ 配套措施：`online()` **故意不保留** `billingId` / `serverIp`
      （那两个正是 kick 需要的参数）⇒ **结构上就凑不出踢人的请求**。
+     ⚠️ 配套措施 2：本文件**没有** `action()` 之类的通用转发口子 ——
+        `self_actions.py` 需要发写请求时，自己 new 一个 opener
+        （见那个模块的说明），这样「本文件只读」是**结构保证**，不是纪律要求。
 
   2. 🔴 **构造式输出，不是过滤式。** 接口返回里**真的带**身份证号、手机号、
      真实姓名、以及**两个**接口会返回**明文密码**（实测确认：
@@ -80,6 +87,15 @@ EP_ONLINE = "getonline.do"
 EP_BILL = "getbilldetail.do"          # ⭐ 上网详单（会话级）
 EP_STOP = "getshutdownformation.do"   # 停机 / 复机状态
 EP_PACKAGE = "getpackageinformation.do"  # 套餐概览
+
+# ---- A 档第二批（2026-10-16 逆 app.js 得到参数，**字段名全部从模板逆出**）----
+# ⚠️ 这一批**没有用真账号实测过**（要登录 = 要人肉读验证码），所以：
+#    · 解析全部走「白名单 + 取不到就给空」——字段名对不上只会显示不全，**不会崩**
+#    · 界面上要能看出「这次没读到」，别把空当「没有」（红线：把错误说成事实）
+EP_BASEINFO = "getbaseinfo.do"        # 详细资料（⚠️ 见 parse_baseinfo 的白名单说明）
+EP_FEE = "getfeerecord.do"            # 扣费记录
+EP_CHARGE = "getchargerecord.do"      # 缴费记录（⚠️ 带身份证号 / 联系电话）
+EP_BUSPKG = "getbusinesspackage.do"   # 可购套餐（**只列，不买**；买是 C 档，只放链接）
 
 # 🔴 服务端**不限制** `pageSize`：实测 `pageSize=200` 直接返回 200 条
 #    （前端只给 5/10 两档，但接口本身接受更大的值）。
@@ -479,6 +495,219 @@ def parse_package(data):
     }
 
 
+# ============ A 档第二批：详细资料 / 扣费 / 缴费 / 可购套餐（2026-10-16）============
+#
+# 🔴 **这一批的字段名全部是从 `app.js` 的模板里逆出来的**，**没有用真账号实测**
+#    （登录要人肉读验证码）。所以解析一律走「白名单 + 取不到就给空」：
+#    字段名万一对不上，结果是**显示不全**，不会崩、也不会串位。
+#    ⚠️ 但界面上必须能看出「这次没读到」，**不能把空显示成「没有」**。
+#
+# 🔴 `getbaseinfo.do` 是**全项目最敏感的一个接口**（接口清单 §5）：
+#    实测返回里带 **身份证号 / 手机号 / 真实姓名 / 运营商明文密码**。
+#    所以这里是**逐个字段手写拼**，不是「拷过来再删几个键」——
+#    学校一加字段，黑名单就漏，白名单不会。
+
+# `authMessageVo` 实测有 32 个字段（从 app.js 逆出）。这里只留要用的。
+# 🔴 **明确排除**（都在同一个对象里，**别顺手加回来**）：
+#      · `operatorAccount` —— 运营商账号
+#      · `operatorPwd`     —— 🔴 **运营商明文密码**（实测确认存在）
+# 🔴 另一个块 `baseMessageVo`（24 字段）**整块不要** ——
+#    前端模板只用了它两个字段，而那俩恰好是 `idCardNum` / `idCardType`，
+#    整块都是个人身份信息。**一个字段都不取。**
+_BASEINFO_TEXT = (
+    # --- 日期 ---
+    "openingDate",            # 开户日
+    "effectiveDate",          # 生效日
+    "expirationDate",         # 到期日
+    "firstUsetime",           # 首次上网
+    "latestEditDate",         # 最后修改
+    "lastmonthlyChargetime",  # 上次月结
+    # --- 认证 ---
+    "authResult",             # 认证结果
+    "operationAuthResult",
+    "operationAuthTime",
+    # --- 套餐变更 ---
+    "groupChangeDate",
+    "groupChangeFlag",
+    # --- 🔴 代理检测：学校就是靠它判断「共享行为」的（门户须知第 2 条）---
+    "proxyCtrlResult",
+    "proxyCtrlStopTime",
+    # --- 停机 ---
+    "shutdownReason",
+    "stopDate",
+    # --- 计费开关 ---
+    "flowtimeflag",
+)
+
+# 数字类。⚠️ 用 `_num_or_none` 不是 `_num` —— 「接口没给这个数」和
+#    「这个数是 0」是两回事（见 `_num_or_none` 的说明）。
+_BASEINFO_NUM = (
+    "accumulateFlow", "accumulateTime", "accumulateMoney",       # 累计
+    "currMonthFlow", "currMonthTime", "currMonthMoney",          # 本月
+    "lastMonthFlow", "lastMonthTime", "lastMonthMoney",          # 上月
+    "currAccumulateFlow",                                        # 本期累计
+    "remainflow", "remaintime",                                  # 剩余
+    "loginCount", "webLoginFailTimes", "proxyCtrlTimes",         # 计数
+)
+
+
+def parse_baseinfo(data):
+    """把 `getbaseinfo.do` 的 `data` 解析成「详细资料」。**纯函数。**
+
+    返回 `{"text": {...}, "num": {...}, "bind": [...], "bind_count": N}`。
+    `text` / `num` 的键就是上面的白名单；取不到的值分别是 `""` / `None`。
+
+    ⚠️ `bind` 是 MAC 绑定槽位，**`clear_type` 是 B 档解绑要用的参数**
+       （`clearusermac.do` 的 `clearType` 直接取它，见 `self_actions.py`）。
+    """
+    d = data if isinstance(data, dict) else {}
+    auth = d.get("authMessageVo")
+    auth = auth if isinstance(auth, dict) else {}
+
+    text = {k: _clean(auth.get(k)) for k in _BASEINFO_TEXT}
+    num = {k: _num_or_none(auth.get(k)) for k in _BASEINFO_NUM}
+
+    bind = parse_bindings(d)
+    return {"text": text, "num": num, "bind": bind, "bind_count": len(bind)}
+
+
+def parse_bindings(data):
+    """MAC 绑定槽位。**纯函数。** 只取解绑需要的四个字段。
+
+    实测结构：`bindingMessageVo.bindMsgVo` 是 6 个槽位的数组，
+    每个槽有 `clearType`（`"1"`~`"6"` 字符串）/ `accountMac` / `terminalType` / `osInfo`。
+
+    ⚠️ **前端只把 `accountMac` 非空的槽推进列表**（`if (null!=e.accountMac …) r.push(e)`）
+       —— 所以「6 个槽位」里通常只有 1~2 个真的绑了设备。这里照做。
+    ⚠️ `clearType` 可能是数字 `1` 或字符串 `"1"`，统一转成字符串再发给接口。
+    """
+    d = data if isinstance(data, dict) else {}
+    bm = d.get("bindingMessageVo")
+    bm = bm if isinstance(bm, dict) else {}
+    rows = bm.get("bindMsgVo")
+    rows = rows if isinstance(rows, list) else []
+    out = []
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        mac = _clean(r.get("accountMac"))
+        if not mac:                     # 空槽位不推（和前端一致）
+            continue
+        out.append({
+            "clear_type": _clean(r.get("clearType")),
+            "mac": mac,
+            "kind": _clean(r.get("terminalType")),
+            "os": _clean(r.get("osInfo")),
+        })
+    return out
+
+
+def parse_fee(rows, data=None, total=None):
+    """把 `getfeerecord.do` 解析成**扣费记录**。**纯函数。**
+
+    表格列（从 `app.js` 模板逆出）：
+      用户账号 / 扣费类型 / 上网套餐 / 网点名称 / 扣除费用(元) / 扣费月份 / 扣费时间 / 收费人
+
+    ⚠️ 这一组**不含隐私字段**（`feeAccount` 是「收费人」，是学校的工作人员，
+       不是用户自己的信息）。
+
+    ⚠️ `data` 是**四类费用汇总**（固定费 / 月租 / 业务费 / 流量时长费）。
+       实测本账号全是 0（融合套餐不单独计费），但**别的账号可能非 0**。
+    """
+    out = []
+    for r in (rows if isinstance(rows, list) else []):
+        if not isinstance(r, dict):
+            continue
+        out.append({
+            "kind": _clean(r.get("feeType")),          # 扣费类型
+            "plan": _clean(r.get("internetTacticsName")),  # 上网套餐
+            "area": _clean(r.get("areaName")),         # 网点名称
+            "money": _num_or_none(r.get("feeMoney")),  # 扣除费用（元）
+            "month": _clean(r.get("feeMonth")),        # 扣费月份
+            "time": _clean(r.get("feeTime")),          # 扣费时间
+        })
+    d = data if isinstance(data, dict) else {}
+    return {
+        "rows": out,
+        "total": int(_num(total)),
+        "sum": {
+            "fix": _num_or_none(d.get("sumFixMoney")),        # 固定费
+            "month": _num_or_none(d.get("sumMothMoney")),     # 月租（学校拼错了，是 Moth）
+            "bus": _num_or_none(d.get("sumBusMoney")),        # 业务费
+            "flowtime": _num_or_none(d.get("sumFlowTimeMoney")),  # 流量时长费
+        },
+    }
+
+
+def parse_charge(rows, data=None, total=None):
+    """把 `getchargerecord.do` 解析成**缴费（充值）记录**。**纯函数。**
+
+    表格列（从 `app.js` 模板逆出）：
+      ID / 用户账号 / 缴费类型 / 缴费金额(元) / 缴费标志 / 收费时间 / 收费人 /
+      预约码 / 办理运营商 / 办理套餐 / 办理网点 / 套餐编码 / **身份证号** / **联系电话** /
+      订单状态 / 生成时间 / 处理时间
+
+    🔴 **明确丢掉 `idCardNum`（身份证号）和 `accountMobile`（联系电话）** ——
+       这两列学校自己的网页上是**明文显示**的，但我们不需要，就不取。
+       （模块规矩 2：白名单逐个接口列。这是**第二个**带身份证号的接口。）
+
+    ⚠️ 这个接口的 `data` 实测是 `null`（四类费用汇总在 `getfeerecord.do` 那边，
+       别放错地方 —— 第一版就放错了，被测试抓出来）。
+    """
+    out = []
+    for r in (rows if isinstance(rows, list) else []):
+        if not isinstance(r, dict):
+            continue
+        out.append({
+            "kind": _clean(r.get("chargeType")),           # 缴费类型
+            "money": _num_or_none(r.get("chargeMoney")),   # 缴费金额（元）
+            "flag": _clean(r.get("chargeFlag")),           # 缴费标志
+            "time": _clean(r.get("chargeTime")),           # 收费时间
+            "sub_code": _clean(r.get("subCode")),          # 预约码
+            "carrier": _clean(r.get("accNbr")),            # 办理运营商
+            "plan": _clean(r.get("internetTacticsName")),  # 办理套餐
+            "area": _clean(r.get("areaName")),             # 办理网点
+            "state": _clean(r.get("state")),               # 订单状态
+            "created": _clean(r.get("createTime")),        # 生成时间
+            "handled": _clean(r.get("handleTime")),        # 处理时间
+        })
+    return {"rows": out, "total": int(_num(total))}
+
+
+def parse_buspkg(rows):
+    """把 `getbusinesspackage.do` 解析成**可购套餐列表**。**纯函数。**
+
+    ⚠️ **只用于「看有哪些套餐」，不用于下单。** 下单是 `buybusinesspackage.do`，
+       属于 C 档（涉及钱）—— 我们**只放跳转链接**，不在软件里代办。
+
+    结构：前端直接 `e.options = t.rows` 喂给下拉框，所以字段名以
+    `label` / `value` / `name` 之类为主，实测本账号 `rows` 是**空的**
+    （融合套餐由电信侧办理，不能在自助服务里买）。
+    ⇒ 这里**宽松取**：常见的几个键都试一遍，取不到就给空。
+    """
+    out = []
+    for r in (rows if isinstance(rows, list) else []):
+        if not isinstance(r, dict):
+            continue
+        name = ""
+        for k in ("businessPackageName", "packageName", "name", "label", "internetTacticsName"):
+            name = _clean(r.get(k))
+            if name:
+                break
+        pid = ""
+        for k in ("businessPackageId", "packageId", "id", "value"):
+            pid = _clean(r.get(k))
+            if pid:
+                break
+        out.append({
+            "name": name,
+            "id": pid,
+            "money": _num_or_none(r.get("money") or r.get("price") or r.get("feeMoney")),
+            "flow": _num_or_none(r.get("flow") or r.get("chargeNumber")),
+        })
+    return {"rows": out, "total": len(out)}
+
+
 class SelfService(object):
     """一个会话（内存里的 cookie + 几个只读请求）。**不碰磁盘。**"""
     def __init__(self, base=DEFAULT_BASE, timeout=TIMEOUT):
@@ -696,18 +925,78 @@ class SelfService(object):
         """**套餐概览**（可用流量 / 余额 / 状态）。**只调 `getpackageinformation.do`。**"""
         return parse_package(self._post(EP_PACKAGE, {"accountId": account}).get("data"))
 
+    # ---------------------------------------------------- A 档第二批取数
+
+    def base_info(self, account):
+        """**详细资料**。**只调 `getbaseinfo.do`。**
+
+        ⚠️ 返回是**白名单拼出来的**（见 `parse_baseinfo`），
+           `baseMessageVo` 整块不取、`operatorPwd` 不取。
+        """
+        return parse_baseinfo(self._post(EP_BASEINFO, {"accountId": account}).get("data"))
+
+    def _records(self, ep, account, parse, start=None, end=None,
+                 page_size=BILL_PAGE_SIZE, max_pages=BILL_MAX_PAGES):
+        """扣费 / 缴费记录**共用**的翻页取数。
+
+        ⚠️ 两个接口的请求体结构**完全一样**（`{accountId, startTime, endTime, page}`），
+           所以合并成一个 —— 免得两边各写一遍、日后改一个漏一个。
+        🔴 和 `bill()` 一样**必须有 `max_pages` 兜底**：服务端要是一直返回满页，
+           没有它就是死循环（而且不报错，只会一直转）。
+        """
+        rows, tail = [], {}
+        for page in range(1, max(1, int(max_pages)) + 1):
+            payload = {"accountId": account,
+                       "page": {"pageSize": page_size, "currentPage": page}}
+            # 空日期不要发（前端也是把空字段删掉再发）
+            if start:
+                payload["startTime"] = start
+            if end:
+                payload["endTime"] = end
+            j = self._post(ep, payload)
+            part = j.get("rows")
+            part = part if isinstance(part, list) else []
+            rows.extend(part)
+            tail = j
+            if len(part) < page_size:
+                break
+        return parse(rows, tail.get("data"), tail.get("total"))
+
+    def fee_records(self, account, start=None, end=None, **kw):
+        """**扣费记录**。**只调 `getfeerecord.do`。**"""
+        return self._records(EP_FEE, account, parse_fee, start, end, **kw)
+
+    def charge_records(self, account, start=None, end=None, **kw):
+        """**缴费（充值）记录**。**只调 `getchargerecord.do`。**"""
+        return self._records(EP_CHARGE, account, parse_charge, start, end, **kw)
+
+    def bus_packages(self, account):
+        """**可购套餐**（只列，不买）。**只调 `getbusinesspackage.do`。**"""
+        return parse_buspkg(self._post(EP_BUSPKG, {"accountId": account}).get("rows"))
+
     def account_center(self, account, start=None, end=None, tolerant=False):
-        """账号中心一次拿全：**上网详单 + 停机状态 + 套餐概览**。
+        """账号中心一次拿全：**上网详单 + 停机状态 + 套餐概览 + 详细资料
+        + 扣费记录 + 缴费记录 + 可购套餐**。
 
         `tolerant=False`（默认）：任一失败就整个抛 `SelfError`（不吞错）。
-        `tolerant=True`：三部分**各自 try** —— 成功的留下，失败的给 `None`，
+        `tolerant=True`：各部分**各自 try** —— 成功的留下，失败的给 `None`，
             原因收在 `errors` 里（字符串列表）。
             ⇒ 界面要「一个挂了其它照常显示」时走这条。`full()` 就是这么用的。
+
+        ⚠️ 2026-10-16 从 3 项扩到 7 项。新增的四项（`base` / `fee` / `charge` /
+           `buspkg`）**字段名是从 `app.js` 逆出来的、没实测过** —— 所以
+           `tolerant=True` 这条路对它们尤其重要：字段对不上时接口本身是通的
+           （不会进 `errors`），只是解析出来是空的。
+           ⇒ **界面不能因为「rows 空」就说「你没有记录」**（那是把错误说成事实）。
         """
         out, errs = {}, []
         for key, call in (("bill", lambda: self.bill(account, start, end)),
                           ("stop", lambda: self.stop_state(account)),
-                          ("package", lambda: self.package(account))):
+                          ("package", lambda: self.package(account)),
+                          ("base", lambda: self.base_info(account)),
+                          ("fee", lambda: self.fee_records(account, start, end)),
+                          ("charge", lambda: self.charge_records(account, start, end)),
+                          ("buspkg", lambda: self.bus_packages(account))):
             try:
                 out[key] = call()
             except SelfError as e:

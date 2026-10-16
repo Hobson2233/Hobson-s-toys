@@ -48,7 +48,7 @@ FAKE_INDEX = {
         "operatorPwd": "SENSITIVE_PASSWORD",
         "openid": "SENSITIVE_OPERATOR",
         # --- 这些是**要留下**的 ---
-        "accountId": "2507210230",
+        "accountId": "2025000000",
         "accountStatus": "正常",
         "areaName": "电信",
         "internetTacticsName": "校园网电信融合套餐",
@@ -88,7 +88,7 @@ FAKE_CHART = {
 FAKE_ONLINE = {
     "errcode": "0", "errmsg": "获取在线清单成功", "success": True,
     "rows": [{
-        "accountId": "2507210230",
+        "accountId": "2025000000",
         "accountMac": "84:9E:56:40:69:1D",
         "accountIp": "10.15.116.156",
         "onlineTime": "2026-10-12 09:37:49",
@@ -173,7 +173,7 @@ def test_no_sensitive_leak():
     print("\n--- 2. 🔴 敏感字段一个都不许漏出去 ---")
     svc = make({S.EP_INDEX: FAKE_INDEX, S.EP_CHART: FAKE_CHART,
                 S.EP_ONLINE: FAKE_ONLINE})
-    out = svc.load("2507210230")
+    out = svc.load("2025000000")
     blob = json.dumps(out, ensure_ascii=False)
 
     for s in SENTINELS:
@@ -361,7 +361,7 @@ def test_parse_days():
     # ⑩ `chart()` **只调一个接口** —— 假数据里没准备 getindexinfo，
     #    真去调了就会抛「测试没准备这个接口的假数据」
     svc = make({S.EP_CHART: c6})
-    out = svc.chart("2507210230", today=TODAY)
+    out = svc.chart("2025000000", today=TODAY)
     check("chart() 拿得到 days", len(out["days"]), 1)
     check("chart() 拿得到 summary", out["summary"]["today"]["date"], TODAY)
 
@@ -376,7 +376,7 @@ def test_parse_days():
 # 实测：chargingDuration == endDate − startDate，分毫不差
 REAL_SESSION = {
     "id": 1,
-    "accountId": "2507210230",
+    "accountId": "2025000000",
     "startDate": "2026-10-11 08:00:00",
     "endDate": "2026-10-11 20:00:08",
     "chargingDuration": 43208,          # = 12h0m8s
@@ -410,6 +410,126 @@ FAKE_BILL = {
         # --- 必须被丢掉的 ---
         "accountName": "SENSITIVE_NAME",
     },
+}
+
+
+# ============ A 档第二批（2026-10-16）的假数据 ============
+#
+# ⚠️ 这几份**不是实测拿到的**（真登录要人肉读验证码），是照着
+#    `app.js` 模板里逆出的字段名编的。作用有两个：
+#      ① 钉住「白名单确实丢掉了敏感字段」
+#      ② 钉住「字段名对不上时不会崩」（下面的脏值测试）
+#    🔴 **不能**拿它证明「真接口就长这样」—— 那要实测。
+
+FAKE_BASEINFO = {
+    "errcode": "0", "errmsg": "操作成功", "success": True,
+    "data": {
+        "authMessageVo": {
+            # --- 必须被丢掉的（就在同一个对象里！）---
+            "operatorAccount": "SENSITIVE_OPERATOR",
+            "operatorPwd": "SENSITIVE_PASSWORD",
+            # --- 要留下的：文本类 ---
+            "openingDate": "2024-09-01",
+            "effectiveDate": "2026-10-06",
+            "expirationDate": "2038-01-01",
+            "firstUsetime": "2024-09-01 10:00:00",
+            "latestEditDate": "2026-10-06 12:00:00",
+            "lastmonthlyChargetime": "2026-10-06",
+            "authResult": "认证成功",
+            "operationAuthResult": "认证成功",
+            "operationAuthTime": "2026-10-16 19:00:00",
+            "groupChangeDate": "2026-10-06",
+            "groupChangeFlag": "0",
+            "proxyCtrlResult": "正常",
+            "proxyCtrlStopTime": "",
+            "shutdownReason": "",
+            "stopDate": "",
+            "flowtimeflag": "0",
+            # --- 要留下的：数字类 ---
+            "accumulateFlow": 690876.003675,
+            "accumulateTime": 3355.498325,
+            "accumulateMoney": 0,
+            "currMonthFlow": 18454.782751,
+            "currMonthTime": 104.017223,
+            "currMonthMoney": 0,
+            "lastMonthFlow": 30000.5,
+            "lastMonthTime": 200.25,
+            "lastMonthMoney": 0,
+            "currAccumulateFlow": 12345.6,
+            "remainflow": 0,
+            "remaintime": 0,
+            "loginCount": 42,
+            "webLoginFailTimes": 0,
+            "proxyCtrlTimes": 0,
+        },
+        "bindingMessageVo": {
+            "bindMsgVo": [
+                {"clearType": "1", "accountMac": "84:9E:56:40:69:1D",
+                 "terminalType": "a", "osInfo": "Windows"},
+                # 空槽位（accountMac 为空）—— 解析要跳过它
+                {"clearType": "2", "accountMac": "", "terminalType": "",
+                 "osInfo": ""},
+                {"clearType": "3", "accountMac": "AA:BB:CC:DD:EE:FF",
+                 "terminalType": "b", "osInfo": "Android"},
+            ],
+            "bindTerminalVo": [],
+        },
+        # 🔴 整块都不要（前端模板只用了它 idCardNum / idCardType 两个字段，
+        #    恰好都是身份信息）
+        "baseMessageVo": {
+            "idCardNum": "SENSITIVE_IDCARD",
+            "idCardType": "1",
+            "accountMobile": "SENSITIVE_PHONE",
+            "accountName": "SENSITIVE_NAME",
+        },
+    },
+}
+
+FAKE_FEE = {
+    "errcode": "0", "success": True, "total": 1,
+    "data": {"sumFixMoney": 0.0, "sumMothMoney": 0.0,
+             "sumBusMoney": 0.0, "sumFlowTimeMoney": 0.0},
+    "rows": [{
+        "accountId": "2025000000",
+        "feeType": "月租",
+        "internetTacticsName": "校园网电信融合套餐",
+        "areaName": "电信",
+        "feeMoney": 39.0,
+        "feeMonth": "2026-10",
+        "feeTime": "2026-10-06 08:00:00",
+        # 收费人 —— 是学校的工作人员，不是用户信息（但仍不展示）
+        "feeAccount": "王老师",
+    }],
+}
+
+FAKE_CHARGE = {
+    "errcode": "0", "success": True, "total": 1,
+    "rows": [{
+        "id": "1",
+        "accountId": "2025000000",
+        "chargeType": "充值",
+        "chargeMoney": 50.0,
+        "chargeFlag": "已缴费",
+        "chargeTime": "2026-10-06 09:00:00",
+        "chargeAccount": "王老师",
+        "subCode": "SUB123",
+        "accNbr": "电信",
+        "internetTacticsName": "校园网电信融合套餐",
+        "areaName": "电信",
+        "ecpId": "ECP1",
+        # 🔴 这两个是**第二个**带身份证号的接口 —— 必须丢
+        "idCardNum": "SENSITIVE_IDCARD",
+        "accountMobile": "SENSITIVE_PHONE",
+        "state": "已完成",
+        "createTime": "2026-10-06 08:59:00",
+        "handleTime": "2026-10-06 09:00:00",
+    }],
+}
+
+FAKE_BUSPKG = {
+    "errcode": "0", "success": True, "total": 1,
+    "rows": [{"businessPackageId": "9", "businessPackageName": "30元30M",
+              "money": 30.0, "flow": 0}],
 }
 
 
@@ -543,7 +663,7 @@ def test_bill_pagination():
         return {"rows": [REAL_SESSION] * 3, "total": 3, "data": {}}
 
     svc._post = _post1
-    out = svc.bill("2507210230")
+    out = svc.bill("2025000000")
     check("一页够 → 只请求一次", len(calls), 1)
     check("拿到 3 条", len(out["sessions"]), 3)
     check("fetched=3", out["summary"]["fetched"], 3)
@@ -556,7 +676,7 @@ def test_bill_pagination():
         return full
 
     svc._post = _post2
-    out2 = svc.bill("2507210230", page_size=200, max_pages=3)
+    out2 = svc.bill("2025000000", page_size=200, max_pages=3)
     check("一直满页 → 停在 max_pages=3", len(calls2), 3)
     check("3 页 × 200 条", len(out2["sessions"]), 600)
     check("total 仍是服务端说的 1000", out2["summary"]["total"], 1000)
@@ -570,17 +690,17 @@ def test_bill_pagination():
         return {"rows": [], "total": 0, "data": {}}
 
     svc._post = _post3
-    svc.bill("2507210230")
+    svc.bill("2025000000")
     p0 = payloads[0]
     check("空日期不发 startTime", "startTime" in p0, False)
     check("空日期不发 endTime", "endTime" in p0, False)
-    check("accountId 发了", p0["accountId"], "2507210230")
+    check("accountId 发了", p0["accountId"], "2025000000")
     check("分页参数", p0["page"],
           {"pageSize": S.BILL_PAGE_SIZE, "currentPage": 1})
 
     # ④ 有日期就发
     payloads.clear()
-    svc.bill("2507210230", start="2026-01-01", end="2026-10-15")
+    svc.bill("2025000000", start="2026-01-01", end="2026-10-15")
     p1 = payloads[0]
     check("有日期就发 startTime", p1["startTime"], "2026-01-01")
     check("有日期就发 endTime", p1["endTime"], "2026-10-15")
@@ -593,39 +713,159 @@ def test_bill_pagination():
         return {"rows": [], "total": 0, "data": {}}
 
     svc._post = _post5
-    svc.bill("2507210230")
+    svc.bill("2025000000")
     check("bill() 只调一个接口", sorted(set(paths)), [S.EP_BILL])
 
 
+def test_a_batch2():
+    print("\n--- 3d. A 档第二批：详细资料 / 扣费 / 缴费 / 可购套餐 ---")
+
+    # ① 详细资料：白名单逐个字段拼出来的
+    r = S.parse_baseinfo(FAKE_BASEINFO["data"])
+    check("文本字段数 = 白名单长度", len(r["text"]), len(S._BASEINFO_TEXT))
+    check("数字字段数 = 白名单长度", len(r["num"]), len(S._BASEINFO_NUM))
+    check("开户日", r["text"]["openingDate"], "2024-09-01")
+    check("累计流量", r["num"]["accumulateFlow"], 690876.003675)
+    check("登录次数", r["num"]["loginCount"], 42)
+    check("代理检测结果", r["text"]["proxyCtrlResult"], "正常")
+    check("绑定槽位数（空槽被跳过）", r["bind_count"], 2)
+
+    # ② 🔴 最敏感的一个接口：一个哨兵都不许漏
+    blob = json.dumps(r, ensure_ascii=False)
+    for s in SENTINELS:
+        check_true("详细资料没有 %s" % s, s not in blob, "")
+    for key in ("operatorAccount", "operatorPwd", "idCardNum", "idCardType",
+                "accountMobile", "accountName", "baseMessageVo"):
+        check_true("详细资料没有键 %s" % key, key not in blob, "")
+
+    # ③ 绑定槽位：clear_type 必须是**字符串**（接口要的就是字符串）
+    b = r["bind"]
+    check("绑定1 clear_type", b[0]["clear_type"], "1")
+    check("绑定1 mac", b[0]["mac"], "84:9E:56:40:69:1D")
+    check("绑定2 mac（中间那个空槽被跳过）", b[1]["mac"], "AA:BB:CC:DD:EE:FF")
+    nb = S.parse_bindings({"bindingMessageVo": {"bindMsgVo": [
+        {"clearType": 2, "accountMac": "11:22:33:44:55:66"}]}})
+    check("数字 clearType 也转成字符串", nb[0]["clear_type"], "2")
+
+    # ④ 脏值：字段名全对不上 ⇒ 给空，**不许崩**（这一批没实测过，全靠这条兜底）
+    junk = S.parse_baseinfo({"authMessageVo": {"whoKnows": 1},
+                             "bindingMessageVo": {"bindMsgVo": "不是列表"}})
+    check("脏值：文本全空", set(junk["text"].values()), {""})
+    check("脏值：数字全 None", set(junk["num"].values()), {None})
+    check("脏值：绑定为空", junk["bind"], [])
+    check("None 输入不崩", S.parse_baseinfo(None)["bind_count"], 0)
+    check("列表输入不崩", S.parse_baseinfo([1, 2])["bind_count"], 0)
+
+    # ⑤ 扣费记录（🔴 四类费用汇总在**这个**接口的 data 里，不在缴费记录那边）
+    f = S.parse_fee(FAKE_FEE["rows"], FAKE_FEE["data"], FAKE_FEE["total"])
+    check("扣费 1 条", len(f["rows"]), 1)
+    check("扣费类型", f["rows"][0]["kind"], "月租")
+    check("扣费金额", f["rows"][0]["money"], 39.0)
+    check("扣费 total", f["total"], 1)
+    check("扣费四类汇总", sorted(f["sum"].keys()),
+          ["bus", "fix", "flowtime", "month"])
+
+    # ⑥ 缴费记录 —— 🔴 第二个带身份证号的接口
+    c = S.parse_charge(FAKE_CHARGE["rows"], None, FAKE_CHARGE["total"])
+    check("缴费 1 条", len(c["rows"]), 1)
+    check("缴费金额", c["rows"][0]["money"], 50.0)
+    cblob = json.dumps(c, ensure_ascii=False)
+    for s in SENTINELS:
+        check_true("缴费记录没有 %s" % s, s not in cblob, "")
+    for key in ("idCardNum", "accountMobile"):
+        check_true("缴费记录没有键 %s" % key, key not in cblob, "")
+
+    # ⑦ 可购套餐：宽松取（真实字段名没实测过，常见几个键都试）
+    p = S.parse_buspkg(FAKE_BUSPKG["rows"])
+    check("可购套餐 1 条", len(p["rows"]), 1)
+    check("套餐名", p["rows"][0]["name"], "30元30M")
+    check("套餐 id", p["rows"][0]["id"], "9")
+    p2 = S.parse_buspkg([{"label": "40元50M", "value": "10"}])
+    check("宽松取 label/value",
+          (p2["rows"][0]["name"], p2["rows"][0]["id"]), ("40元50M", "10"))
+    check("空列表不崩", S.parse_buspkg(None)["total"], 0)
+
+    # ⑧ 每个方法只打自己那一个接口
+    for name, fn, want in (("base_info", lambda v: v.base_info("x"),
+                            S.EP_BASEINFO),
+                           ("fee_records", lambda v: v.fee_records("x"),
+                            S.EP_FEE),
+                           ("charge_records", lambda v: v.charge_records("x"),
+                            S.EP_CHARGE),
+                           ("bus_packages", lambda v: v.bus_packages("x"),
+                            S.EP_BUSPKG)):
+        svc, paths = make({S.EP_BASEINFO: FAKE_BASEINFO, S.EP_FEE: FAKE_FEE,
+                           S.EP_CHARGE: FAKE_CHARGE, S.EP_BUSPKG: FAKE_BUSPKG}), []
+        inner = svc._post
+
+        def spy(path, payload=None, _i=inner, _p=paths):
+            _p.append(path)
+            return _i(path, payload)
+
+        svc._post = spy
+        fn(svc)
+        check("%s() 只调一个接口" % name, sorted(set(paths)), [want])
+
+    # ⑨ 记录接口的翻页兜底（和 bill 同一套：max_pages 防死循环）
+    svc2 = make({S.EP_FEE: FAKE_FEE})
+    seen = []
+    inner2 = svc2._post
+
+    def spy2(path, payload=None):
+        seen.append(payload.get("page", {}).get("currentPage"))
+        return inner2(path, payload)
+
+    svc2._post = spy2
+    svc2.fee_records("2025000000", page_size=200)
+    check("一页够 → 只请求一次", seen, [1])
+
+    full_page = {"rows": [FAKE_FEE["rows"][0]] * 200, "total": 1000, "data": {}}
+    got = make({S.EP_FEE: full_page}).fee_records("2025000000", page_size=200,
+                                                  max_pages=3)
+    check("一直满页 → 停在 max_pages=3", len(got["rows"]), 600)
+
+
 def test_account_center():
-    print("\n--- 3c. A 档：account_center 一次拿全（三个接口） ---")
+    print("\n--- 3c. A 档：account_center 一次拿全（七个接口） ---")
     svc = make({S.EP_BILL: FAKE_BILL,
                 S.EP_STOP: {"data": {"pageType": "0"}},
                 S.EP_PACKAGE: {"data": {"accountState": "正常",
                                         "chargeNumber": 0, "remainMoney": 0,
-                                        "accountName": "SENSITIVE_NAME"}}})
-    out = svc.account_center("2507210230")
-    check("三个键", sorted(out.keys()), ["bill", "package", "stop"])
+                                        "accountName": "SENSITIVE_NAME"}},
+                S.EP_BASEINFO: FAKE_BASEINFO,
+                S.EP_FEE: FAKE_FEE,
+                S.EP_CHARGE: FAKE_CHARGE,
+                S.EP_BUSPKG: FAKE_BUSPKG})
+    out = svc.account_center("2025000000")
+    check("七个键", sorted(out.keys()),
+          ["base", "bill", "buspkg", "charge", "fee", "package", "stop"])
     check("bill 有会话", len(out["bill"]["sessions"]), 1)
     check("stop 状态", out["stop"]["state"], "正常")
     check("package 状态", out["package"]["state"], "正常")
+    check("base 绑定槽位", out["base"]["bind_count"], 2)
+    check("fee 条数", len(out["fee"]["rows"]), 1)
+    check("charge 条数", len(out["charge"]["rows"]), 1)
+    check("buspkg 条数", len(out["buspkg"]["rows"]), 1)
     blob = json.dumps(out, ensure_ascii=False)
     for sent in SENTINELS:
         check_true("account_center 输出没有 %s" % sent, sent not in blob, "")
 
     # 🔴 tolerant=False（默认）：任一失败就整个抛 —— 不许吞
-    svc2 = make({S.EP_BILL: FAKE_BILL, S.EP_STOP: {"data": {"pageType": "0"}}},
+    svc2 = make({S.EP_BILL: FAKE_BILL, S.EP_STOP: {"data": {"pageType": "0"}},
+                 S.EP_BASEINFO: FAKE_BASEINFO, S.EP_FEE: FAKE_FEE,
+                 S.EP_CHARGE: FAKE_CHARGE, S.EP_BUSPKG: FAKE_BUSPKG},
                 raise_on={S.EP_PACKAGE: S.SelfError("other", "套餐接口抽风")})
     try:
-        svc2.account_center("2507210230")
+        svc2.account_center("2025000000")
         check_true("默认（不容错）应当抛异常", False, "却没抛")
     except S.SelfError as e:
         check("默认模式抛的是原错误", e.msg, "套餐接口抽风")
 
     # tolerant=True：成功的留下、失败的给 None、原因收在 errors 里
-    got = svc2.account_center("2507210230", tolerant=True)
+    got = svc2.account_center("2025000000", tolerant=True)
     check("容错模式：bill 还在", len(got["bill"]["sessions"]), 1)
     check("容错模式：stop 还在", got["stop"]["state"], "正常")
+    check("容错模式：base 还在", got["base"]["bind_count"], 2)
     check("容错模式：失败的给 None", got["package"], None)
     check("容错模式：原因收在 errors", got["errors"], ["套餐接口抽风"])
 
@@ -637,11 +877,14 @@ def test_full():
             S.EP_STOP: {"data": {"pageType": "0"}},
             S.EP_PACKAGE: {"data": {"accountState": "正常", "chargeNumber": 0,
                                     "remainMoney": 0,
-                                    "accountName": "SENSITIVE_NAME"}}}
+                                    "accountName": "SENSITIVE_NAME"}},
+            S.EP_BASEINFO: FAKE_BASEINFO, S.EP_FEE: FAKE_FEE,
+            S.EP_CHARGE: FAKE_CHARGE, S.EP_BUSPKG: FAKE_BUSPKG}
 
     # ① 全好：主数据 + A 档都在，center_error 是空串
-    out = make(dict(base)).full("2507210230", today="2026-10-12")
-    for k in ("status", "plan", "days", "devices", "bill", "stop", "package"):
+    out = make(dict(base)).full("2025000000", today="2026-10-12")
+    for k in ("status", "plan", "days", "devices", "bill", "stop", "package",
+              "base", "fee", "charge", "buspkg"):
         check_true("full() 里有 %s" % k, k in out, "")
     check("主数据：状态", out["status"], "正常")
     check("A 档：详单条数", len(out["bill"]["sessions"]), 1)
@@ -652,7 +895,7 @@ def test_full():
     # ② 🔴 详单接口挂了：**主数据必须照常**，且 center_error 要说出来
     out2 = make(dict(base),
                 raise_on={S.EP_BILL: S.SelfError("other", "详单接口抽风")}
-                ).full("2507210230", today="2026-10-12")
+                ).full("2025000000", today="2026-10-12")
     check("详单挂了：主数据照常（状态）", out2["status"], "正常")
     check("详单挂了：主数据照常（天数）", len(out2["days"]), 1)
     check("详单挂了：bill 是 None", out2["bill"], None)
@@ -665,7 +908,7 @@ def test_full():
         S.EP_BILL: S.SelfError("other", "详单挂"),
         S.EP_STOP: S.SelfError("other", "停机挂"),
         S.EP_PACKAGE: S.SelfError("other", "套餐挂"),
-    }).full("2507210230", today="2026-10-12")
+    }).full("2025000000", today="2026-10-12")
     check("三个全挂：主数据仍在", out3["status"], "正常")
     for msg in ("详单挂", "停机挂", "套餐挂"):
         check_true("center_error 里有 %s" % msg, msg in out3["center_error"], "")
@@ -685,7 +928,7 @@ def test_error_kinds():
     # 验证码错 ⇒ 可以换一张重来
     svc = make(raise_on={S.EP_LOGIN: S.SelfError("other", "验证码错误")})
     try:
-        svc.login("2507210230", "pw", "0000")
+        svc.login("2025000000", "pw", "0000")
         check_true("验证码错应当抛异常", False, "却没抛")
     except S.SelfError as e:
         check("验证码错 → kind", e.kind, "captcha")
@@ -693,7 +936,7 @@ def test_error_kinds():
     # 其它登录失败 ⇒ 🔴 必须停下来，不许重试
     svc = make(raise_on={S.EP_LOGIN: S.SelfError("other", "账号或密码不正确")})
     try:
-        svc.login("2507210230", "pw", "0000")
+        svc.login("2025000000", "pw", "0000")
         check_true("密码错应当抛异常", False, "却没抛")
     except S.SelfError as e:
         check("密码错 → kind（不许重试）", e.kind, "login")
@@ -734,7 +977,20 @@ SRC = os.path.join(HERE, "self_service.py")
 #             见 `郑航自助服务-接口清单.md` §3A）。
 ALLOWED_EP = ["getbilldetail.do", "getindexchart.do", "getindexinfo.do",
               "getonline.do", "getpackageinformation.do",
-              "getshutdownformation.do", "login.do", "tologin.do"]
+              "getshutdownformation.do", "login.do", "tologin.do",
+              # 2026-10-16 A 档第二批（参数与字段名从 app.js 逆出，未用真账号实测）
+              "getbaseinfo.do", "getfeerecord.do", "getchargerecord.do",
+              "getbusinesspackage.do"]
+
+
+def _is_readonly_ep(name):
+    """接口名是不是「只读」形状：`get*` / `login` / `tologin`。
+
+    🔴 这是一条**形状**判据，和上面逐个点名的 `banned` 列表**互补**：
+       banned 是「已知的坏东西」，这条是「凡是长得不像读的，一律不接受」。
+       两者都要有 —— 只靠 banned，将来有人加个没列进去的写接口就漏了。
+    """
+    return name.startswith("get") or name in ("login.do", "tologin.do")
 
 
 def _scan_source():
@@ -773,9 +1029,14 @@ def test_no_write_endpoints():
 
     # ① 最强的判据：代码里出现的 `.do` 接口名，**必须正好**是白名单
     found = sorted(set(re.findall(r"[A-Za-z][A-Za-z0-9]*\.do", joined)))
-    check("代码里实际用到的接口集合", found, ALLOWED_EP)
+    check("代码里实际用到的接口集合", found, sorted(ALLOWED_EP))
     check_true("集合里没有多余接口",
                len(found) == len(ALLOWED_EP), "（多一个就说明加了新接口）")
+
+    # ①b 形状判据：凡是不像「读」的接口名，一律不接受（和 banned 互补）
+    for ep in found:
+        check_true("接口 %s 是只读形状" % ep, _is_readonly_ep(ep),
+                   "（不是 get*/login 开头的接口，本模块不许有）")
 
     # ② 逐个点名「写」接口（防止有人写成不带 .do 的变量名）
     banned = ["kickonline", "clearusermac", "changepassword", "userdatachange",
@@ -849,6 +1110,7 @@ def main():
     test_parse_package()
     test_clean()
     test_bill_pagination()
+    test_a_batch2()
     test_account_center()
     test_full()
     test_error_kinds()
