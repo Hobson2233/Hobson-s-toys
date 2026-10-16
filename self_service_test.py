@@ -367,6 +367,317 @@ def test_parse_days():
 
 
 
+# ------------------------------------------- 3c. A 档解析（2026-10-15 加）
+#
+# 数据**照抄真实返回的形状**（2026-10-15 实测那份 dump.json，227 条里的两条）。
+# 保留三个坑：① 时长单位是**秒**（不是小时）；② `total` 是服务端说的总数、
+# `fetched` 是我们真拉到的；③ 服务端会发字符串 `"(null)"`。
+
+# 实测：chargingDuration == endDate − startDate，分毫不差
+REAL_SESSION = {
+    "id": 1,
+    "accountId": "2507210230",
+    "startDate": "2026-10-11 08:00:00",
+    "endDate": "2026-10-11 20:00:08",
+    "chargingDuration": 43208,          # = 12h0m8s
+    "uploadFlows": 973.9739,
+    "downloadFlows": 2962.2022,
+    "fee": 0.0,
+    "terminateCause": "用户请求断开",
+    "terminalType": "a",
+    "osInfo": "Windows",
+    "accountMac": "84:9E:56:40:69:1D",
+    "accountIp": "10.15.116.156",
+    # --- 必须被丢掉的 ---
+    "serverIp": "SENSITIVE_OPERATOR",
+    "nasId": "SENSITIVE_OPERATOR",
+    "vlanId": "SENSITIVE_OPERATOR",
+    "broswerType": "Chrome",
+    "areaName": "电信",
+    "internetTacticsName": "校园网电信融合套餐",
+}
+
+FAKE_BILL = {
+    "errcode": "0", "errmsg": "操作成功", "success": True,
+    "rows": [REAL_SESSION],
+    "total": 227,
+    "data": {
+        "allUpFlows": 35321.13,
+        "allDownFlows": 261458.92,
+        "allFees": 0.0,
+        "onlineHour": 12,
+        "onlineMin": 0,
+        # --- 必须被丢掉的 ---
+        "accountName": "SENSITIVE_NAME",
+    },
+}
+
+
+def test_parse_bill():
+    print("\n--- 3c. A 档：上网详单解析（单位是秒 / total≠fetched） ---")
+    sessions, summary = S.parse_bill(FAKE_BILL["rows"], FAKE_BILL["data"],
+                                     FAKE_BILL["total"])
+
+    check("解析出 1 条会话", len(sessions), 1)
+    s = sessions[0]
+    check("会话字段集合", sorted(s.keys()),
+          ["cause", "device", "down", "end", "fee", "ip", "mac", "os",
+           "seconds", "start", "up"])
+    check("时长（秒）", s["seconds"], 43208)
+    check("上行 MB", s["up"], 973.9739)
+    check("下行 MB", s["down"], 2962.2022)
+    check("起止时间", (s["start"], s["end"]),
+          ("2026-10-11 08:00:00", "2026-10-11 20:00:08"))
+    check("断开原因", s["cause"], "用户请求断开")
+    check("设备类型", s["device"], "a")
+    check("设备 MAC 保留（要区分哪台设备）", s["mac"], "84:9E:56:40:69:1D")
+
+    # 🔴 构造式输出：敏感 / 噪音字段一个都不许出现
+    #    ⚠️ 用**字典成员判断**而不是子串搜索 —— `"id"` 这种短词做子串会误判。
+    for key in ("id", "accountId", "serverIp", "nasId", "vlanId",
+                "broswerType", "areaName", "internetTacticsName"):
+        check_true("会话里没有键 %s" % key, key not in s, "")
+    check_true("汇总里没有 accountName", "accountName" not in summary, "")
+    blob = json.dumps({"s": sessions, "m": summary}, ensure_ascii=False)
+    for sent in SENTINELS:
+        check_true("输出里没有 %s" % sent, sent not in blob, "")
+
+    # 汇总：来自服务端 data，是**全量**口径
+    check("total 是服务端说的总数", summary["total"], 227)
+    check("fetched 是真拉到的", summary["fetched"], 1)
+    check_true("total ≠ fetched（两者都要留着，别合并）",
+               summary["total"] != summary["fetched"], "")
+    check("累计上行", summary["up"], 35321.13)
+    check("累计下行", summary["down"], 261458.92)
+    check("累计费用", summary["fee"], 0.0)
+    check("累计时长换算成秒（12h0m）", summary["seconds"], 43200)
+
+    # 🔴 单位陷阱：秒 vs 小时，差 3600 倍且**不会报错**
+    check("43208 秒 → 「12 小时 0 分」", S.fmt_duration(43208), "12 小时 0 分")
+    check_true("用 fmt_duration(秒) ≠ 拿 fmt_hours 去量秒那种错法",
+               S.fmt_duration(3600) != S.fmt_hours(3600), "")
+
+    # 空 / 坏输入不崩
+    check("坏输入 → 空会话", S.parse_bill(None)[0], [])
+    check("坏输入 → summary 键一个不少",
+          sorted(S.parse_bill(None)[1]),
+          ["down", "fee", "fetched", "seconds", "total", "up"])
+    check("坏输入 → total 是 None（不是 0）", S.parse_bill(None)[1]["total"], None)
+    check("rows 是字符串", S.parse_bill("x")[0], [])
+    check("rows 里有非 dict", S.parse_bill([None, 1, "x"])[0], [])
+    check("total 读不动 → None", S.parse_bill([], None, "abc")[1]["total"], None)
+
+
+def test_fmt_duration():
+    print("\n--- 3c. A 档：时长（秒）换算 ---")
+    check("0 秒", S.fmt_duration(0), "0 秒")
+    check("59 秒", S.fmt_duration(59), "59 秒")
+    check("60 秒 → 1 分 0 秒", S.fmt_duration(60), "1 分 0 秒")
+    check("3599 秒", S.fmt_duration(3599), "59 分 59 秒")
+    check("3600 秒 → 1 小时 0 分", S.fmt_duration(3600), "1 小时 0 分")
+    check("43208 秒", S.fmt_duration(43208), "12 小时 0 分")
+    check("脏数据不崩（None）", S.fmt_duration(None), "0 秒")
+    check("脏数据不崩（负数）", S.fmt_duration(-5), "0 秒")
+    check("脏数据不崩（字符串）", S.fmt_duration("abc"), "0 秒")
+
+
+def test_parse_stop():
+    print("\n--- 3c. A 档：停机状态解析 ---")
+    check("pageType=0 → 正常", S.parse_stop({"pageType": "0"})["state"], "正常")
+    check("pageType=1 → 停机中", S.parse_stop({"pageType": "1"})["state"], "停机中")
+    check("pageType=2 → 复机中", S.parse_stop({"pageType": "2"})["state"], "复机中")
+
+    # 🔴 没见过的值 ⇒ 必须说「未知」，**绝不能兜底成「正常」**
+    #    （把「停机了」显示成「正常」是这类功能里最糟的一种错）
+    unknown = S.parse_stop({"pageType": "9"})
+    check("没见过的 pageType → 未知", unknown["state"], "未知")
+    check("未知时原始值要留着（好排查）", unknown["page_type"], "9")
+    check_true("没见过的值绝不显示成正常", unknown["state"] != "正常", "")
+
+    check("停机原因", S.parse_stop(
+        {"pageType": "1", "shutdownReason": "欠费"})["reason"], "欠费")
+    check("坏输入不崩", S.parse_stop(None)["state"], "未知")
+    check("坏输入的原始值是空串", S.parse_stop(None)["page_type"], "")
+
+
+def test_parse_package():
+    print("\n--- 3c. A 档：套餐概览解析（🔴 必须丢掉真实姓名） ---")
+    p = S.parse_package({"accountState": "正常", "chargeNumber": 0,
+                         "remainMoney": 12.5,
+                         "accountName": "SENSITIVE_NAME"})
+    check("套餐字段集合", sorted(p.keys()),
+          ["available_flow", "balance", "state"])
+    check("状态", p["state"], "正常")
+    check("可用流量", p["available_flow"], 0.0)
+    check("余额", p["balance"], 12.5)
+    # 🔴 真实姓名必须被丢掉（这个接口**带** accountName）
+    check_true("accountName 被丢掉", "accountName" not in p, "")
+    check_true("SENSITIVE_NAME 没漏出去",
+               "SENSITIVE_NAME" not in json.dumps(p, ensure_ascii=False), "")
+    check("坏输入不崩", S.parse_package(None)["state"], "")
+
+
+def test_clean():
+    print("\n--- 3c. A 档：脏值归一化 ---")
+    check("None → 空串", S._clean(None), "")
+    check("空串 → 空串", S._clean(""), "")
+    check('字符串 "(null)" → 空串（学校真这么发）', S._clean("(null)"), "")
+    check("'null' → 空串", S._clean("null"), "")
+    check("前后空格去掉", S._clean("  abc  "), "abc")
+    # ⚠️ "Unknown" **不**归零 —— 那是学校真的写了「未知」，是信息不是缺失
+    check('"Unknown" 保留（是信息不是缺失）', S._clean("Unknown"), "Unknown")
+    check("0 保留（不是空）", S._clean(0), "0")
+
+
+def test_bill_pagination():
+    print("\n--- 3c. A 档：翻页 + 兜底（🔴 max_pages 防死循环） ---")
+    full = {"rows": [REAL_SESSION] * 200, "total": 1000,
+            "data": {"onlineHour": 1, "onlineMin": 0}}
+
+    # ① 一页就够（返回 < pageSize）⇒ 只请求一次
+    calls = []
+    svc = S.SelfService()
+
+    def _post1(path, payload=None):
+        calls.append((path, dict(payload)))
+        return {"rows": [REAL_SESSION] * 3, "total": 3, "data": {}}
+
+    svc._post = _post1
+    out = svc.bill("2507210230")
+    check("一页够 → 只请求一次", len(calls), 1)
+    check("拿到 3 条", len(out["sessions"]), 3)
+    check("fetched=3", out["summary"]["fetched"], 3)
+
+    # ② 服务端**一直**返回满页 ⇒ 必须在 max_pages 处停（不许死循环）
+    calls2 = []
+
+    def _post2(path, payload=None):
+        calls2.append(dict(payload))
+        return full
+
+    svc._post = _post2
+    out2 = svc.bill("2507210230", page_size=200, max_pages=3)
+    check("一直满页 → 停在 max_pages=3", len(calls2), 3)
+    check("3 页 × 200 条", len(out2["sessions"]), 600)
+    check("total 仍是服务端说的 1000", out2["summary"]["total"], 1000)
+    check("fetched 是真拉到的 600", out2["summary"]["fetched"], 600)
+
+    # ③ 空日期**不发**（前端也是把空字段删掉再发的）
+    payloads = []
+
+    def _post3(path, payload=None):
+        payloads.append(dict(payload))
+        return {"rows": [], "total": 0, "data": {}}
+
+    svc._post = _post3
+    svc.bill("2507210230")
+    p0 = payloads[0]
+    check("空日期不发 startTime", "startTime" in p0, False)
+    check("空日期不发 endTime", "endTime" in p0, False)
+    check("accountId 发了", p0["accountId"], "2507210230")
+    check("分页参数", p0["page"],
+          {"pageSize": S.BILL_PAGE_SIZE, "currentPage": 1})
+
+    # ④ 有日期就发
+    payloads.clear()
+    svc.bill("2507210230", start="2026-01-01", end="2026-10-15")
+    p1 = payloads[0]
+    check("有日期就发 startTime", p1["startTime"], "2026-01-01")
+    check("有日期就发 endTime", p1["endTime"], "2026-10-15")
+
+    # ⑤ bill() 只调 getbilldetail.do
+    paths = []
+
+    def _post5(path, payload=None):
+        paths.append(path)
+        return {"rows": [], "total": 0, "data": {}}
+
+    svc._post = _post5
+    svc.bill("2507210230")
+    check("bill() 只调一个接口", sorted(set(paths)), [S.EP_BILL])
+
+
+def test_account_center():
+    print("\n--- 3c. A 档：account_center 一次拿全（三个接口） ---")
+    svc = make({S.EP_BILL: FAKE_BILL,
+                S.EP_STOP: {"data": {"pageType": "0"}},
+                S.EP_PACKAGE: {"data": {"accountState": "正常",
+                                        "chargeNumber": 0, "remainMoney": 0,
+                                        "accountName": "SENSITIVE_NAME"}}})
+    out = svc.account_center("2507210230")
+    check("三个键", sorted(out.keys()), ["bill", "package", "stop"])
+    check("bill 有会话", len(out["bill"]["sessions"]), 1)
+    check("stop 状态", out["stop"]["state"], "正常")
+    check("package 状态", out["package"]["state"], "正常")
+    blob = json.dumps(out, ensure_ascii=False)
+    for sent in SENTINELS:
+        check_true("account_center 输出没有 %s" % sent, sent not in blob, "")
+
+    # 🔴 tolerant=False（默认）：任一失败就整个抛 —— 不许吞
+    svc2 = make({S.EP_BILL: FAKE_BILL, S.EP_STOP: {"data": {"pageType": "0"}}},
+                raise_on={S.EP_PACKAGE: S.SelfError("other", "套餐接口抽风")})
+    try:
+        svc2.account_center("2507210230")
+        check_true("默认（不容错）应当抛异常", False, "却没抛")
+    except S.SelfError as e:
+        check("默认模式抛的是原错误", e.msg, "套餐接口抽风")
+
+    # tolerant=True：成功的留下、失败的给 None、原因收在 errors 里
+    got = svc2.account_center("2507210230", tolerant=True)
+    check("容错模式：bill 还在", len(got["bill"]["sessions"]), 1)
+    check("容错模式：stop 还在", got["stop"]["state"], "正常")
+    check("容错模式：失败的给 None", got["package"], None)
+    check("容错模式：原因收在 errors", got["errors"], ["套餐接口抽风"])
+
+
+def test_full():
+    print("\n--- 3c. A 档：full() = load + A 档，且 A 档失败不拖垮主数据 ---")
+    base = {S.EP_INDEX: FAKE_INDEX, S.EP_CHART: FAKE_CHART,
+            S.EP_ONLINE: FAKE_ONLINE, S.EP_BILL: FAKE_BILL,
+            S.EP_STOP: {"data": {"pageType": "0"}},
+            S.EP_PACKAGE: {"data": {"accountState": "正常", "chargeNumber": 0,
+                                    "remainMoney": 0,
+                                    "accountName": "SENSITIVE_NAME"}}}
+
+    # ① 全好：主数据 + A 档都在，center_error 是空串
+    out = make(dict(base)).full("2507210230", today="2026-10-12")
+    for k in ("status", "plan", "days", "devices", "bill", "stop", "package"):
+        check_true("full() 里有 %s" % k, k in out, "")
+    check("主数据：状态", out["status"], "正常")
+    check("A 档：详单条数", len(out["bill"]["sessions"]), 1)
+    check("A 档：停机状态", out["stop"]["state"], "正常")
+    check("A 档：套餐状态", out["package"]["state"], "正常")
+    check("全好时 center_error 是空串", out["center_error"], "")
+
+    # ② 🔴 详单接口挂了：**主数据必须照常**，且 center_error 要说出来
+    out2 = make(dict(base),
+                raise_on={S.EP_BILL: S.SelfError("other", "详单接口抽风")}
+                ).full("2507210230", today="2026-10-12")
+    check("详单挂了：主数据照常（状态）", out2["status"], "正常")
+    check("详单挂了：主数据照常（天数）", len(out2["days"]), 1)
+    check("详单挂了：bill 是 None", out2["bill"], None)
+    check("详单挂了：stop 照常拿到", out2["stop"]["state"], "正常")
+    check_true("🔴 详单挂了必须说出来（不能假装没有记录）",
+               "详单接口抽风" in out2["center_error"], out2["center_error"])
+
+    # ③ 三个全挂 ⇒ 主数据仍在，错误三条都在
+    out3 = make(dict(base), raise_on={
+        S.EP_BILL: S.SelfError("other", "详单挂"),
+        S.EP_STOP: S.SelfError("other", "停机挂"),
+        S.EP_PACKAGE: S.SelfError("other", "套餐挂"),
+    }).full("2507210230", today="2026-10-12")
+    check("三个全挂：主数据仍在", out3["status"], "正常")
+    for msg in ("详单挂", "停机挂", "套餐挂"):
+        check_true("center_error 里有 %s" % msg, msg in out3["center_error"], "")
+    check("三个全挂：bill/stop/package 都是 None",
+          (out3["bill"], out3["stop"], out3["package"]), (None, None, None))
+
+    # ④ full() 输出的敏感字段也不能漏（多接口拼起来最容易漏）
+    blob = json.dumps(out, ensure_ascii=False)
+    for sent in SENTINELS:
+        check_true("full() 输出没有 %s" % sent, sent not in blob, "")
+
+
 # --------------------------------------------------------------- 4. 失败要分类
 
 def test_error_kinds():
@@ -418,8 +729,12 @@ SRC = os.path.join(HERE, "self_service.py")
 
 # 允许出现的全部接口。**加一个就要改这里** —— 这是故意的：
 # 改白名单这个动作本身就是一次「停下来想一想」。
-ALLOWED_EP = ["getindexchart.do", "getindexinfo.do", "getonline.do",
-              "login.do", "tologin.do"]
+#
+# 2026-10-15：新增 A 档三个只读接口（全部 `get*`，参数与返回已实测，
+#             见 `郑航自助服务-接口清单.md` §3A）。
+ALLOWED_EP = ["getbilldetail.do", "getindexchart.do", "getindexinfo.do",
+              "getonline.do", "getpackageinformation.do",
+              "getshutdownformation.do", "login.do", "tologin.do"]
 
 
 def _scan_source():
@@ -528,6 +843,14 @@ def main():
     test_no_sensitive_leak()
     test_fmt()
     test_parse_days()
+    test_parse_bill()
+    test_fmt_duration()
+    test_parse_stop()
+    test_parse_package()
+    test_clean()
+    test_bill_pagination()
+    test_account_center()
+    test_full()
     test_error_kinds()
     test_no_write_endpoints()
     print()

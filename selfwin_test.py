@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""「上网数据」面板（`campus_login.SelfServiceWindow`）的**界面自检**。
+"""「账号中心」面板（`campus_login.SelfServiceWindow`）的**界面自检**。
 
 为什么非要有这个文件（2026-10-12）：
     面板写完之后只过了 `py_compile` 和 AST 扫描 —— 那两样只能证明「语法对、
@@ -112,6 +112,29 @@ FAKE_DAYS = [
 FAKE_TODAY = {"date": "2026-10-12", "flow": 2428.691523,
               "up": None, "down": None, "hours": 14.002222}
 
+# --- A 档（2026-10-16 加）：上网详单 / 停机状态 / 套餐概览 ---
+# 数据**照实测那份 dump.json 的形状**（227 条里的前两条，最新在前）。
+# ⚠️ 合计那几个数**故意**用实测真值：详单合计 114180.32 + 501650.28 = 615830.6 MB
+#    = 601.40 GB，而账号卡的「累计」是 690876 MB = 674.68 GB —— **两个口径**，
+#    测试里专门有一条断言这两个数**不相等且都在**（红线 35）。
+FAKE_BILL = {
+    "sessions": [
+        {"start": "2026-10-14 15:05:53", "end": "2026-10-15 03:06:01",
+         "seconds": 43208, "up": 207.28497, "down": 2871.914942, "fee": 0.0,
+         "cause": "空闲超时", "device": "手机", "os": "Android 1.x",
+         "mac": "84:9E:56:40:69:1D", "ip": "10.15.116.156"},
+        {"start": "2026-10-13 08:03:56", "end": "2026-10-13 12:03:59",
+         "seconds": 14403, "up": 12.5, "down": 88.25, "fee": 0.0,
+         "cause": "用户主动下线", "device": "电脑", "os": "Windows",
+         "mac": "84:9E:56:40:69:1D", "ip": "10.15.116.156"},
+    ],
+    "summary": {"total": 227, "fetched": 2, "up": 114180.32,
+                "down": 501650.28, "fee": 0.0, "seconds": 9756240},
+}
+FAKE_STOP = {"page_type": "0", "state": "正常", "reason": "", "oper": "",
+             "date": ""}
+FAKE_PACKAGE = {"state": "1", "available_flow": 0.0, "balance": 0.0}
+
 FAKE_DATA = {
     "status": "正常",
     "plan": "校园网电信融合套餐",
@@ -132,6 +155,11 @@ FAKE_DATA = {
     "devices": [{"ip": "10.15.116.156", "mac": "84:9E:56:40:69:1D",
                  "since": "2026-10-12 09:37:49", "os": "Windows",
                  "nas": "ZZHK-ZAX-BRAS", "kind": "a"}],
+    # --- A 档（2026-10-16 加）---
+    "bill": FAKE_BILL,
+    "stop": FAKE_STOP,
+    "package": FAKE_PACKAGE,
+    "center_error": "",
 }
 
 
@@ -187,6 +215,22 @@ class FakeSvc(object):
     def load(self, account, today=None):
         self._note("load")
         return json.loads(json.dumps(FAKE_DATA))    # 深拷贝，防被测代码改到
+
+    def full(self, account, today=None, start=None, end=None):
+        """`load()` + A 档。**被测代码现在走的是这条**（见 `_job_load`）。
+
+        `script["full"] == "center_fail"` 时模拟「A 档没读到」——
+        形状和真 `self_service.full()` 一致：三项给 None、原因进 `center_error`。
+        专门用来验「A 档挂了不能假装成『这个账号没有记录』」。
+        """
+        self._note("full")
+        d = json.loads(json.dumps(FAKE_DATA))
+        if FakeSvc.script.get("full") == "center_fail":
+            d["bill"] = None
+            d["stop"] = None
+            d["package"] = None
+            d["center_error"] = "详单接口抽风"
+        return d
 
 
 # ---------------------------------------------------------------- 小工具
@@ -276,6 +320,46 @@ def canvas_items(w):
         except Exception:
             pass
     return n
+
+
+def row_value(w, name):
+    """找一行 `_row`（左名右值），返回**右边的值**。找不到返回 `None`。
+
+    🔴 为什么不直接 `"正常" in texts_of(w.win)`：那种断言几乎永远为真
+       （界面上到处都有「正常」），等于没测。这里靠**结构**定位：
+       `_row` 造的是一个恰好两个子 Label 的 Frame，左边是名字、右边是值。
+    """
+    for f in all_widgets(w):
+        try:
+            kids = f.winfo_children()
+        except Exception:
+            continue
+        if len(kids) != 2:
+            continue
+        try:
+            a, b = kids[0].cget("text"), kids[1].cget("text")
+        except Exception:
+            continue
+        if str(a) == name:
+            return str(b)
+    return None
+
+
+def row_fg(w, name):
+    """那一行**值**的颜色（验语义色用）。找不到返回 `None`。"""
+    for f in all_widgets(w):
+        try:
+            kids = f.winfo_children()
+        except Exception:
+            continue
+        if len(kids) != 2:
+            continue
+        try:
+            if str(kids[0].cget("text")) == name:
+                return str(kids[1].cget("fg"))
+        except Exception:
+            continue
+    return None
 
 
 def tk_image_size(root, name):
@@ -764,8 +848,12 @@ def test_devices_layout(root):
     FakeSvc.script = {"has_session": "yes"}
     saved = json.loads(json.dumps(FAKE_DATA))
     saved["devices"][0]["os"] = ""
-    orig_load = FakeSvc.load
-    FakeSvc.load = lambda self, account, today=None: json.loads(json.dumps(saved))
+    # ⚠️ 猴补的是 `full`（不是 `load`）—— 2026-10-16 起 `_job_load` 走的是
+    #    `self_service.full()`。补错方法的话这个替身根本不生效，
+    #    而断言仍然会「绿」得莫名其妙（这里当时就是漏改，靠 ⑫ 报红才发现）。
+    orig_full = FakeSvc.full
+    FakeSvc.full = lambda self, account, today=None, start=None, end=None: \
+        json.loads(json.dumps(saved))
     w2 = open_panel(root)
     w2._today = lambda: "2026-10-12"
     w2.start_sync()
@@ -775,7 +863,7 @@ def test_devices_layout(root):
                "未知设备" in t2, "")
     check_true("也没有把那个代码 a 当成设备类型显示",
                not any(x.strip() == "a" for x in t2), "")
-    FakeSvc.load = orig_load
+    FakeSvc.full = orig_full
     w.close()
     w2.close()
 
@@ -790,7 +878,7 @@ def test_off_main_thread():
 
 
 def test_main_window_chip():
-    """主界面状态卡上的「上网数据」圆角片：**在、文字对、高度和邻居一模一样**。
+    """主界面状态卡上的「账号中心」圆角片：**在、文字对、高度和邻居一模一样**。
 
     🔴 高度这条是重点：内容高度是 827px、上限 906px，多 1px 都可能压线。
        这个圆角片是塞进状态卡右侧的，只要它不比旁边那个高，
@@ -800,11 +888,11 @@ def test_main_window_chip():
     print("\n⑭ 主界面上的入口")
     app = C.LoginApp(smoke=True)
     try:
-        check_true("郑航下「上网数据」入口存在", app.btn_self is not None, "")
+        check_true("郑航下「账号中心」入口存在", app.btn_self is not None, "")
         check_true("「测一下速度」也还在", app.btn_probe is not None, "")
         if app.btn_self is not None:
             check("圆角片上的字", getattr(app.btn_self, "_rb_text", None),
-                  "上网数据")
+                  "账号中心")
             check("和「测一下速度」同高（保证内容高度不变）",
                   app.btn_self.winfo_reqheight(), app.btn_probe.winfo_reqheight())
             check("两个片是同一个父容器（同一行）",
@@ -815,7 +903,7 @@ def test_main_window_chip():
         # 🔴 界面铁律：**主按钮固定三个**。新入口是状态卡里的圆角片，
         #    不许混进那三个里去。`set_busy` 里那个元组就是这条铁律的实现
         #    （`(btn_switch, btn_save, btn_out, btn_probe)`），所以直接验行为：
-        #    忙碌时那三个必须变灰、而「上网数据」**不该**跟着变
+        #    忙碌时那三个必须变灰、而「账号中心」**不该**跟着变
         #    （它的忙碌拦截是 `on_self_service` 自己做的）。
         main3 = (app.btn_switch, app.btn_save, app.btn_out)
         check("三个主按钮互不相同", len({id(x) for x in main3}), 3)
@@ -826,7 +914,7 @@ def test_main_window_chip():
                   [str(w.cget("state")) for w in main3],
                   ["disabled", "disabled", "disabled"])
             if app.btn_self is not None:
-                check("忙碌时「上网数据」没被算进主按钮（自己拦截）",
+                check("忙碌时「账号中心」没被算进主按钮（自己拦截）",
                       str(app.btn_self.cget("state")), "normal")
         finally:
             app.set_busy(False)
@@ -834,11 +922,129 @@ def test_main_window_chip():
         app.root.destroy()
 
 
+def test_center_cards(root):
+    """⑮ 账号中心：停机状态 / 上网详单（含口径区分）+ A 档失败要说出来。"""
+    print("\n⑮ 账号中心：停机状态 / 上网详单")
+    reset_fake()
+    reset_history()
+    FakeSvc.script = {"has_session": "yes", "login": "ok"}
+    w = open_panel(root)
+    pump(root, 0.4)
+    try:
+        # ① 直接塞数据 + 重画（登录那条流程 ④ 已经验过，不重复走）
+        w.data = json.loads(json.dumps(FAKE_DATA))
+        w._render()
+        pump(root, 0.5)
+
+        # --- 停机状态（并进账号卡）---
+        check("账号卡里有「停机状态」行", row_value(w.win, "停机状态"), "正常")
+        check("「正常」用绿色（语义色）", row_fg(w.win, "停机状态"), C.OK)
+
+        # --- 上网详单卡 ---
+        check("区间（最旧 ~ 最新）", row_value(w.win, "区间"), "2026-10-13 ~ 2026-10-14")
+        check("会话数用服务端的 total", row_value(w.win, "会话数"), "227 次")
+        check("详单合计时长（秒 → 人话）",
+              row_value(w.win, "详单合计时长"), "2710 小时 4 分")
+        check("详单合计流量（上行+下行）",
+              row_value(w.win, "详单合计流量"), "601.40 GB")
+
+        # 🔴 红线 35：两个口径的「累计」同屏，必须**都写清是哪个**
+        check("账号卡那边的口径还在（学校记录：累计 674.68 GB）",
+              row_value(w.win, "余额"), "12.50 元")
+        blob = "\n".join(texts_of(w.win))
+        check_true("两个数都在界面上（601.40 GB 和 674.68 GB）",
+                   "601.40 GB" in blob and "674.68 GB" in blob,
+                   "详单口径 vs 账号口径")
+        check_true("两个数**不相等**（不是同一口径重复显示）",
+                   "601.40 GB" != "674.68 GB", "")
+        check_true("🔴 界面上解释了「为什么两个数不一样」",
+                   "不是同一个数" in blob, "")
+
+        # --- 会话明细（最新在前）---
+        check_true("第一条会话的起止", "10-14 15:05 → 10-15 03:06" in blob, "")
+        check_true("第一条的时长", "12 小时 0 分" in blob, "")
+        check_true("🔴 上行/下行**分开**写（用户要看上下行）",
+                   "↑ 207.28 MB" in blob and "↓ 2.80 GB" in blob, "")
+        check_true("第一条的断开原因", "空闲超时" in blob, "")
+        check_true("第二条会话也在", "10-13 08:03 → 10-13 12:03" in blob, "")
+        check_true("第二条的原因", "用户主动下线" in blob, "")
+
+        # --- 会话数超过 BILL_SHOW 时要有说明 ---
+        w.BILL_SHOW = 1
+        w._render()
+        pump(root, 0.3)
+        blob2 = "\n".join(texts_of(w.win))
+        check_true("超过上限时写「只列最近 N 次」",
+                   "这里只列最近 1 次" in blob2, "")
+        check_true("超上限时第二条不画了", "用户主动下线" not in blob2, "")
+        w.BILL_SHOW = 10
+
+        # --- 套餐可用流量：0 时**不显示**（0 会被读成「没流量了」，和事实相反）---
+        check("可用流量 0 ⇒ 不显示这一行", row_value(w.win, "套餐可用流量"), None)
+        d = json.loads(json.dumps(FAKE_DATA))
+        d["package"]["available_flow"] = 512.0
+        w.data = d
+        w._render()
+        pump(root, 0.3)
+        check("可用流量 > 0 ⇒ 显示", row_value(w.win, "套餐可用流量"), "512.00 MB")
+
+        # --- 停机中要用警示色 ---
+        d = json.loads(json.dumps(FAKE_DATA))
+        d["stop"] = {"page_type": "1", "state": "停机中", "reason": "欠费",
+                     "oper": "admin", "date": "2026-10-15"}
+        w.data = d
+        w._render()
+        pump(root, 0.3)
+        check("停机中", row_value(w.win, "停机状态"), "停机中")
+        check("停机中用红色", row_fg(w.win, "停机状态"), C.DANGER)
+        check_true("停机原因写出来了", "原因：欠费" in "\n".join(texts_of(w.win)), "")
+
+        # ② 🔴 A 档没读到：必须**说出来**，不能假装「这个账号没有记录」
+        d2 = json.loads(json.dumps(FAKE_DATA))
+        d2["bill"] = None
+        d2["stop"] = None
+        d2["package"] = None
+        d2["center_error"] = "详单接口抽风"
+        w.data = d2
+        w._render()
+        pump(root, 0.5)
+        blob3 = "\n".join(texts_of(w.win))
+        check_true("🔴 明说「这次没读到详单」", "这次没读到详单" in blob3, "")
+        check_true("🔴 不能说成「还没有上网记录」",
+                   "还没有上网记录" not in blob3, "")
+        check_true("页脚写出原因", "详单接口抽风" in blob3, "")
+        check_true("🔴 页脚说清「不代表没有」", "不代表「没有」" in blob3, "")
+        check("🔴 停机没读到 ⇒ 不画那一行（不知道 ≠ 正常）",
+              row_value(w.win, "停机状态"), None)
+        # 主数据必须照常
+        check("主数据照常：账号状态", row_value(w.win, "账号状态"), "正常")
+        check_true("主数据照常：设备卡还在",
+                   "在线设备" in "\n".join(texts_of(w.win)), "")
+
+        # ③ 走一遍真流程：同步后 data 里带着 A 档（验 `_job_load` 用的是 full）
+        reset_fake()
+        FakeSvc.script = {"has_session": "yes", "login": "ok"}
+        w2 = open_panel(root)
+        try:
+            pump(root, 0.4)
+            w2.start_sync()
+            ok = pump(root, 6.0, lambda: w2.data is not None)
+            check_true("同步后拿到数据", ok, "")
+            check_true("🔴 同步走的是 full()（不是 load）", "full" in FakeSvc.calls,
+                       str(sorted(set(FakeSvc.calls))))
+            check("同步后详单卡也画出来了",
+                  row_value(w2.win, "会话数"), "227 次")
+        finally:
+            w2.close()
+    finally:
+        w.close()
+
+
 # ---------------------------------------------------------------- 收尾
 
 def main():
     print("=" * 78)
-    print("SelfServiceWindow（上网数据面板）界面自检")
+    print("SelfServiceWindow（账号中心面板）界面自检")
     print("真的建窗口 / 不联网 / 不碰真实数据")
     print("=" * 78)
 
@@ -871,6 +1077,7 @@ def main():
             test_clear_history(root)
             test_chart_views(root)
             test_devices_layout(root)
+            test_center_cards(root)
         finally:
             root.destroy()
         test_off_main_thread()

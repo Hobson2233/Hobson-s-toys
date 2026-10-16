@@ -47,12 +47,12 @@ from urllib.parse import urlparse, parse_qs, urlencode
 #    但**打包时必须让 PyInstaller 看见它** —— 藏在函数里的 import 容易被漏掉。
 import updater
 
-# 「上网数据」功能（郑航自助服务）的取数层。**和 updater 同理**：
+# 「账号中心」功能（郑航自助服务）的取数层。**和 updater 同理**：
 # 顶层 import，打包时必须让 PyInstaller 看见它 —— 藏在函数里的 import 容易被漏掉。
 # 它只 import 标准库（base64/datetime/hashlib/http.cookiejar/json/urllib），不引入新依赖。
 import self_service
 
-# 「上网数据」的**本地流量历史**（存本机，下次不登录也能看）。
+# 「账号中心」的**本地流量历史**（存本机，下次不登录也能看）。
 # ⚠️ 它和 self_service 是**故意分开**的两个模块：self_service 有一条被测试钉死的
 #    性质 —— **它不碰磁盘**（不 import os / pathlib、没有 open）。那条性质保护的是
 #    「取数层不会把响应偷偷落盘」，而响应里带身份证号和明文密码。
@@ -372,7 +372,7 @@ LEGACY_DIR = r"C:\tools"          # 最老的 PowerShell 版部署位置，首�
 PRIVATE_FILES = ("config.json", "accounts.json", "last-result.json",
                  "campus-login.log", "selftest.txt", "guitest.txt")
 
-# 「上网数据」的本地流量历史。
+# 「账号中心」的本地流量历史。
 #
 # 🔴 **故意不放进 `PRIVATE_FILES`** —— 也就是说「清除本机保存的账号密码」
 #    **不会**删它。理由：用户要的就是「以后不登录也能看过去的流量」
@@ -5588,7 +5588,7 @@ def show_text_window(title, text, width=780, height=640):
 
 
 # ---------------------------------------------------------------------------
-# 「上网数据」面板（郑航自助服务）
+# 「账号中心」面板（郑航自助服务）
 # ---------------------------------------------------------------------------
 
 # 🔴 登录请求的次数上限。密码连错可能被学校风控锁号，所以**必须**有这道闸门。
@@ -5643,11 +5643,17 @@ def self_service_available(cfg=None):
 
 
 class SelfServiceWindow(object):
-    """「上网数据」面板：状态 / 套餐 / 流量图表 / 在线设备。
+    """「账号中心」面板：状态 / 停机 / 套餐 / 流量图表 / 上网详单 / 在线设备。
 
     🔴 **离线优先**（2026-10-12 用户提的改法）。打开面板**不联网、不要验证码**，
     先把本机攒下来的历史画出来；只有点「同步数据」才会取验证码 → 登录 → 拉数 →
     合并写盘 → 重画。理由：验证码得人肉读，每次想看历史都要读一遍码太蠢了。
+
+    ⚠️ 2026-10-16 扩成「账号中心」：同步时多带回 A 档三样（上网详单 /
+    停机状态 / 套餐概览，见 `self_service.account_center`）。**这三样没有本机
+    缓存** —— 没同步过就看不到，因为它们每次都在变、而且体积大。
+    面板因此从三块变成四块（账号 / 图表 / 详单 / 设备），
+    其中「停机状态」并进账号卡（它就是一个状态字段，不值得单独一张卡）。
 
     🔴 三条硬要求（从上一版继承）：
 
@@ -5659,9 +5665,8 @@ class SelfServiceWindow(object):
       3. 🔴 **cookie 只在内存**（`self_service.py` 里就是这么写的）——
          窗口一关会话就结束。这是**故意**的：会话 cookie 等价于一次登录态。
 
-    ⚠️ 和上一版的一处**行为变化**：`_draw_data` 以前是「把整屏换成数据」，
-       现在数据只是面板的一部分 —— 面板是「账号卡 + 图表卡 + 设备卡」三块，
-       没有数据时（没同步过）只画图表卡（可能有本地历史）。
+    ⚠️ 一处**行为变化**：`_draw_data` 以前是「把整屏换成数据」，现在数据只是
+       面板的一部分 —— 没有数据时（没同步过）只画图表卡（可能有本地历史）。
     """
 
     def __init__(self, root, tk, fam, base, account, password, base_url):
@@ -5703,7 +5708,7 @@ class SelfServiceWindow(object):
         self.note = ""
 
         self.win = tk.Toplevel(root)
-        self.win.title("上网数据 · %s · %s" % (account, APP_TITLE))
+        self.win.title("账号中心 · %s · %s" % (account, APP_TITLE))
         # 窗口底色 = **页面底色**（不是卡片底色）—— 正文是圆角卡片，
         # 同色的话圆角就看不出来了。和 show_help 同一个理由。
         self.win.configure(bg=BG)
@@ -5720,7 +5725,7 @@ class SelfServiceWindow(object):
         # --- 顶部：标题 + 账号 + 「同步数据」 ---
         self.head = tk.Frame(self.win, bg=BG)
         self.head.pack(fill="x", padx=OUTER_PAD, pady=(OUTER_PAD, 6))
-        tk.Label(self.head, text="上网数据", bg=BG, fg=FG,
+        tk.Label(self.head, text="账号中心", bg=BG, fg=FG,
                  font=(fam, base + 4, "bold")).pack(side="left")
         # 🔴 账号**必须显示出来**：这个面板看的是「界面上那个账号」的数据，
         #    而本机历史是按账号存的 —— 不写清楚是哪个账号，用户会以为看的是
@@ -5831,7 +5836,7 @@ class SelfServiceWindow(object):
             self.win.geometry("%dx%d" % (PANEL_W, h))
             self._on_holder()
         except Exception:
-            log("上网数据面板定尺寸失败:\n%s" % traceback.format_exc())
+            log("账号中心面板定尺寸失败:\n%s" % traceback.format_exc())
 
     def _place(self):
         """把窗口摆在主窗口附近偏中间的位置。"""
@@ -5851,7 +5856,7 @@ class SelfServiceWindow(object):
         except Exception:
             # 定位失败不是致命问题（窗口会用系统默认位置），但要留痕 ——
             # 万一定位算错把窗口甩到屏幕外，这条日志就是唯一线索。
-            log("上网数据面板定位失败:\n%s" % traceback.format_exc())
+            log("账号中心面板定位失败:\n%s" % traceback.format_exc())
 
     def close(self):
         """关窗。置 `closed` 之后子线程再往队列里放东西也没人处理了。
@@ -5865,7 +5870,7 @@ class SelfServiceWindow(object):
         try:
             self.win.destroy()
         except Exception:
-            log("关闭上网数据面板异常:\n%s" % traceback.format_exc())
+            log("关闭账号中心面板异常:\n%s" % traceback.format_exc())
 
     # ------------------------------------------------------------ 线程 / 队列
 
@@ -5882,7 +5887,7 @@ class SelfServiceWindow(object):
             try:
                 fn()
             except Exception as e:
-                log("上网数据面板后台任务异常:\n%s" % traceback.format_exc())
+                log("账号中心面板后台任务异常:\n%s" % traceback.format_exc())
                 self._put("fail", "内部错误（已记日志）：%s: %s"
                           % (type(e).__name__, e))
 
@@ -5901,7 +5906,7 @@ class SelfServiceWindow(object):
                     self._handle(kind, payload)
                 except Exception:
                     # 单条消息处理失败不能中断整批，也不能让窗口卡在"忙碌"
-                    log("上网数据面板处理消息异常:\n%s" % traceback.format_exc())
+                    log("账号中心面板处理消息异常:\n%s" % traceback.format_exc())
         except queue.Empty:
             pass
         if not self.closed:
@@ -5954,7 +5959,12 @@ class SelfServiceWindow(object):
         try:
             # ⚠️ `today=` 显式传进去：让「今天算哪一天」和写盘用的是同一个日期，
             #    也免得 `parse_days` 去读时钟（那样测试就不是确定性的了）。
-            self._put("data", self.svc.load(self.account, today=self._today()))
+            #
+            # 🔴 用 `full()` 而不是 `load()`（2026-10-16）：多带回 A 档的
+            #    上网详单 / 停机状态 / 套餐概览。`full()` 内部**对 A 档容错** ——
+            #    详单接口抽风时主数据照常返回，原因落在 `center_error` 里
+            #    （界面会显式写出来，不会假装「这个账号没有上网记录」）。
+            self._put("data", self.svc.full(self.account, today=self._today()))
         except self_service.SelfError as e:
             if e.kind == "session":
                 # 会话在取数途中过期了 —— 退回验证码流程，不算失败
@@ -6023,7 +6033,7 @@ class SelfServiceWindow(object):
         """只读本地历史（**不联网**）。"""
         self.store, self.store_why = self_history.load(SELF_FLOW_FILE)
         if self.store_why:
-            log("上网数据面板：%s" % self.store_why)
+            log("账号中心面板：%s" % self.store_why)
 
     def clear_history(self):
         """清掉**当前账号**的本机历史（只删这个账号，不动别人的）。"""
@@ -6054,7 +6064,7 @@ class SelfServiceWindow(object):
             from tkinter import messagebox
             return bool(messagebox.askyesno(APP_TITLE, msg, parent=self.win))
         except Exception:
-            log("上网数据面板确认框失败:\n%s" % traceback.format_exc())
+            log("账号中心面板确认框失败:\n%s" % traceback.format_exc())
             return False
 
     # ------------------------------------------------------------ 渲染
@@ -6110,7 +6120,7 @@ class SelfServiceWindow(object):
         try:
             self.btn_sync.configure(state="disabled" if self.syncing else "normal")
         except Exception:
-            log("上网数据面板按钮状态失败:\n%s" % traceback.format_exc())
+            log("账号中心面板按钮状态失败:\n%s" % traceback.format_exc())
 
     def _render(self):
         """按当前状态把整个面板重画一遍。**所有界面改动只从主线程调这里。**"""
@@ -6121,6 +6131,9 @@ class SelfServiceWindow(object):
         if self.data is not None:
             self._card_account(self.data)
         self._card_flow()
+        # 详单排在图表后面：读的顺序是「概要 → 趋势 → 明细 → 当前」。
+        if self.data is not None:
+            self._card_bill(self.data)
         if self.data is not None:
             self._card_devices(self.data.get("devices") or [])
         self._foot_note()
@@ -6137,6 +6150,13 @@ class SelfServiceWindow(object):
                    "以后不登录也能看。" % self.account)
         if self.store_why:
             txt += "\n⚠️ %s" % self.store_why
+        # 🔴 A 档（详单/停机/套餐）没读到时要**显式**说，见 `self_service.full()`：
+        #    安静吞掉的话，用户会把「没读到」读成「这个账号没有上网记录」——
+        #    那是把错误说成事实，比直接报错更坏。
+        if self.data and self.data.get("center_error"):
+            txt += ("\n⚠️ 账号中心有几项没读到：%s。"
+                    "这几项这次是空的，不代表「没有」。"
+                    % self.data["center_error"])
         self.tk.Label(self.body, text=txt, bg=BG, fg=SUB, justify="left",
                       wraplength=CHART_W, font=(self.fam, self.base - 2)
                       ).pack(anchor="w", pady=(8, 0))
@@ -6151,6 +6171,30 @@ class SelfServiceWindow(object):
         f, t = d.get("flow") or {}, d.get("time") or {}
         inner = self._card("账号")
         self._row(inner, "账号状态", d.get("status") or "-")
+
+        # --- 停机 / 复机状态（A 档，2026-10-16 加）---
+        # ⚠️ `d["stop"]` 为 None 表示「这次没读到」（A 档容错路径），
+        #    **不是**「状态是正常」⇒ 这种情况**不画这一行**，
+        #    由页脚的 center_error 说明「没读到」。假装成正常是这里最糟的错。
+        st = d.get("stop")
+        if isinstance(st, dict):
+            state = st.get("state") or "未知"
+            # 语义色：正常=绿、停机中=红、复机中=黄、未知=灰。
+            # 🔴 用**查表**而不是 if/else 链：以后学校加了新的 pageType，
+            #    `parse_stop` 会给「未知」+ 保留原始值，这里自然落到灰色，
+            #    不会因为漏写一个分支而显示成正常。
+            color = {"正常": OK, "停机中": DANGER, "复机中": WARN}.get(state, SUB)
+            self._row(inner, "停机状态", state, fg=color, bold=True)
+            extra = []
+            if st.get("reason"):
+                extra.append("原因：%s" % st["reason"])
+            if st.get("date"):
+                extra.append("时间：%s" % st["date"])
+            if extra:
+                self.tk.Label(inner, text="　".join(extra), bg=CARD, fg=SUB,
+                              justify="left", wraplength=CHART_W - 20,
+                              font=(self.fam, self.base - 2)).pack(anchor="w")
+
         self._row(inner, "上网套餐", d.get("plan") or "-")
         self._row(inner, "套餐到期", d.get("expire") or "-")
         self._row(inner, "计费日", d.get("billing_day") or "-")
@@ -6158,6 +6202,18 @@ class SelfServiceWindow(object):
         # 和学校网页的显示条件一致，别在套餐制下显示一个恒为 0 的"余额"。
         if str(d.get("charge_type")) == "1":
             self._row(inner, "余额", "%.2f 元" % (d.get("balance") or 0.0))
+
+        # --- 套餐可用流量（A 档 `getpackageinformation.do`，2026-10-16 加）---
+        # 🔴 **只在 > 0 时显示**。这个字段实测是 `0`（因为融合套餐不限量），
+        #    而「可用流量 0」在界面上会被读成「一点流量都没了」—— 和事实相反。
+        #    限量套餐用完了确实也是 0，但那时上面「限额」那行会写具体额度，
+        #    用户能看出是「用完了」而不是「不限量」。
+        pk = d.get("package")
+        if isinstance(pk, dict):
+            avail = pk.get("available_flow") or 0
+            if float(avail) > 0:
+                self._row(inner, "套餐可用流量", self_service.fmt_flow(avail))
+
         lim = []
         if f.get("limit"):
             lim.append("流量 %s" % f["limit"])
@@ -6177,6 +6233,108 @@ class SelfServiceWindow(object):
                               self_service.fmt_hours(t.get("total") or 0)),
                       bg=CARD, fg=SUB, font=(self.fam, self.base - 2)
                       ).pack(anchor="w", pady=(6, 0))
+
+    # ------------------------------------------------------------ 详单卡
+
+    BILL_SHOW = 10        # 界面上最多列几条会话（服务端可能给几百条）
+
+    @staticmethod
+    def _mmdd(s):
+        """`2026-10-14 15:05:53` → `10-14 15:05`。
+
+        ⚠️ 用**切片**而不是 `strptime`：服务端给过 `"(null)"` 这种脏值
+           （见 `self_service._clean`），`strptime` 会当场抛异常把整个面板打挂。
+           切不出来就原样返回，难看但不会崩。
+        """
+        s = s or ""
+        return s[5:16] if len(s) >= 16 else s
+
+    def _card_bill(self, d):
+        """上网详单卡（A 档 `getbilldetail.do`，2026-10-16 加）。
+
+        🔴 **这里的「详单合计」和账号卡里的「学校记录：累计」不是同一个口径**
+           （红线 35）。实测：
+             · 详单合计 = 114180.32 + 501650.28 = **615.83 GB**（只统计生成了
+               记录的会话，区间 2026-04-17 ~ 2026-10-14）
+             · 账号卡那个「累计」= 690876 MB = **674.68 GB**（`getindexchart`
+               的 `cumulativeFlow`，含没生成详单的部分）
+           差 12%，**两个数都是对的**。所以这一卡必须写明「详单合计」，
+           而且把区间一起写出来 —— 不写清楚用户会以为我们算错了。
+        """
+        inner = self._card("上网详单")
+        b = d.get("bill")
+        if not isinstance(b, dict):
+            # A 档容错路径：这次没读到。**明说**，别说成「没有记录」。
+            self.tk.Label(inner, text="（这次没读到详单，见下方说明）",
+                          bg=CARD, fg=SUB,
+                          font=(self.fam, self.base)).pack(anchor="w")
+            return
+
+        ss = b.get("sessions") or []
+        s = b.get("summary") or {}
+        if not ss:
+            self.tk.Label(inner, text="（这个账号还没有上网记录）", bg=CARD,
+                          fg=SUB, font=(self.fam, self.base)).pack(anchor="w")
+            return
+
+        # 🔴 会话是**最新在前**（实测）：首条最新、末条最旧。
+        #    哪天学校改了排序，区间会反着写 —— 所以区间用 min/max 取，
+        #    不靠数组顺序。
+        starts = [x.get("start") or "" for x in ss]
+        span = "%s ~ %s" % (min(starts)[:10], max(starts)[:10])
+        self._row(inner, "区间", span)
+        # ⚠️ `total` 是**服务端说的**总数；`sessions` 是**我们真拉到的**。
+        #    被翻页上限截断时两者会不一样，所以两个都写出来。
+        tot, got = s.get("total"), len(ss)
+        self._row(inner, "会话数", "%d 次" % tot if tot else "%d 次" % got)
+        self._row(inner, "详单合计时长", self_service.fmt_duration(s.get("seconds")))
+        self._row(inner, "详单合计流量",
+                  self_service.fmt_flow((s.get("up") or 0) + (s.get("down") or 0)))
+        if (s.get("fee") or 0) > 0:
+            self._row(inner, "详单合计费用", "%.2f 元" % s["fee"])
+        # 🔴 红线 35：同屏出现两个**口径不同**的流量数（详单合计 601.40 GB /
+        #    账号卡的「学校记录：累计」674.68 GB），差 12%。**不解释就会被当成
+        #    算错** —— 所以把「为什么不一样」直接写在界面上，而不是只写在注释里。
+        self.tk.Label(inner,
+                      text="（口径：只统计生成了记录的会话。和账号卡里"
+                           "「学校记录：累计」不是同一个数 —— 两个都对。）",
+                      bg=CARD, fg=SUB, justify="left",
+                      wraplength=CHART_W - 20,
+                      font=(self.fam, self.base - 3)).pack(anchor="w", pady=(3, 0))
+        if tot and got and tot != got:
+            self.tk.Label(inner, text="⚠️ 服务端共 %d 次，只取回 %d 次"
+                          % (tot, got), bg=CARD, fg=WARN,
+                          font=(self.fam, self.base - 2)).pack(anchor="w", pady=(4, 0))
+
+        # --- 最近几条会话 ---
+        show = ss[:self.BILL_SHOW]
+        self.tk.Frame(inner, bg=LINE, height=1).pack(fill="x", pady=(8, 0))
+        for x in show:
+            top = self.tk.Frame(inner, bg=CARD)
+            top.pack(fill="x", pady=(7, 0))
+            self.tk.Label(top,
+                          text="%s → %s" % (self._mmdd(x.get("start")),
+                                            self._mmdd(x.get("end"))),
+                          bg=CARD, fg=FG,
+                          font=(self.fam, self.base)).pack(side="left")
+            self.tk.Label(top, text=self_service.fmt_duration(x.get("seconds")),
+                          bg=CARD, fg=SUB,
+                          font=(self.fam, self.base - 1)).pack(side="right")
+            # 🔴 上行/下行**分开放**，不合起来 —— 用户明确说过要看上下行。
+            #    `terminateCause` 放在末尾：它解释「这次为什么结束」，
+            #    实测取值是「空闲超时 / 用户主动下线 / 账号抢占 / 管理员重置」。
+            self.tk.Label(inner,
+                          text="↑ %s　↓ %s　%s"
+                               % (self_service.fmt_flow(x.get("up")),
+                                  self_service.fmt_flow(x.get("down")),
+                                  x.get("cause") or ""),
+                          bg=CARD, fg=SUB, justify="left",
+                          wraplength=CHART_W - 20,
+                          font=(self.fam, self.base - 2)).pack(anchor="w")
+        if len(ss) > len(show):
+            self.tk.Label(inner, text="（共 %d 次，这里只列最近 %d 次）"
+                          % (len(ss), len(show)), bg=CARD, fg=SUB,
+                          font=(self.fam, self.base - 3)).pack(anchor="w", pady=(8, 0))
 
     # ------------------------------------------------------------ 设备卡
 
@@ -6796,7 +6954,7 @@ class LoginApp:
             command=lambda: self.on_speed_probe())
         self.btn_probe.pack(side="right")
 
-        # 「上网数据」入口（2026-10-12 加，郑航自助服务）。
+        # 「账号中心」入口（2026-10-12 加，郑航自助服务）。
         #
         # 🔴 为什么不新开一张卡：和上面「测一下速度」**完全同一个理由** ——
         #    内容高度 827px、上限 906px，加一张卡（约 90px）就压线了。
@@ -6812,7 +6970,7 @@ class LoginApp:
         self.btn_self = None
         if self_service_available():
             self.btn_self = round_chip(
-                status_body, tk, "上网数据", (self.fam, self.SMALL), BLUE_DARK,
+                status_body, tk, "账号中心", (self.fam, self.SMALL), BLUE_DARK,
                 BLUE_SOFT, height=self.SMALL + 14, hover="#d3e0ff",
                 command=lambda: self.on_self_service())
             self.btn_self.pack(side="right", padx=(0, 6))
@@ -7647,7 +7805,7 @@ class LoginApp:
         return (0, "测速完成（到 %s 的下载速度）\n%s" % (host, speed_describe(info)))
 
     def on_self_service(self):
-        """点「上网数据」触发（郑航自助服务）。
+        """点「账号中心」触发（郑航自助服务）。
 
         🔴 用的是**界面上填的那份账号密码**（没填就退回已保存的那份）——
            自助服务要用同一份凭据去登录，不该再问用户要一遍。
@@ -7665,7 +7823,7 @@ class LoginApp:
         uid = (self.var_uid.get() or "").strip() or (cfg.get("userId") or "")
         pwd = self.pwd_field.get() or (cfg.get("passwd") or "")
         if not uid or not pwd:
-            self.show("「上网数据」要用账号密码登录学校自助服务。\n"
+            self.show("「账号中心」要用账号密码登录学校自助服务。\n"
                       "请先在上面把账号密码填好（或保存一个账号）再点。", "err")
             return
         base = (cfg.get("portalHost") or DEFAULTS["portalHost"]).rstrip("/")
@@ -7673,8 +7831,8 @@ class LoginApp:
             SelfServiceWindow(self.root, self.tk, self.fam, self.BASE,
                               uid, pwd, base)
         except Exception:
-            log("打开上网数据面板失败:\n%s" % traceback.format_exc())
-            self.show("打不开「上网数据」面板。", "err")
+            log("打开账号中心面板失败:\n%s" % traceback.format_exc())
+            self.show("打不开「账号中心」面板。", "err")
 
     def form(self):
         uid = self.var_uid.get().strip()

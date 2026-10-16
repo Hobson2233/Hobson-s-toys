@@ -43,7 +43,7 @@ import campus_login as C      # noqa: E402
 
 # 会被重定向的路径常量。和 campus_login 里的 5 个一一对应。
 _PATH_ATTRS = ("CONFIG_FILE", "ACCOUNTS_FILE", "LOG_FILE", "RESULT_FILE",
-               # 2026-10-12 加：上网数据的本地流量历史。
+               # 2026-10-12 加：账号中心的本地流量历史。
                # ⚠️ 它**必须**在这里 —— 否则探针/测试一同步就会把历史写到
                #    **真实**数据目录里去（沙箱盖不住这条路径），
                #    而 `sandbox()` 末尾那条自检正是为了防这种事。

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""郑航自助服务（/self/）取数层 —— 「上网数据」功能的数据来源。
+"""郑航自助服务（/self/）取数层 —— 「账号中心」功能的数据来源。
 
 背景：`http://202.196.169.166/self/` 是郑航的**用户自助管理**系统，而
 `202.196.169.166` **就是软件现在用的 portalHost**（认证走 `/webauth.do`）——
@@ -14,19 +14,26 @@
 
 🔴 四条不可破的规矩：
 
-  1. **只读。** 本模块只调 `tologin.do` / `login.do` / `getindexinfo.do` /
-     `getindexchart.do` / `getonline.do`。
+  1. **只读。** 本模块只调这几个：
+     `tologin.do` / `login.do` / `getindexinfo.do` / `getindexchart.do` /
+     `getonline.do` / `getbilldetail.do`（上网详单） /
+     `getshutdownformation.do`（停机状态） / `getpackageinformation.do`（套餐概览）。
      **绝不加** `kickonline.do`（踢设备下线）/ `clearusermac.do`（解绑 MAC）/
-     缴费 / 改密码 —— 要加必须是单独评审过的改动。
+     缴费 / 改密码 / `getcode.do`（发短信）—— 要加必须是单独评审过的改动。
      ⚠️ 配套措施：`online()` **故意不保留** `billingId` / `serverIp`
      （那两个正是 kick 需要的参数）⇒ **结构上就凑不出踢人的请求**。
 
   2. 🔴 **构造式输出，不是过滤式。** 接口返回里**真的带**身份证号、手机号、
-     真实姓名、以及一个明文密码（实测确认，见 `baseMessageVo` / `authMessageVo`）。
+     真实姓名、以及**两个**接口会返回**明文密码**（实测确认：
+     `getbaseinfo.do` 的 `authMessageVo.operatorPwd`、
+     `getoperatorsinformation.do` 的 `operatorPwd`）。
      所以本模块的每个返回值都是**逐个字段手写拼出来的**，
      **不是「把响应拷过来再删几个键」** —— 后者一旦学校加字段就会漏。
-     ⚠️ 配套措施：`getbaseinfo.do` / `getuserinformation.do` **根本不调**
-     （那才是身份证号/密码的出处）。
+     ⚠️ 配套措施：`getbaseinfo.do` / `getuserinformation.do` /
+     `getoperatorsinformation.do` **根本不调**（那才是身份证号/密码的出处）；
+     `getpackageinformation.do` 虽然调了，但 `parse_package()` **明确丢掉**
+     `accountName`（真实姓名）。
+     ⇒ 白名单必须**逐个接口**列，**不能只防一个**。
 
   3. 🔴 **不落盘、不写日志。** cookie 用内存 `CookieJar`（不是 `LWPCookieJar`）；
      任何响应内容都不进 log、不写缓存文件。
@@ -67,6 +74,19 @@ EP_LOGIN = "login.do"
 EP_INDEX = "getindexinfo.do"
 EP_CHART = "getindexchart.do"
 EP_ONLINE = "getonline.do"
+
+# ---- A 档（2026-10-15 实测，见 `郑航自助服务-接口清单.md` §3A）----
+# 全部 `get*` 只读。参数从 `app.js` 逆出、返回全部真实测过。
+EP_BILL = "getbilldetail.do"          # ⭐ 上网详单（会话级）
+EP_STOP = "getshutdownformation.do"   # 停机 / 复机状态
+EP_PACKAGE = "getpackageinformation.do"  # 套餐概览
+
+# 🔴 服务端**不限制** `pageSize`：实测 `pageSize=200` 直接返回 200 条
+#    （前端只给 5/10 两档，但接口本身接受更大的值）。
+BILL_PAGE_SIZE = 200
+# 兜底：最多翻这么多页。防的是「服务端 total 变了 / 一直返回满页」导致死循环 ——
+# 200 × 10 = 2000 条，半年 227 条远远用不到。
+BILL_MAX_PAGES = 10
 
 # 登录失败时，errmsg 里出现这些词 = 验证码的问题（可以换一张重试）；
 # 否则**一律当作「不要再重试」**（可能是密码错 / 账号不存在 / 被锁）。
@@ -171,6 +191,28 @@ def fmt_hours(h):
     用户会拿我们的界面和学校网页对照，我们自己改了反而像我们算错。
     """
     return "%.2f 小时" % _num(h)
+
+
+def fmt_duration(sec):
+    """时长（**秒**）→ 给人看的字符串。**和 `fmt_hours` 不是一回事，别混用。**
+
+    🔴 为什么另开一个：`getindexchart.do` 的时长单位是**小时**，
+       而 `getbilldetail.do`（上网详单）的 `chargingDuration` 单位是**秒**
+       （实测 43208 == `endDate − startDate`，**分毫不差**）。
+       两个接口单位不同，拿错就会差 3600 倍 —— 而那种错**不会报错**，
+       只会让界面上的数字离谱。
+
+    输出规则：< 60 秒 → 「N 秒」；< 1 小时 → 「N 分 N 秒」；否则「N 小时 N 分」。
+    """
+    s = int(_num(sec))
+    if s < 0:
+        s = 0
+    if s < 60:
+        return "%d 秒" % s
+    if s < 3600:
+        return "%d 分 %d 秒" % (s // 60, s % 60)
+    h, m = divmod(s // 60, 60)
+    return "%d 小时 %d 分" % (h, m)
 
 
 def _looks_like_captcha(msg):
@@ -315,9 +357,130 @@ def parse_days(chart, today=None):
     }
 
 
+# ---------------------------------------------------------------- A 档解析
+#
+# 下面几个也是**纯函数**（不联网）。分开写的理由和 `parse_days` 一样：
+# 它们处理的全是「服务端返回长什么样」这类**容易错又不好复现**的问题。
+
+def _clean(v):
+    """把服务端那些「等于没有值」的写法统一成空串。
+
+    实测见过：JSON `null` / `""` / **字符串** `"(null)"`（学校真的这么发）。
+    ⚠️ 但 `"Unknown"` **不**归零 —— 那是学校真的写了「未知」，是信息不是缺失。
+    """
+    if v is None:
+        return ""
+    s = str(v).strip()
+    if s in ("", "(null)", "null", "NULL"):
+        return ""
+    return s
+
+
+def parse_bill(rows, data=None, total=None):
+    """把 `getbilldetail.do`（上网详单）解析成**会话列表 + 汇总**。**纯函数。**
+
+    返回 `(sessions, summary)`：
+
+      · `sessions` —— 每次上网一条：
+        `{"start", "end", "seconds", "up", "down", "fee", "cause",
+          "device", "os", "mac", "ip"}`
+      · `summary` —— `{"total", "fetched", "up", "down", "fee", "seconds"}`
+
+    🔴 **构造式输出**（模块规矩 2）：每个字段手写拼出来，**不是**把响应拷过来再删键。
+    丢弃的字段：`id`（页内序号，不是主键）、`accountId`、`serverIp`、`nasId`、
+    `vlanId`、`broswerType`、`areaName`、`internetTacticsName`（后两个对本账号是常量，
+    概览里已经有了，放在 227 行的列表里纯属噪音）。
+
+    ⚠️ 保留 `mac` / `ip` 是**有意的**：界面上要能区分「哪台设备」，
+       而 `online()`（当前在线设备）也是这么做的，两处保持一致。
+       `ip` 每次上网都会变，本来只是辅助。
+
+    🔴 单位（实测确认，**两个接口不一样，别混**）：
+       · `chargingDuration` = **秒**（实测 43208 == `endDate − startDate`）
+       · `uploadFlows` / `downloadFlows` = **MB**
+       · `fee` = 元
+    """
+    sessions = []
+    if isinstance(rows, list):
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            sessions.append({
+                "start": _clean(r.get("startDate")),
+                "end": _clean(r.get("endDate")),
+                "seconds": int(_num(r.get("chargingDuration"))),
+                "up": _num(r.get("uploadFlows")),
+                "down": _num(r.get("downloadFlows")),
+                "fee": _num(r.get("fee")),
+                "cause": _clean(r.get("terminateCause")),
+                "device": _clean(r.get("terminalType")),
+                "os": _clean(r.get("osInfo")),
+                "mac": _clean(r.get("accountMac")),
+                "ip": _clean(r.get("accountIp")),
+            })
+
+    d = data if isinstance(data, dict) else {}
+    # ⚠️ `total` 是**服务端说的总数**，`fetched` 是**我们真拉到的**。
+    #    翻页被 `max_pages` 截断时两者会不一样 —— 这种时候必须让调用方看得出来，
+    #    而不是默默少给几条。所以两个都留着，别合并。
+    try:
+        tot = int(total)
+    except (TypeError, ValueError):
+        tot = None
+    summary = {
+        "total": tot,
+        "fetched": len(sessions),
+        # 汇总来自服务端 `data`（是**全量**口径，不是当前这一页）
+        "up": _num(d.get("allUpFlows")),
+        "down": _num(d.get("allDownFlows")),
+        "fee": _num(d.get("allFees")),
+        # onlineHour / onlineMin 是**两个字段拼一个时长**，换算成秒好统一处理
+        "seconds": int(_num(d.get("onlineHour")) * 3600
+                       + _num(d.get("onlineMin")) * 60),
+    }
+    return sessions, summary
+
+
+# `pageType` 的含义从 `app.js` 逆出（前端 `if("1"==pageType)` / `if("2"==pageType)`）。
+# ⚠️ 实测本账号是 `"0"`。**没见过的值不要猜** —— 见 `parse_stop`。
+_STOP_STATES = {"0": "正常", "1": "停机中", "2": "复机中"}
+
+
+def parse_stop(data):
+    """把 `getshutdownformation.do` 解析成停机状态。**纯函数。**
+
+    ⚠️ `pageType` 遇到**没见过的值**时：`state` 给「未知」，但把原始值留在
+    `page_type` 里。**不要**往「正常」上兜底 —— 那会把「停机了」显示成「正常」，
+    是这类功能里最糟的一种错。
+    """
+    d = data if isinstance(data, dict) else {}
+    pt = _clean(d.get("pageType"))
+    return {
+        "page_type": pt,
+        "state": _STOP_STATES.get(pt, "未知"),
+        "reason": _clean(d.get("shutdownReason")),
+        "oper": _clean(d.get("stopOper")),
+        "date": _clean(d.get("stopDate")),
+    }
+
+
+def parse_package(data):
+    """把 `getpackageinformation.do` 解析成套餐概览。**纯函数。**
+
+    🔴 **故意丢掉 `accountName`** —— 这个接口带**真实姓名**，而我们不需要。
+       （模块规矩 2：白名单要**逐个接口**列，不能只防 `getbaseinfo.do` 一个。）
+    """
+    d = data if isinstance(data, dict) else {}
+    return {
+        "state": _clean(d.get("accountState")),
+        # chargeNumber = 可用流量（实测本账号 0，因为套餐不限量）
+        "available_flow": _num(d.get("chargeNumber")),
+        "balance": _num(d.get("remainMoney")),
+    }
+
+
 class SelfService(object):
     """一个会话（内存里的 cookie + 几个只读请求）。**不碰磁盘。**"""
-
     def __init__(self, base=DEFAULT_BASE, timeout=TIMEOUT):
         self.base = (base or DEFAULT_BASE).rstrip("/")
         self.timeout = timeout
@@ -487,6 +650,94 @@ class SelfService(object):
                 "nas": r.get("nasId") or "",
                 "kind": r.get("terminalType") or "",
             })
+        return out
+
+    # ------------------------------------------------------------ A 档取数
+
+    def bill(self, account, start=None, end=None, page_size=BILL_PAGE_SIZE,
+             max_pages=BILL_MAX_PAGES):
+        """⭐ **上网详单（会话级）**。**只调 `getbilldetail.do`。**
+
+        `start` / `end` 是 `"YYYY-MM-DD"`（可 `None` = 不限日期）。
+        返回 `{"sessions": [...], "summary": {...}}`，字段含义见 `parse_bill()`。
+
+        🔴 **翻页有兜底**：最多 `max_pages` 页。
+           实测服务端**不限制** `pageSize`，所以正常情况 1~2 次请求就拉完了
+           （半年 227 条 → 200 + 27）。
+           ⚠️ **别去掉 `max_pages`** —— 万一服务端一直返回满页，
+              没有它这里就是个死循环（而且它不会报错，只会一直转）。
+        """
+        sessions, summary = [], {}
+        for page in range(1, max(1, int(max_pages)) + 1):
+            payload = {"accountId": account,
+                       "page": {"pageSize": page_size, "currentPage": page}}
+            # ⚠️ 空日期**不要发**（前端也是把空字段删掉再发的）。
+            #    发 `""` 和不发**不等价** —— 实测只发一个 `{"accountId", "page"}` 就通。
+            if start:
+                payload["startTime"] = start
+            if end:
+                payload["endTime"] = end
+            j = self._post(EP_BILL, payload)
+            rows = j.get("rows")
+            rows = rows if isinstance(rows, list) else []
+            part, summary = parse_bill(rows, j.get("data"), j.get("total"))
+            sessions.extend(part)
+            if len(rows) < page_size:
+                break
+        # `fetched` 以**真拉到的**为准（`parse_bill` 里那一份只看了最后一页）
+        summary["fetched"] = len(sessions)
+        return {"sessions": sessions, "summary": summary}
+
+    def stop_state(self, account):
+        """**停机 / 复机状态**。**只调 `getshutdownformation.do`。**"""
+        return parse_stop(self._post(EP_STOP, {"accountId": account}).get("data"))
+
+    def package(self, account):
+        """**套餐概览**（可用流量 / 余额 / 状态）。**只调 `getpackageinformation.do`。**"""
+        return parse_package(self._post(EP_PACKAGE, {"accountId": account}).get("data"))
+
+    def account_center(self, account, start=None, end=None, tolerant=False):
+        """账号中心一次拿全：**上网详单 + 停机状态 + 套餐概览**。
+
+        `tolerant=False`（默认）：任一失败就整个抛 `SelfError`（不吞错）。
+        `tolerant=True`：三部分**各自 try** —— 成功的留下，失败的给 `None`，
+            原因收在 `errors` 里（字符串列表）。
+            ⇒ 界面要「一个挂了其它照常显示」时走这条。`full()` 就是这么用的。
+        """
+        out, errs = {}, []
+        for key, call in (("bill", lambda: self.bill(account, start, end)),
+                          ("stop", lambda: self.stop_state(account)),
+                          ("package", lambda: self.package(account))):
+            try:
+                out[key] = call()
+            except SelfError as e:
+                if not tolerant:
+                    raise
+                out[key] = None
+                errs.append(e.msg or key)
+        if tolerant:
+            out["errors"] = errs
+        return out
+
+    def full(self, account, today=None, start=None, end=None):
+        """**界面用的一次拿全**：`load()`（状态 / 套餐 / 流量 / 设备）
+        **加上** A 档（上网详单 / 停机状态 / 套餐概览）。
+
+        🔴 **A 档失败不拖垮主数据**（这是故意的，和 `account_center()` 默认的
+           「任一失败就抛」相反）。理由：主数据是用户每次同步都要的，
+           A 档是附加的、而且是学校那边最容易变的几个接口。让「详单接口抽风」
+           把整次同步变成失败，等于用一个附加功能废掉主功能。
+
+        ⚠️ 但**绝不能安静吞掉**：失败原因放在 `center_error` 里（空串 = 全好）。
+           界面必须**显式**说「详单没读到」—— 否则用户会以为
+           「这个账号没有上网记录」，那是把「没读到」说成「没有」，
+           比直接报错更坏。
+        """
+        out = self.load(account, today=today)
+        center = self.account_center(account, start, end, tolerant=True)
+        errs = center.pop("errors")
+        out.update(center)
+        out["center_error"] = "；".join(errs)
         return out
 
     def load(self, account, today=None):
