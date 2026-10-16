@@ -1442,6 +1442,101 @@ def test_actions(root):
         w.close()
 
 
+# ---------------------------------------------------------------- C 档链接
+
+def test_links_card(root):
+    """⑱ C 档：去学校网页办（只放链接）+ 官方文件。"""
+    print("\n⑱ C 档：跳转链接 + 官方文件")
+    reset_fake()
+    reset_history()
+    FakeSvc.script = {"has_session": "yes", "login": "ok"}
+    w = open_panel(root)
+    pump(root, 0.4)
+    real_open = C.open_in_browser
+
+    def chips_now():
+        return [c for c in all_widgets(w.win)
+                if getattr(c, "_rb_text", None) == "打开"]
+
+    try:
+        # ① **没同步过也有这张卡**（它只是几个网址，不需要会话）
+        t0 = texts_of(w.win)
+        check_true("没同步过也有「去学校网页办」卡", "去学校网页办" in t0, "")
+
+        # ② 五个 C 档入口 + 两个官方文件都在
+        for label in ("账号充值 / 在线支付", "卡充值", "转账",
+                      "办理套餐", "变更套餐"):
+            check_true("有「%s」入口" % label, label in t0, "")
+        check_true("有官方文件小标题",
+                   any("官方文件" in x for x in t0), "")
+        check_true("有账号安全通知",
+                   any("账号安全管理" in x for x in t0), "")
+        check_true("说清了「涉及付款，本软件不代办」",
+                   any("本软件不代办" in x for x in t0), "")
+        check_true("说清了「浏览器里要再登录一次」",
+                   any("再登录一次" in x for x in t0), "")
+
+        # ③ 每个「打开」都真的能点，且网址是 **hash 路由**
+        #
+        # ⚠️ 按**行结构**找片（左边 Label 的文字 == 那一行的说明），
+        #    **不能**靠 `all_widgets()` 的顺序 —— 实测那个顺序不是创建顺序，
+        #    照着下标点会点到别的行上去（第一版就点错了，7 次里有 5 次
+        #    点的是同一行）。这和 `row_value` 靠「恰好两个子控件」定位是同一个思路。
+        def chip_for(label):
+            for f in all_widgets(w.win):
+                try:
+                    kids = f.winfo_children()
+                except Exception:
+                    continue
+                if len(kids) != 2:
+                    continue
+                try:
+                    if str(kids[0].cget("text")) != label:
+                        continue
+                except Exception:
+                    continue
+                if getattr(kids[1], "_rb_text", None) == "打开":
+                    return kids[1]
+            return None
+
+        check("「打开」按钮 7 个（5 个 C 档 + 2 个官方文件）",
+              len(chips_now()), 7)
+
+        B = "http://202.196.169.246"
+        want = [
+            ("账号充值 / 在线支付", B + "/self/index.html#/payfees"),
+            ("卡充值", B + "/self/index.html#/cardpay"),
+            ("转账", B + "/self/index.html#/chargetransfer"),
+            ("办理套餐", B + "/self/index.html#/subscribeOrder"),
+            ("变更套餐", B + "/self/index.html#/changeorder"),
+            ("《关于加强校园网账号安全管理的通知》（PDF）",
+             B + "/uploadpic/notice/20260513.pdf"),
+            ("《暑假自助暂停通知》（DOCX）",
+             B + "/uploadpic/notice/20260703.docx"),
+        ]
+        opened = []
+        C.open_in_browser = lambda u: (opened.append(u), True)[1]
+        for label, url in want:
+            chip_for(label).invoke()
+            pump(root, 0.25)
+            check("「%s」打开的网址" % label, opened[-1], url)
+        check("🔴 所有链接都指向学校自己的服务器（没有第三方域名）",
+              sorted({u.split("/")[2] for u in opened}), ["202.196.169.246"])
+
+        # ④ 🔴 打开失败必须**把网址显示出来**（静默失败 = 用户以为按钮坏了）
+        C.open_in_browser = lambda u: False
+        w.note = ""
+        chip_for("《暑假自助暂停通知》（DOCX）").invoke()
+        pump(root, 0.4)
+        check_true("🔴 打不开浏览器时把网址写出来了",
+                   "没打开浏览器" in w.note and "uploadpic" in w.note, w.note)
+        check_true("网址也画到界面上了",
+                   any("uploadpic" in x for x in texts_of(w.win)), "")
+    finally:
+        C.open_in_browser = real_open
+        w.close()
+
+
 # ---------------------------------------------------------------- 收尾
 
 def main():
@@ -1482,6 +1577,7 @@ def main():
             test_center_cards(root)
             test_center_cards2(root)
             test_actions(root)
+            test_links_card(root)
         finally:
             root.destroy()
         test_off_main_thread()

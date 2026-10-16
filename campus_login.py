@@ -4984,6 +4984,17 @@ def round_chip(parent, tk, text, font, fg, soft, page=CARD, pad_x=9,
         cv.bind("<Enter>", lambda e: (st.update(hovering=True), redraw()))
         cv.bind("<Leave>", lambda e: (st.update(hovering=False), redraw()))
 
+        def invoke():
+            """按一下。**和 `round_button.invoke()` 对称** —— 测试脚本两种控件
+            都能用同一种方式「点」，不用去记「这个要用 event_generate、
+            那个要用 invoke」。2026-10-16 加：C 档的「打开」是圆角片，
+            而 `event_generate` 在没映射的控件上不一定触发，容易写出
+            「看着点了其实没点」的测试。
+            """
+            _click()
+
+        cv.invoke = invoke
+
     def configure(**kw):
         state = kw.pop("state", None)
         if state is not None:
@@ -6379,6 +6390,9 @@ class SelfServiceWindow(object):
             self._card_profile(self.data)
             self._card_fee(self.data)
             self._card_buspkg(self.data)
+        # C 档 + 官方文件：**不需要会话**，所以放在 `if self.data` 外面 ——
+        # 没同步过也能用（那几张只读卡没数据时是空的，但这张一直有用）。
+        self._card_links()
         self._foot_note()
         self._autosize()
 
@@ -6907,6 +6921,81 @@ class SelfServiceWindow(object):
             if right:
                 self.tk.Label(f, text="　".join(right), bg=CARD, fg=SUB,
                               font=(self.fam, self.base - 1)).pack(side="right")
+
+    # ------------------------------------------------------------ 去学校网页办
+
+    # C 档：涉及**钱 / 第三方**的，**只放跳转链接**（红线 9：别替别人处理钱，
+    # 也别依赖第三方服务器 —— 让学校自己的页面去办，我们只负责「一键打开」）。
+    #
+    # ⚠️ 路由是 **hash 模式**（`app.js` 里写的是 `mode:"hash"`），所以页面地址形如
+    #    `<base>/self/index.html#/<route>`。
+    # ⚠️ 下面这些 route 名是**从 app.js 的路由表里抄出来的**，不是猜的
+    #    （`path:"/payfees",name:"PayFees"` 这一串）。
+    SELF_LINKS = (
+        ("账号充值 / 在线支付", "payfees"),
+        ("卡充值", "cardpay"),
+        ("转账", "chargetransfer"),
+        ("办理套餐", "subscribeOrder"),
+        ("变更套餐", "changeorder"),
+    )
+    # 官方文件。⚠️ 这两个是**实测活着**的（2026-10-16 取到 206 + 正确的
+    #    Content-Type）。同批的第三个（`uploadpic/zznet.pdf`《校园网使用手册》）
+    #    这次已经是 **404** —— 说明这几个地址**会变**，发版前要重新核一遍。
+    SELF_DOCS = (
+        ("《关于加强校园网账号安全管理的通知》（PDF）",
+         "/uploadpic/notice/20260513.pdf"),
+        ("《暑假自助暂停通知》（DOCX）",
+         "/uploadpic/notice/20260703.docx"),
+    )
+
+    def _open_url(self, url):
+        """用系统浏览器打开。🔴 **打不开就把网址显示出来**，别静默失败。
+
+        静默失败的后果：用户点了「打开」什么也没发生，只会以为按钮坏了 ——
+        而正确做法（复制网址自己打开）他根本想不到。
+        """
+        if open_in_browser(url):
+            self.note = "已在浏览器里打开（那个页面要再登录一次）。"
+        else:
+            self.note = "没打开浏览器。网址：%s" % url
+        self._render()
+
+    def _link_row(self, parent, label, url):
+        """一行「左边说明 + 右边『打开』」。"""
+        f = self.tk.Frame(parent, bg=CARD)
+        f.pack(fill="x", pady=2)
+        self.tk.Label(f, text=label, bg=CARD, fg=FG, justify="left",
+                      wraplength=CHART_W - 96,
+                      font=(self.fam, self.base - 1)).pack(side="left")
+        h = self.base * 2 + 6
+        round_chip(f, self.tk, "打开", (self.fam, self.base - 2), BLUE_DARK,
+                   BLUE_SOFT, page=CARD, height=h, pad_x=13,
+                   command=(lambda u=url: self._open_url(u))).pack(side="right")
+
+    def _card_links(self):
+        """「去学校网页办」卡（C 档 + 官方文件）。
+
+        🔴 **只放链接，不代办**。理由（红线 9）：充值 / 支付会走到**公网第三方**
+           （`ht.huarantech.com.cn:20080`），套餐办理涉及资费 —— 钱这件事让学校
+           自己的页面去处理，我们只负责「一键打开那个页面」。
+
+        ⚠️ 这张卡**不需要会话**（就是几个网址），所以**没同步过也画** ——
+           这样面板在「离线优先」的默认状态下也有用，不只是个空壳。
+        """
+        inner = self._card("去学校网页办")
+        self.tk.Label(inner,
+                      text="这几件事涉及付款，本软件不代办 —— 点开的是学校自己的"
+                           "网页。\n（浏览器里要再登录一次；登录后如果没直接跳到"
+                           "那一页，在左边菜单里找一下。）",
+                      bg=CARD, fg=SUB, justify="left",
+                      wraplength=CHART_W - 20,
+                      font=(self.fam, self.base - 2)).pack(anchor="w")
+        for label, route in self.SELF_LINKS:
+            self._link_row(inner, label, "%s/self/index.html#/%s"
+                           % (self.svc.base, route))
+        self._sub(inner, "官方文件（学校自己的服务器上）")
+        for label, path in self.SELF_DOCS:
+            self._link_row(inner, label, "%s%s" % (self.svc.base, path))
 
     # ------------------------------------------------------------ 图表卡
 
