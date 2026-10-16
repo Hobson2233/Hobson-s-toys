@@ -8227,19 +8227,60 @@ def exit_now(code):
     os._exit(code)
 
 
+def _fix_std_streams():
+    """把 stdout/stderr 收拾成「print 任何东西都不会抛异常」的状态。
+
+    要兜住三种形态（2026-10-16 补全，起因见下）：
+
+      1. **None** —— `--windowed` 打包且没有重定向（双击运行就是这样）。
+         `print` 会 `AttributeError: 'NoneType' has no attribute 'write'`。
+         ⇒ 接一个 devnull。
+      2. **被重定向的文本流**（文件 / NUL / 管道）—— 此时 `sys.stdout` 不是 None，
+         编码是 **locale**（中文 Windows 上是 cp936）。输出里只要有它表示不了的
+         字符（`⚠️`、`✅` 这类），`print` 就抛 `UnicodeEncodeError`。
+         ⇒ 只把 errors 策略改成 `replace`。
+      3. **正常终端** —— 也统一改 errors，代价只是「个别字符显示成 ?」。
+
+    🔴 **为什么必须修，而不是「反正用户看不到就算了」**：
+       `--windowed` 的 exe 遇到未捕获异常会弹一个**等人点 Close** 的错误框。
+       调用方是脚本时（`build.py` 的冒烟测试把输出接到 DEVNULL），那个框没人点
+       ⇒ 进程一直挂着，一路挂到调用方超时。而 build.py 报出来的是
+       「--selftest 超时 45s / 界面可能有问题」—— **完全指不到真原因**。
+       2026-10-16 实测踩到：0.6.0 的 `--selftest` 新增了一行带 `⚠️` 的
+       「密码加密」，于是**每次构建都必然超时**（0.5.6 时没有非 GBK 字符，
+       所以从没暴露过）。
+
+    ⚠️ 只改 `errors`、**不改 `encoding`**：把编码改成 utf-8 之后，控制台仍按
+       cp936 解释那些字节 ⇒ 中文全变乱码。改 errors 的代价只是个别字符显示成 `?`。
+
+    返回 `(是否原本有 stdout, 是否成功改过 errors)` —— 调用方要用第一个值分辨
+    「双击（没有终端）」和「从终端启动」，见 main() 里 `had_stdout` 的说明。
+    """
+    had = sys.stdout is not None
+    patched = False
+    for name in ("stdout", "stderr"):
+        s = getattr(sys, name, None)
+        if s is None:
+            setattr(sys, name, open(os.devnull, "w", encoding="utf-8",
+                                    errors="replace"))
+            continue
+        try:
+            s.reconfigure(errors="replace")
+            patched = True
+        except Exception:
+            # 不是 TextIOWrapper（被测试替身换过、或 Python 太老没 reconfigure）
+            # —— 不致命，跳过就是。
+            pass
+    return had, patched
+
+
 def main():
     # --windowed 打包后 stdout/stderr 是 None，某些库会因此报错。
-    # 显式指定 utf-8 + errors="replace"：中文 Windows 的默认编码是 cp936，
-    # 一旦有代码 print 出 cp936 表示不了的字符（emoji 之类）就会抛
-    # UnicodeEncodeError —— 而这里本来就是为了"兜住异常"才接的 devnull。
-    # ⚠️ 先把「本来有没有 stdout」记下来，**再**做下面的 devnull 兜底 ——
+    # ⚠️ 先把「本来有没有 stdout」记下来，**再**做兜底 ——
     #    兜底之后 sys.stdout 永远不是 None，就再也分辨不出「双击（没有终端）」
     #    和「从终端里启动」了。`--help` 要靠这个决定打印还是弹窗（见那边的注释）。
-    had_stdout = sys.stdout is not None
-    if sys.stdout is None:
-        sys.stdout = open(os.devnull, "w", encoding="utf-8", errors="replace")
-    if sys.stderr is None:
-        sys.stderr = open(os.devnull, "w", encoding="utf-8", errors="replace")
+    #    具体怎么兜、为什么要兜这么多，见 `_fix_std_streams` 的说明。
+    had_stdout = _fix_std_streams()[0]
 
     args = [a.lower() for a in sys.argv[1:]]
 
