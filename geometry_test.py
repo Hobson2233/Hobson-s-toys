@@ -84,6 +84,12 @@ def check(name, got, want):
         FAILS.append(name)
 
 
+def check_true(name, cond, detail=""):
+    print("  [%s] %-44s %s" % ("OK" if cond else "失败", name, detail))
+    if not cond:
+        FAILS.append(name)
+
+
 def main():
     print("=== 1. 任何屏幕上，窗口都不能比屏幕还高/还宽 ===")
     bad = []
@@ -122,7 +128,18 @@ def main():
     print("=== 3. 装得下的时候，不该被压小（保持原来的观感）===")
     w, h, x, y = C.window_geometry(1707, 1067, CONTENT_H)
     check("本机高度 = 内容需要的高度 + 余量", h, EXPECTED_H)
-    check("本机宽度 = 屏幕的 44%%（在 820..1180 之间）", w, 820)
+    # 🔴 2026-10-16：宽度的三条门槛（1000 下限 / 1320 上限 / 屏幕的 68%）
+    #    本来按 0.44 算，但 0.44 在 1707 上只有 751，一直被 820 这个下限兜着
+    #    —— 也就是说那个比例**早就没在起作用**。加了左侧导航栏之后必须真的变宽，
+    #    所以改成 0.68 并且把比例也纳入断言（不然又是「看着有比例、其实没用」）。
+    check("本机宽度 = 屏幕的 68%（在 1000..1320 之间）", w,
+          max(1000, min(1320, int(1707 * 0.68))))
+    # 导航栏那 184px 之外，内容区还得有 700 以上（设置页里有 wraplength 680/700
+    # 的说明文字，窄了会被静默裁掉）。
+    content_w = w - 2 * C.OUTER_PAD - C.NAV_W - C.NAV_GAP
+    check_true("内容区宽度 >= 700（否则长说明文字会被裁）",
+               content_w >= 700, "（实测 %d）" % content_w)
+    check("内容区宽度", content_w, 1160 - 28 - 168 - 16)
 
     print()
     print("=== 4. 屏幕太矮时必须压到屏幕内，而不是硬撑 ===")
@@ -145,7 +162,19 @@ def main():
             print("  [失败] %-16s minsize %dx%d 超出屏幕 %dx%d"
                   % (label, mw, mh, sw, sh))
     check("各屏幕的 minsize 都在屏幕内", [f for f in FAILS if f.startswith("minsize")], [])
-    check("本机 minsize 保持原来的 700x520", C.minsize_for(1707, 1067), (700, 520))
+    # 🔴 2026-10-16：从 700 涨到 700 + 导航栏(168) + 缝(16)。
+    #    700 是**内容区**的最小值（设置页有 wraplength 680/700 的说明文字）。
+    check("本机 minsize = 内容区 700 + 导航栏那块",
+          C.minsize_for(1707, 1067), (700 + C.NAV_W + C.NAV_GAP, 520))
+    # 反向确认：minsize 不能比 window_geometry 真算出来的宽度还大
+    # （那样 Tk 会把窗口撑到 minsize，用户看到的是「窗口不听话」）。
+    bad_min = []
+    for label, sw, sh in SCREENS:
+        w, _h, _x, _y = C.window_geometry(sw, sh, CONTENT_H)
+        mw, _mh = C.minsize_for(sw, sh)
+        if mw > w:
+            bad_min.append((label, mw, w))
+    check("任何屏幕上 minsize 都不超过算出来的窗口宽度", bad_min, [])
 
     print()
     print("=== 6. 极端小屏不能算出负数或 0 ===")

@@ -408,6 +408,26 @@ def canvas_items(w):
     return n
 
 
+def biggest_canvas_in(w):
+    """界面里**要求的宽度最大**的那个 Canvas。
+
+    ⚠️ 为什么要挑最大而不是按类型找：柱状图是 `tk.Canvas`，而卡片本身
+       （`round_panel`）也是 `tk.Canvas`，`round_button` / `round_chip` 还是
+       `tk.Canvas`。按类型找会挑到一个按钮上去，量出来当然"不超宽"——
+       于是「图表被裁」这条断言变成永远通过的空转。图表的画布宽度是
+       **显式设成 `self.cw`** 的，所以它一定是最大的那个。
+    """
+    best, bw = None, -1
+    for c in all_widgets(w):
+        try:
+            rq = c.winfo_reqwidth()
+        except Exception:
+            continue
+        if c.winfo_class() == "Canvas" and rq > bw:
+            best, bw = c, rq
+    return best
+
+
 def row_value(w, name):
     """找一行 `_row`（左名右值），返回**右边的值**。找不到返回 `None`。
 
@@ -476,10 +496,58 @@ def pump(root, seconds=6.0, until=None):
     return bool(until is None or until())
 
 
-def open_panel(root, account="2025000000"):
-    """开一个面板（**不跑它自己的网络流程** —— 打开面板本来就不联网）。"""
+def open_panel(root, account="2025000000", host_w=None, host_h=None):
+    """开一个面板（**不跑它自己的网络流程** —— 打开面板本来就不联网）。
+
+    🔴 2026-10-16：面板从「独立 Toplevel」改成「主窗口里的一页」，
+       所以这里也得按**真实路径**给它一块 Frame（`host=`），
+       而不是让它自己建窗口。用 `pack_propagate(False)` + 显式宽度，
+       把「正文有多宽」固定下来 —— 两列排版、wraplength 全是从这个宽度
+       推出来的，宽度不定的话测出来的是随机的。
+    """
+    # 🔴 用 `place` 而不是 `pack`，而且**尺寸写死**。原因：
+    #    · `pack` 会把一块块 846x760 的 host 排队塞进一个 900x800 的窗口，
+    #      排到后面的一分不到空间（宽度量出来是 1），面板就退回兜底宽度 ——
+    #      报出来是「没分两列」，根因却在十几个用例之前，极难查。
+    #    · 多个用例会**同时在用两块面板**（比如 ⑤ 里的 w 和 w2），
+    #      所以也不能「建新的就把旧的删掉」。
+    #    `place` 让它们各自叠在同一位置、互不抢空间，两个问题一起没了。
+    host = _tk().Frame(root, bg=C.BG)
+    host.place(x=0, y=0, width=host_w or HOST_W, height=host_h or HOST_H)
+    # ⚠️ 必须先把 host 真正布局出来再建面板：面板构造时就要量正文宽度
+    #    （分几列 / 换行多宽都靠它）。不 update 的话量到的是 1px，
+    #    面板会退回兜底宽度 —— 于是「两列排版」这一整段测的就是兜底路径，
+    #    等于假绿。
+    host.update_idletasks()
     return C.SelfServiceWindow(root, _tk(), *_font(root), account,
-                               "not-a-real-pwd", "http://202.196.169.246")
+                               "not-a-real-pwd", "http://202.196.169.246",
+                               host=host)
+
+
+def close_panel(w):
+    """关面板，并把它那块测试用 host 一起拆掉。
+
+    ⚠️ 面板自己**管不到 host** —— host 是测试（或主窗口）给的，
+       `w.close()` 只销毁面板自己那一层。不拆的话截图工具会把好几块
+       面板叠在同一位置（新的盖住旧的，看不出来，但 `winfo_*` 会互相干扰）。
+    """
+    try:
+        host = w.win.master
+    except Exception:
+        host = None
+    w.close()
+    if host is not None:
+        try:
+            host.destroy()
+        except Exception:
+            pass
+
+
+# 测试用的「主窗口内容区」尺寸。**不是随便挑的**：按真实主窗口算出来的
+# —— 窗口宽 `window_geometry(1707, 1067, 827)` = 1160，
+# 减去 shell 两侧留白(28) + 导航栏(168) + 缝(16) = 948。
+HOST_W = 948
+HOST_H = 780
 
 
 def reset_fake():
@@ -608,16 +676,32 @@ def test_open_offline_with_history(root):
                not any("账号状态" in x for x in t), "")
     check_true("没有设备卡", not any("在线设备" in x for x in t), "")
 
-    # 🔴 正文必须**真的有图表那么宽**。这条看着像废话，其实抓的是一个静默 bug：
+    # 🔴 正文必须**真的放得下图表**。这条看着像废话，其实抓的是一个静默 bug：
     #    正文在滚动区里，holder 不绑 `<Configure>` 撑到 canvas 宽度的话，
-    #    它会停在卡片 Canvas 的默认宽度（378px），而图表画布是 520px ——
-    #    **右边 1/3 被裁掉**（实测：6 天的柱子只画出来 4 根），Tk 一声不吭。
+    #    它会停在卡片 Canvas 的默认宽度（378px），而图表画布更宽 ——
+    #    **右边一截被裁掉**（实测：6 天的柱子只画出来 4 根），Tk 一声不吭。
     #    ⚠️ 光数「柱子有几根」抓不到它（都画了，只是看不见），**必须量宽度**。
+    #
+    # ⚠️ 2026-10-16：分两列之后判据**不是**「正文 ≥ 图表宽」，而是
+    #    「**列宽** == 卡片实际宽度 == 图表画布宽度」—— 图表现在是按列宽
+    #    现算的（`self.cw`），只要这三者一致就说明画布没被裁。
     root.update()
-    need = C.CHART_W + 2 * 14          # 图表宽 + 卡片两侧内边距
     check_true("正文宽度够画整张图（不然柱子会被裁）",
-               w.body.winfo_width() >= need,
-               "（实测 %d，需要 %d）" % (w.body.winfo_width(), need))
+               w.body.winfo_width() >= 400,
+               "（实测 %d）" % w.body.winfo_width())
+    if w.cols:
+        colw = w.cols[0].winfo_width()
+        # ⚠️ 给 1px 容差：`winfo_width()` 是布局算完之后**取整**的结果，
+        #    和我们自己算的 `int(colw)` 可能差 1。卡死相等的话，
+        #    这条断言会因为「屏幕缩放变了」这种无关原因变红。
+        check_true("卡片可用宽度 = 列宽 - 卡片内边距",
+                   abs(w.cw - (colw - 2 * C._CARD_PAD_X)) <= 1,
+                   "（cw=%d，列宽=%d）" % (w.cw, colw))
+        cv = biggest_canvas_in(w.win)
+        check_true("图表画布宽度 == 卡片可用宽度（没被裁）",
+                   cv is not None and cv.winfo_reqwidth() <= w.cw + 2,
+                   "（画布 %s / 可用 %d）"
+                   % (cv.winfo_reqwidth() if cv else "?", w.cw))
     w.close()
 
 
@@ -976,45 +1060,182 @@ def test_off_main_thread():
                "（建了 %d 个）" % FakeSvc.made)
 
 
-def test_main_window_chip():
-    """主界面状态卡上的「账号中心」圆角片：**在、文字对、高度和邻居一模一样**。
+def text_widget_in(page):
+    """某一页里那个 `tk.Text`（「使用说明」的正文就是它）。没有就返回 None。"""
+    for c in all_widgets(page):
+        if c.winfo_class() == "Text":
+            return c
+    return None
 
-    🔴 高度这条是重点：内容高度是 827px、上限 906px，多 1px 都可能压线。
-       这个圆角片是塞进状态卡右侧的，只要它不比旁边那个高，
-       整张卡的高度就一个像素都不变。所以这里直接拿两个控件比高度 ——
-       哪天有人只改了一个，这条立刻红。
+
+def cards_in(col):
+    """某一列里装了几张卡。每张卡是 `round_panel` 返回的一个 Canvas。"""
+    return [c for c in col.winfo_children() if c.winfo_class() == "Canvas"]
+
+
+def test_two_columns(root):
+    """⑳ 横向排版：**宽了分两列、窄了自动退回单列**。
+
+    🔴 为什么两种宽度都要测：只测宽的那一遍会漏掉「窄屏还硬分两列」——
+       那时每列只有三四百像素，说明文字折成一堆短行、图表细成毛刺，
+       而且**不报任何错**，只是难看。反过来只测窄的会漏掉「宽了没分列」，
+       用户抱怨的正是这个（「不用这么竖」）。
+
+    🔴 还要验**页脚说明在两列下面**。混用 `pack(side="left")` 和默认的
+       `pack(side="top")` 时，Tk 会把后来的那个排到**右边剩下的区域**里去，
+       而不是下面 —— 而且不抛异常，只是位置不对（得靠量 y 坐标才发现）。
     """
-    print("\n⑭ 主界面上的入口")
-    app = C.LoginApp(smoke=True)
-    try:
-        check_true("郑航下「账号中心」入口存在", app.btn_self is not None, "")
-        check_true("「测一下速度」也还在", app.btn_probe is not None, "")
-        if app.btn_self is not None:
-            check("圆角片上的字", getattr(app.btn_self, "_rb_text", None),
-                  "账号中心")
-            check("和「测一下速度」同高（保证内容高度不变）",
-                  app.btn_self.winfo_reqheight(), app.btn_probe.winfo_reqheight())
-            check("两个片是同一个父容器（同一行）",
-                  str(app.btn_self.master), str(app.btn_probe.master))
-            check_true("能点（挂上了左键事件）",
-                       bool(app.btn_self.bind("<Button-1>")), "")
+    print("\n⑳ 横向排版：宽了分两列、窄了回单列")
 
-        # 🔴 界面铁律：**主按钮固定三个**。新入口是状态卡里的圆角片，
-        #    不许混进那三个里去。`set_busy` 里那个元组就是这条铁律的实现
-        #    （`(btn_switch, btn_save, btn_out, btn_probe)`），所以直接验行为：
-        #    忙碌时那三个必须变灰、而「账号中心」**不该**跟着变
-        #    （它的忙碌拦截是 `on_self_service` 自己做的）。
+    def build(host_w):
+        reset_fake()
+        reset_history()
+        FakeSvc.script = {"has_session": "yes", "login": "ok"}
+        w = open_panel(root, host_w=host_w)
+        pump(root, 0.4)
+        w.data = json.loads(json.dumps(FAKE_DATA))
+        w._render()
+        pump(root, 0.8)
+        return w
+
+    # ---------- 宽：两列 ----------
+    w = build(HOST_W)
+    try:
+        check_true("正文宽度 >= 门槛（%.0f）" % w.MIN_2COL_W,
+                   w._body_w() >= w.MIN_2COL_W, "（实测 %d）" % w._body_w())
+        check("分成了 2 列", len(w.cols), 2)
+        check_true("多了一层「放两列」的容器", w.colrow is not None, "")
+        check("卡片可用宽度 = (正文 - 列缝)/2 - 卡片内边距", w.cw,
+              int((w._body_w() - w.COL_GAP) / 2.0) - 2 * C._CARD_PAD_X)
+        check("左列 3 张卡（账号 / 图表 / 资料）",
+              len(cards_in(w.cols[0])), 3)
+        check("右列 5 张卡（设备 / 详单 / 费用 / 套餐 / 链接）",
+              len(cards_in(w.cols[1])), 5)
+        # 两列高度别差太多（差太多的话短的那列底下会空一大块）
+        h0, h1 = w.cols[0].winfo_reqheight(), w.cols[1].winfo_reqheight()
+        ratio = float(max(h0, h1)) / max(1, min(h0, h1))
+        check_true("两列高度大致相当（比值 %.2f <= 1.60）" % ratio,
+                   ratio <= 1.60, "（左 %d / 右 %d）" % (h0, h1))
+        # 🔴 页脚必须在两列**下面**，不是在右边那块空地里
+        root.update()
+        foot = w.body.winfo_children()[-1]
+        check_true("页脚说明排在两列下方（不是被挤到右半边）",
+                   foot.winfo_y() >= w.colrow.winfo_reqheight() - 4,
+                   "（页脚 y=%d，两列高=%d）"
+                   % (foot.winfo_y(), w.colrow.winfo_reqheight()))
+    finally:
+        close_panel(w)
+
+    # ---------- 窄：单列 ----------
+    w = build(600)
+    try:
+        check_true("正文宽度 < 门槛", w._body_w() < w.MIN_2COL_W,
+                   "（实测 %d）" % w._body_w())
+        check("没分列（退回单列）", len(w.cols), 0)
+        check("卡片直接铺在正文里（8 张卡都在同一列）",
+              len(cards_in(w.body)), 8)
+        check("单列时卡片可用宽度 = 正文宽 - 卡片内边距", w.cw,
+              w._body_w() - 2 * C._CARD_PAD_X)
+    finally:
+        close_panel(w)
+
+
+def test_main_window_pages():
+    """主界面：**左侧导航 + 右侧内容**，一个窗口里进出所有页。
+
+    🔴 这一段的由来（2026-10-16）。用户原话：
+        「每加一个新功能就要加一个窗口，那用户同时看好几个功能
+          不就全屏都是窗口了」。
+       所以面板从独立 Toplevel 改成了主窗口里的一页。这里钉三件事：
+
+      1. **导航项真的在、点得动**（挂的是 `_rb_text` + `<Button-1>` +
+         `invoke`，和 `round_chip` / `round_button` 同一套 —— 测试不用记两套写法）。
+      2. **点一下就真的换页**（`self.page` 变了、别的页 `pack_forget` 了）。
+         光验「控件存在」是不够的：`show_page` 里写错一个 key，
+         表现就是「点了没反应」，而且不报任何错。
+      3. **切页不销毁别的页**（账号中心里挂着内存会话，销毁了要重新读验证码）。
+    """
+    print("\n⑭ 主界面：左侧导航 + 一个窗口多个页面")
+    # 沙箱里塞一个假账号：不给的话 `_ensure_center` 会走「没填账号密码」那条
+    # 提示，而它弹的是**真模态框** —— 无人值守的测试会一直等在那里。
+    C.save_config({"userId": "2025000000", "passwd": "x"})
+    app = C.LoginApp(smoke=True)
+    # 🔴 兜底：任何模态框都自动「否」。**不能省** —— 弹一个框就挂住整档测试，
+    #    报出来却是「超时」，和真实原因差十万八千里。
+    app.messagebox = C._SilentBox()
+    try:
+        check("页面清单", [k for k, _l, _i in app.PAGES],
+              ["settings", "center", "help"])
+        check_true("郑航下有「账号中心」这一项", "center" in app.nav_btns, "")
+        check_true("「设置」「使用说明」也在",
+                   "settings" in app.nav_btns and "help" in app.nav_btns, "")
+        check("「测一下速度」还在（删的是状态卡上那个重复入口）",
+              app.btn_probe is not None, True)
+        check("状态卡上不再有重复的「账号中心」圆角片",
+              getattr(app, "btn_self", None), None)
+
+        # --- 导航项长什么样 ---
+        setb = app.nav_btns["settings"]
+        check("导航项文字", getattr(setb, "_rb_text", None), "设置")
+        check_true("能点（挂了左键事件）", bool(setb.bind("<Button-1>")), "")
+        check_true("有 invoke()（和 round_chip/round_button 对齐）",
+                   callable(getattr(setb, "invoke", None)), "")
+
+        # --- 切页 ---
+        check("一开始在设置页", app.page, "settings")
+        check("设置页在布局里（`winfo_manager` 非空 = 真的 pack 上了）",
+              app.page_settings.winfo_manager(), "pack")
+        app.nav_btns["help"].invoke()
+        check("点「使用说明」→ 切过去了", app.page, "help")
+        check("说明页在布局里", app.page_help.winfo_manager(), "pack")
+        check("设置页被收起来了（不是叠在上面）",
+              app.page_settings.winfo_manager(), "")
+        tb = text_widget_in(app.page_help)
+        check_true("说明正文真的在（不是空页）",
+                   tb is not None and "校园网" in tb.get("1.0", "end"), "")
+        check("高亮跟着走：说明亮着", 
+              [k for k, b in app.nav_btns.items() if b.is_active()], ["help"])
+        app.nav_btns["settings"].invoke()
+        check("点回「设置」→ 回来了", app.page, "settings")
+        check("高亮也回来了",
+              [k for k, b in app.nav_btns.items() if b.is_active()], ["settings"])
+
+        # --- 不销毁别的页（来回切，还是同一块 Frame）---
+        first = app.page_help
+        app.nav_btns["help"].invoke()
+        app.nav_btns["settings"].invoke()
+        app.nav_btns["help"].invoke()
+        check("说明页是**同一块 Frame**（切页只 pack_forget，不重建）",
+              app.page_help is first, True)
+        app.nav_btns["settings"].invoke()
+
+        # --- 🔴 点「账号中心」真的建得起来（嵌入模式那条路）---
+        app.nav_btns["center"].invoke()
+        check("切到账号中心页", app.page, "center")
+        check_true("面板真的建出来了", app.panel is not None, "")
+        check_true("面板嵌在那一页里（`host` 就是 page_center）",
+                   app.panel is not None
+                   and app.panel.win.master is app.page_center, "")
+        check_true("嵌进主窗口之后**不再建 Toplevel**",
+                   app.panel is not None and app.panel.embedded, "")
+        if app.panel is not None:
+            check("导航栏还在布局里（没被内容盖掉／顶掉）",
+                  app.nav.winfo_manager(), "pack")
+            check("面板看的账号 = 界面上那个账号",
+                  app.panel.account, "2025000000")
+        # ⚠️ 面板起来之后 `after(80, _pump)` 就在跑了，销毁前先关掉它，
+        #    否则 `root.destroy()` 之后那一拍还会往死控件上摸。
+        app.nav_btns["settings"].invoke()
+        app._drop_center()
+
+        # --- 铁律：主按钮还是三个 ---
         main3 = (app.btn_switch, app.btn_save, app.btn_out)
         check("三个主按钮互不相同", len({id(x) for x in main3}), 3)
-        check_true("新入口不是那三个主按钮之一", app.btn_self not in main3, "")
         app.set_busy(True)
         try:
             check("忙碌时三个主按钮都灰了",
                   [str(w.cget("state")) for w in main3],
                   ["disabled", "disabled", "disabled"])
-            if app.btn_self is not None:
-                check("忙碌时「账号中心」没被算进主按钮（自己拦截）",
-                      str(app.btn_self.cget("state")), "normal")
         finally:
             app.set_busy(False)
     finally:
@@ -1556,11 +1777,14 @@ def main():
     try:
         test_available()
         root = _tk().Tk()
-        # 🔴 **不能 withdraw**：面板是 `transient(root)` 的，主窗一隐藏，
-        #    Windows 就不映射子窗 —— 于是 `winfo_width()` 永远是 1，
-        #    「窗口够不够宽」那条断言就成了假绿（量到 1 也算过）。
-        #    所以这里让它真的显示出来（很小的一块，测试期间闪一下而已）。
-        root.geometry("320x140+30+30")
+        # 🔴 **不能 withdraw**：面板靠 `winfo_width()` 量宽度来排版
+        #    （两列 / 单列、wraplength 都从它来），主窗一隐藏，
+        #    Windows 就不映射子控件 —— `winfo_width()` 永远是 1，
+        #    那条「够不够宽」的断言就成了假绿（量到 1 也算过）。
+        #    所以这里让它真的显示出来（测试期间闪一下而已）。
+        # ⚠️ 2026-10-16：从 320x140 放大到 900x800 —— 面板现在是**嵌在主窗口
+        #    里的一页**，得给它一块真实的画布尺寸才测得到两列排版。
+        root.geometry("900x800+30+30")
         root.update()
         try:
             test_open_offline_empty(root)
@@ -1578,10 +1802,11 @@ def main():
             test_center_cards2(root)
             test_actions(root)
             test_links_card(root)
+            test_two_columns(root)
         finally:
             root.destroy()
         test_off_main_thread()
-        test_main_window_chip()
+        test_main_window_pages()
         print("\n%s" % datasafe.assert_untouched())
     finally:
         S.SelfService = real_svc

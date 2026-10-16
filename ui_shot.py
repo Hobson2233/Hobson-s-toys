@@ -115,11 +115,14 @@ def grab(widget, name):
 
 
 def find_button(w, text):
-    """在控件树里按文字找按钮（run_gui 里的按钮都是局部变量，拿不到引用）。
+    """在控件树里按文字找按钮/导航项（run_gui 里它们都是局部变量，拿不到引用）。
 
     ⚠️ 2026-10-04 起按钮**不再都是 tk.Button**：「使用说明」和三个主按钮换成了
     Canvas 手绘的圆角按钮（见 campus_login.round_button）。它们把文字挂在
     `_rb_text` 属性上，这里一并认。
+    ⚠️ 2026-10-16 起「使用说明」**不再是按钮**，而是左侧导航栏里的一项
+    （`campus_login.nav_button`）。它同样挂 `_rb_text`，所以这里一个字都不用改
+    —— 但下面 `open_help` 得改成「切页」而不是「等一个弹窗」。
 
     为什么要专门说这一句：漏认的后果是**静默的** —— 找不到就只打印一行
     「没找到」，后面的截图流程照样跑完，看起来像成功了，其实第 5 张图是空的。
@@ -138,11 +141,14 @@ def find_button(w, text):
     return None
 
 
-def find_toplevel(w):
-    for c in w.winfo_children():
-        if isinstance(c, tk.Toplevel):
-            return c
-    return None
+def find_page(w, name):
+    """按导航项的文字切到那一页。返回是否切成功。"""
+    b = find_button(w, name)
+    if b is None or not callable(getattr(b, "invoke", None)):
+        return False
+    b.invoke()
+    w.update_idletasks()
+    return True
 
 
 def schedule(root):
@@ -180,21 +186,15 @@ def schedule(root):
         grab(root, "04_再点一次盖回去")
 
     def open_help():
-        b = find_button(root, "使用说明")
-        print("[5] 使用说明按钮: %s" % ("找到并点击" if b else "**没找到**"))
-        if b:
-            b.invoke()
+        # ⚠️ 2026-10-16：「使用说明」从**弹窗**变成了**左侧导航栏里的一页**，
+        #    所以这里是「切页」而不是「点按钮等窗口」。
+        ok = find_page(root, "使用说明")
+        print("[5] 使用说明（导航栏）: %s" % ("切过去了" if ok else "**没找到**"))
 
     def shot_help():
-        t = find_toplevel(root)
-        if t:
-            grab(t, "05_使用说明弹窗")
-            try:
-                t.destroy()
-            except Exception:
-                pass
-        else:
-            print("  没找到说明弹窗")
+        # 页在同一个窗口里 —— 拍 root 本身就是拍它
+        grab(root, "05_使用说明页")
+        find_page(root, "设置")          # 切回去，后面那张要拍设置页
 
     def switch_school():
         """第 6 张：切到嘉兴大学 —— 账号行上「属于别的学校」的警示标签就会出现。

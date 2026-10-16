@@ -49,19 +49,31 @@ def grab(widget, name):
 
 
 def measure(w, tag):
-    """量所有控件的 reqwidth，挑出**超过卡片可用宽度**的（会被裁）。"""
-    avail = C.CHART_W + 2 * C._CARD_PAD_X      # 卡片内部可用宽度
+    """量「子控件要求的宽度 > 父容器实际宽度」的，那些才是**会被裁掉**的。
+
+    ⚠️ 2026-10-16 改成「和**父容器**比」，不再和某个常量比。原因：
+      分两列之后，「正文宽」「列宽」「卡片宽」是三个不同的数，
+      拿其中任何一个当基准都会误报或漏报 ——
+      第一版拿卡片宽当基准，把两列的那个容器（本来就是整个正文宽）报成了
+      「超宽控件」，全是假警报；而真正的裁切（控件比它所在的列还宽）
+      反倒可能被漏掉。**真正能判「会不会被裁」的只有父容器自己的宽度。**
+    """
     bad = []
     for c in T.all_widgets(w.win):
         try:
             rq = c.winfo_reqwidth()
             cls = c.winfo_class()
+            pw = c.master.winfo_width()
         except Exception:
             continue
-        if rq > avail:
-            bad.append((cls, rq))
-    print("  [%s] 卡片可用宽度 = %d；超宽控件 = %s"
-          % (tag, avail, sorted(set(bad)) or "无"))
+        # 父容器还没布局完（宽度是 1）就跳过 —— 那不是「被裁」，是「还没量到」
+        # ⚠️ 留 2px 容差：`winfo_width()` 是布局取整之后的数，
+        #    和控件自己算的宽度差 1 是常事（实测 429 vs 428）。
+        #    卡死相等的话这里会长期挂一条假警报，看久了就没人看这张表了。
+        if pw > 10 and rq > pw + 2:
+            bad.append((cls, rq, pw))
+    print("  [%s] 窄于内容的容器 = %s"
+          % (tag, sorted(set(bad)) or "无"))
     # holder 的**要求**宽度 vs 画布**实际**宽度（差 > 2px 就是横向被裁）
     hw, cw = w.holder.winfo_reqwidth(), w.canvas.winfo_width()
     print("  [%s] holder 需要 %d px / 画布实际 %d px  ->  %s"
@@ -76,7 +88,9 @@ def main():
 
     root = T._tk().Tk()
     root.title("（截图用，不是真界面）")
-    root.geometry("300x120+20+20")
+    # 尺寸要**像真的内容区**：正文宽度是量出来的（分几列靠它），
+    # 窗口一小就退回单列，截出来就不是用户看到的样子。
+    root.geometry("%dx%d+20+20" % (T.HOST_W, T.HOST_H))
     root.update()
     fam, base = T._font(root)
 
@@ -88,30 +102,29 @@ def main():
 
     T.reset_fake()
     T.FakeSvc.script = {"has_session": "yes", "login": "ok"}
-    w = C.SelfServiceWindow(root, T._tk(), fam, base, "2025000000",
-                            "demo-1234", "http://202.196.169.246")
+    w = T.open_panel(root)
     T.pump(root, 1.0)
 
     # ① 还没同步过（只有本机历史）
-    grab(w.win, "center_01_没同步过.png")
+    grab(root, "center_01_没同步过.png")
     measure(w, "没同步过")
 
     # ② 同步完（账号 + 图表 + 详单 + 设备）
     w.start_sync()
     T.pump(root, 8.0, lambda: w.data is not None)
     T.pump(root, 0.8)
-    grab(w.win, "center_02_顶部.png")
+    grab(root, "center_02_顶部.png")
     measure(w, "同步后")
 
     # ③ 滚到底，看详单 + 设备
     w.canvas.yview_moveto(1.0)
     T.pump(root, 0.5)
-    grab(w.win, "center_03_底部.png")
+    grab(root, "center_03_底部.png")
 
     # ④ 详单在中间，滚到 0.55 左右
     w.canvas.yview_moveto(0.5)
     T.pump(root, 0.5)
-    grab(w.win, "center_04_中间.png")
+    grab(root, "center_04_中间.png")
 
     # ⑤ A 档没读到
     w.data = dict(w.data)
@@ -123,7 +136,7 @@ def main():
     T.pump(root, 0.6)
     w.canvas.yview_moveto(1.0)
     T.pump(root, 0.4)
-    grab(w.win, "center_05_A档没读到.png")
+    grab(root, "center_05_A档没读到.png")
 
     # ⑥ 停机中
     w.data = None
@@ -135,9 +148,9 @@ def main():
     w.data = d
     w._render()
     T.pump(root, 0.5)
-    grab(w.win, "center_06_停机中.png")
+    grab(root, "center_06_停机中.png")
 
-    w.close()
+    T.close_panel(w)
     root.destroy()
     print("完成，输出目录: %s" % OUT)
     proc_tree.exit_hard(0)

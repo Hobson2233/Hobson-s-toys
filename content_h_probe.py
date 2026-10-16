@@ -50,17 +50,43 @@ def spy(sw, sh, reqh):
 def find_tree(root):
     """按**结构**找到内容区那几层：(holder, inner)。对不上就返回 (None, None)。
 
-    形状是 root -> outer -> canvas -> holder -> inner。
-    不按名字猜 —— 名字是局部变量，外面根本看不到。
+    形状是 root -> shell -> (nav, content) -> page_settings -> outer
+                  -> canvas -> holder -> inner
+
+    ⚠️ 2026-10-16：主窗口从「一屏设置」改成了「左侧导航 + 右侧内容」，
+       所以中间多了 shell / nav / content / page_settings 四层。
+       这里**不再按层数硬数**（那是「改了结构就静默失效」的写法）——
+       改成整个控件树里找**第一个 Canvas 的 holder**：内容区那个滚动画布
+       是页面上唯一一个「Canvas 里装着 Frame」的结构（卡片也是 Canvas，
+       但里面装的还是 Frame…所以再加一条：holder 的父链上要有 Canvas 且
+       holder 自己有名字叫 inner 的孩子）。
+       ⚠️ 找不到就返回 (None, None)，调用方会打「量不出来」——
+          宁可说量不出来，也别拿一棵错的树算出个假数字。
     """
     try:
-        outer = root.winfo_children()[0]
-        canvas = next(c for c in outer.winfo_children()
-                      if c.winfo_class() == "Canvas")
-        holder = canvas.winfo_children()[0]      # create_window 的对象是子控件
-        return holder, holder.winfo_children()[0]
+        for canvas in _all_canvas(root):
+            kids = canvas.winfo_children()
+            if len(kids) != 1:
+                continue
+            holder = kids[0]
+            if holder.winfo_class() != "Frame":
+                continue
+            inner = holder.winfo_children()
+            if len(inner) == 1 and inner[0].winfo_class() == "Frame":
+                return holder, inner[0]
+        return None, None
     except Exception:
         return None, None
+
+
+def _all_canvas(w):
+    """控件树里所有的 Canvas（深度优先）。"""
+    out = []
+    for c in w.winfo_children():
+        if c.winfo_class() == "Canvas":
+            out.append(c)
+        out.extend(_all_canvas(c))
+    return out
 
 
 def _text_of(w, depth=0):

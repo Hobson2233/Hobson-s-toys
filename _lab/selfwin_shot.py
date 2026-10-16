@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""给「上网数据」面板截图（一次性工具，本地看界面用）。
+"""给「账号中心」面板截图（一次性工具，本地看界面用）。
 
 为什么单独做：
     `selfwin_test.py` 验的是**逻辑**（该有的文字在不在、图有没有被 GC）。
@@ -8,6 +8,11 @@
 
 不联网：复用 `selfwin_test.FakeSvc`（假数据层），并且一样掐掉 socket。
 不碰真实数据：`datasafe.sandbox()`。
+
+⚠️ 2026-10-16：面板从「独立窗口」改成「主窗口里的一页」，所以这里
+   **不再自己建窗口**，而是复用 `selfwin_test.open_panel()`（它按真实
+   内容区宽度给一块 host）—— 截图要拍的正是**两列排版**的真实样子。
+   拍的是 root（面板就嵌在里面），不是面板自己那层 Frame。
 
 用法：
     python _lab/selfwin_shot.py     # 输出到 repo/ui_shots/panel_*.png
@@ -65,10 +70,11 @@ def main():
     ]
 
     root = T._tk().Tk()
-    # 🔴 根窗口**不能 withdraw**：面板是 `transient(root)` 的，
-    #    主窗一隐藏，Windows 就不映射子窗了 —— 截出来是 1x1 的空白。
+    # 🔴 根窗口**不能 withdraw**，而且尺寸要**像真的内容区**：
+    #    面板的正文宽度是量出来的（决定分几列、每行多宽换行），
+    #    窗口一小就退回单列 —— 那截出来的就不是用户看到的样子了。
     root.title("（截图用，不是真界面）")
-    root.geometry("300x120+20+20")
+    root.geometry("%dx%d+20+20" % (T.HOST_W, T.HOST_H))
     root.update()
     fam, base = T._font(root)
 
@@ -76,52 +82,49 @@ def main():
 
     # ① 本机没历史（空状态）
     T.reset_history()
-    w = C.SelfServiceWindow(root, T._tk(), fam, base, "2025000000",
-                            "demo-1234", "http://202.196.169.246")
+    w = T.open_panel(root)
     T.pump(root, 1.0)
-    grab(w.win, "panel_01_还没同步过.png")
-    w.close()
+    grab(root, "panel_01_还没同步过.png")
+    T.close_panel(w)
 
     # ② 按天（默认）
     T.reset_history()
     seed(hist)
-    w = C.SelfServiceWindow(root, T._tk(), fam, base, "2025000000",
-                            "demo-1234", "http://202.196.169.246")
+    w = T.open_panel(root)
     T.pump(root, 1.0)
-    grab(w.win, "panel_02_按天.png")
+    grab(root, "panel_02_按天.png")
 
     # ③ 按月
     w.set_view("month")
     T.pump(root, 0.5)
-    grab(w.win, "panel_03_按月.png")
+    grab(root, "panel_03_按月.png")
     w.set_view("day")
     T.pump(root, 0.3)
 
     # ④ 9 月（有缺口那个月）
     w.shift_month(-1)
     T.pump(root, 0.5)
-    grab(w.win, "panel_04_九月.png")
-    w.close()
+    grab(root, "panel_04_九月.png")
+    T.close_panel(w)
 
     # ⑤ 验证码界面
     T.reset_fake()
     T.reset_history()
     T.FakeSvc.script = {"has_session": "no", "login": "ok"}
-    w = C.SelfServiceWindow(root, T._tk(), fam, base, "2025000000",
-                            "demo-1234", "http://202.196.169.246")
+    w = T.open_panel(root)
     w._today = lambda: "2026-10-12"
     w.start_sync()
     T.pump(root, 8.0, lambda: w._cap_big is not None)
     root.update()
-    grab(w.win, "panel_05_验证码.png")
+    grab(root, "panel_05_验证码.png")
 
     # ⑥ 同步完（账号 + 图表 + 设备）
     w._entry.insert(0, "a1b2")
     w._submit()
     T.pump(root, 8.0, lambda: "账号状态" in " ".join(T.texts_of(w.win)))
     T.pump(root, 0.5)
-    grab(w.win, "panel_06_同步后.png")
-    w.close()
+    grab(root, "panel_06_同步后.png")
+    T.close_panel(w)
 
     root.destroy()
     print("完成，输出目录: %s" % OUT)

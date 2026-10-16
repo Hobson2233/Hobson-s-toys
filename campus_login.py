@@ -3855,6 +3855,36 @@ HELP_TEXT = (("校园网自动登录 —— 使用说明（v%s）\n" % VERSION) 
   以后开机自动联网，不用再管。
 
 
+【整个程序只有一个窗口】
+
+  左边竖着一排入口：设置 / 账号中心 / 使用说明。点一下就换页，不用为每个功能
+  各开一个窗口 —— 想同时看好几样，来回点也不会满屏都是窗口。当前在哪一页，
+  那一行就是蓝底。
+
+  · 设置      就是这一页：账号、开机自启、隐私、网络状态。
+  · 账号中心  「你有账号的那所学校（郑航）」的账号情况，见下一节。
+               学校没有自助服务时这一项不出现。
+  · 使用说明  你现在看的这份。
+
+
+【账号中心（郑航）】
+
+  查你自己账号的情况：账号状态、是不是停机了、套餐、余额、在线设备、每天用了
+  多少流量（柱状图），以及「上网详单」（每次上网的起止时间、时长、上行、下行、
+  断开原因）。
+
+  点右上角「同步数据」才需要登录学校自助服务 —— 要照着图输一次 4 个字符的
+  验证码。登进去之后会顺手把「每天流量」攒在本机，以后不登录也能翻历史。
+
+  ⚠️ 三件事说在前头：
+    · 数据是**只读**的。本程序不发任何改动的请求（不踢设备下线、不解绑、
+      不缴费、不改密码）。充值、办套餐这类涉及付款的事会**跳到你学校自己的
+      网页**去办，本程序不代办。
+    · 「上网详单」和「停机状态」每次都从学校现取，不留在本机；只有每天流量
+      那几个数字会攒在本机（按账号分开）。想清掉点「清掉本机历史」。
+    · 窗口够宽时卡片会自动分成两列，不用一路往下滚。
+
+
 【换学校】
 
   点「账号信息」那行右边的「学校」下拉框就能换。目前内置两所：
@@ -4278,6 +4308,18 @@ def pwd_wiring_check(field, loaded=None):
 
 OUTER_PAD = 14      # 最外层留白
 INNER_PAD = 14      # 卡片内留白
+
+# ---- 「一个窗口、多个页面」的骨架（2026-10-16） ----
+# 🔴 用户原话：「如果咱们软件每加一个新功能就要加一个窗口，那用户同时看好几个
+#    功能不就全屏都是窗口了」—— 所以主窗口从「一屏设置」改成
+#    **左侧导航 + 右侧内容**，功能都在同一个窗口里进出。
+#
+# 为什么导航放**左边**而不是做成顶部标签：
+#    竖向空间是本项目最紧的资源（内容 827px / 上限 906px，`content_h_probe.py`
+#    量过），横向却很富裕（窗口在 1707 宽的屏上只占 1050）。标签栏要吃掉
+#    ~40px 高，侧边栏只吃横向 —— 花在横向上才是划算的那一边。
+NAV_W = 168         # 导航栏宽度（含它自己那张圆角面板）
+NAV_GAP = 16        # 导航栏与内容区之间的缝
 # 0.3.6 起改成 0。它原本记的是「给标题栏/边框留的余量」，但 Tk 的
 # `geometry("WxH")` 里的 H **就是客户区高度、不含标题栏**（实测：
 # 传 851 → winfo_height()=851、holder 实际也拿到 851-28=823）。
@@ -4293,15 +4335,29 @@ SCREEN_MARGIN_H = 80    # 给任务栏 + 标题栏留的余量
 # 就会一路顶到屏幕边。按下限和上限同时收口，窗口才是「跟着屏幕走」的。
 SCREEN_H_RATIO = 0.85
 MIN_H = 560         # 再矮也不小于这个（低于它就一定挂滚动条了）
+# 最小宽度 = 内容区最少 700px + 导航栏那一块。
+# ⚠️ 700 是**内容区**的最小值（设置页里有 wraplength 680/700 的说明文字，
+#    再窄就会被静默裁掉），加上导航栏和缝才是窗口的最小宽度。
+MIN_W = 700 + NAV_W + NAV_GAP
 
 
 def window_geometry(sw, sh, reqh):
     """按屏幕尺寸和内容需要的高度算窗口几何，返回 (w, h, x, y)。
 
-    **宽度只按屏幕算**，跟内容想要多宽无关（内容宽度由下面 820 的下限兜住）。
+    **宽度只按屏幕算**，跟内容想要多宽无关（内容宽度由下面 1000 的下限兜住）。
     原来签名里还有个 `reqw` 参数，但全仓没有任何调用点传它、函数体里也从不使用
     —— 一个"看起来会让宽度自适应内容、实际完全不影响"的死参数，只会误导人，
     已经删掉。真要按内容调宽度，得先有调用点传 `winfo_reqwidth()` 再说。
+
+    🔴 **0.4.0 起宽度明显变宽**（820 → 1000..1320）。原因：主窗口改成了
+       「左侧导航 + 右侧内容」，导航要占掉 `NAV_W`(168) + `NAV_GAP`(16) ——
+       不把窗口加宽的话，右侧内容会从原来的 ~792 掉到 ~608，
+       设置页里 `wraplength=680` 那几行说明文字会全部提前折行、卡片高度跟着变，
+       `geometry_test.CONTENT_H` 那套标定全部作废。
+       加宽之后右侧内容 ≈ 1050-168-16-28 ≈ 838，比原来还宽一点，
+       所以竖向高度**一个像素都没变**（这条有 `content_h_probe.py` 复核）。
+       比例取 0.62 而不是 0.44：0.44 在 1707 宽的屏上算出 751，被 820 的下限
+       兜住 —— 那说明这个比例早就没在起作用了，一直是下限在定宽度。
 
     **高度必须按屏幕收口。** 原来的写法只把高度限制在 560..1000，完全没看屏幕多高 ——
     在 1366x768、或者 1080p 开了 150% 缩放（虚拟化后只剩 720 高）这类屏幕上，
@@ -4324,9 +4380,14 @@ def window_geometry(sw, sh, reqh):
     # 比例上限和绝对上限取更严的：大屏上比例生效，小屏上 sh-80 生效。
     ratio_h = int(sh * SCREEN_H_RATIO) if sh > 0 else max_h
 
-    w = max(820, min(1180, int(sw * 0.44)))
+    w = max(1000, min(1320, int(sw * 0.68)))
     h = max(MIN_H, min(ratio_h, max_h, reqh + EXTRA_H))
     w = min(w, max_w)
+    # 🔴 也不能太「贴边」：1024 宽的屏上 0.68 只有 696，会被 1000 的下限拉到 1000，
+    #    那就是屏幕的 98%，左右几乎没余量、看着像全屏。所以再按屏幕比例收一道。
+    #    ⚠️ 收下来之后右侧内容可能不够宽 —— 那没关系，正文会**自动退回单列**
+    #    （判据见 `SelfServiceWindow.MIN_2COL_W`），不是裁掉。
+    w = min(w, int(sw * 0.86))
     h = min(h, max_h)          # 屏幕装不下就按屏幕来，宁可小也不要跑出屏幕
 
     x = max(0, (sw - w) // 2)
@@ -4335,8 +4396,15 @@ def window_geometry(sw, sh, reqh):
 
 
 def minsize_for(sw, sh):
-    """最小尺寸同样要按屏幕收口，否则小屏幕上用户连缩都缩不动。"""
-    return (min(700, max(360, sw - 40)),
+    """最小尺寸同样要按屏幕收口，否则小屏幕上用户连缩都缩不动。
+
+    🔴 2026-10-16：**最小宽度从 700 涨到 700 + 导航栏**。加了左侧导航之后，
+       700 宽的窗口只剩约 500 给内容区 —— 而设置页里有几行说明文字的
+       `wraplength` 是 680/700（`warn_auto`、`self.msg`）。Label 的
+       `create_window` 是按**自己要求**的尺寸摆的，比容器宽就直接被裁掉，
+       **不报任何错**。所以最小宽度得把导航栏那 184px 一起算进去。
+    """
+    return (min(MIN_W, max(360, sw - 40), int(sw * 0.86)),
             min(520, max(320, sh - SCREEN_MARGIN_H)))
 
 
@@ -5024,6 +5092,83 @@ def round_chip(parent, tk, text, font, fg, soft, page=CARD, pad_x=9,
     return cv
 
 
+def nav_button(parent, tk, text, icon, font, command, width, height=38,
+               fg=SUB, active_fg=BLUE_DARK, active_fill=BLUE_SOFT, page=BG,
+               hover="#eef2f7"):
+    """左侧导航栏里的一项：**左边图标 + 右边一行字**，整条可点。
+
+    🔴 为什么不直接用 `round_chip`（导航项和它长得像）：
+        `round_chip` 的宽度是**按文字量出来的**、文字还是**居中**的。
+        导航项要的恰好是相反的三件事 —— 宽度固定、文字左对齐、图标在最左。
+        拿 chip 拼出来的导航会是一排宽窄不一、字都居中的小标签，
+        看着就是「没做完」。所以这里单独写一个。
+
+    🔴 **故意不挂 `_rb_bg`**（`round_chip` / `round_button` 都挂了）：
+        未选中的导航项**本来就是透明的**（露出底下那张白面板），
+        这是标签页的通用画法，不是「按钮和背景同色」那种缺陷。
+        挂上去会被 `ui_contrast_check` 判成「按钮隐形」而误报 ——
+        而那个自检是**硬拦构建**的（UI_FAIL_PHRASE）。宁可少查一项，
+        也不能让一条会误报的自检天天挡发布。
+        选中态靠 `set_active(True)` 的浅蓝底区分，这一条由
+        `selfwin_test.py` 的导航段单独钉着。
+
+    ⚠️ 图标名不认识时**当场抛异常**，不静默画空白：
+        `_draw_icon` 对不认识的名字返回 0（什么都不画），
+        那种失败在截图上就是「这个导航项没有图标」，很容易被当成设计如此。
+
+    返回的 Canvas 上挂了（和 round_chip / round_button 对齐，测试能一视同仁）：
+        `invoke()`          —— 直接「点」一下
+        `set_active(bool)`  —— 切选中态
+        `_rb_text`          —— 文字（Canvas 的 create_text 内容查不出来）
+    """
+    if icon not in _ICON_SHAPES:
+        raise ValueError(
+            "nav_button: 图标 %r 不在 _ICON_SHAPES 里（界面上会变成一块空白，"
+            "而且不报任何错）。现有图标：%s"
+            % (icon, ", ".join(sorted(_ICON_SHAPES))))
+    st = {"text": text, "active": False, "hovering": False, "state": "normal"}
+
+    cv = tk.Canvas(parent, width=width, height=height, bg=page,
+                   highlightthickness=0, bd=0, cursor="hand2")
+
+    def redraw(_e=None):
+        try:
+            cv.delete("all")
+        except Exception:
+            return                              # 控件正在被销毁
+        on = st["active"]
+        col = active_fg if on else fg
+        if on:
+            bg = active_fill
+        else:
+            bg = hover if st["hovering"] else None
+        if bg:
+            _draw_round_rect(cv, 0, 0, width, height, 9, bg)
+        _draw_icon(cv, icon, col, 20, height / 2.0, 15.0)
+        cv.create_text(38, height / 2.0, text=st["text"], font=font,
+                       fill=col, anchor="w")
+        cv._rb_text = st["text"]
+
+    def _click(_e=None):
+        if st["state"] != "disabled":
+            command()
+
+    cv.bind("<Button-1>", _click)
+    cv.bind("<Enter>", lambda e: (st.update(hovering=True), redraw()))
+    cv.bind("<Leave>", lambda e: (st.update(hovering=False), redraw()))
+    # 和 round_chip / round_button 同名同义：测试点导航项不用另记一套写法。
+    cv.invoke = _click
+
+    def set_active(on):
+        st["active"] = bool(on)
+        redraw()
+
+    cv.set_active = set_active
+    cv.is_active = lambda: st["active"]
+    redraw()
+    return cv
+
+
 def round_check(parent, tk, text, var, command, font, page=CARD, fg=FG,
                 box=18, radius=5, gap=9, pad_y=3, disabled_fg="#a3adbb"):
     """圆角复选框：Canvas 画的圆角方框 + 对勾，右边跟一句说明文字。返回外层 Frame。
@@ -5520,7 +5665,7 @@ def _ui_font(root, tkfont):
     return fam, base
 
 
-def text_panel(parent, tk, fam, base, text):
+def text_panel(parent, tk, fam, base, text, pad=OUTER_PAD):
     """在 `parent` 里搭一块「可滚动、可复制」的只读长文本区。返回 (外框, Text)。
 
     🔴 这是**唯一实现**（2026-10-05 收敛）。
@@ -5532,6 +5677,10 @@ def text_panel(parent, tk, fam, base, text):
 
     `parent` 必须是**已经建好的窗口或 Toplevel** —— 本函数不建窗口，
     也不进 mainloop（调用方自己决定怎么跑）。
+
+    ⚠️ `pad` 是四周留白。独立的说明窗口用默认值（`OUTER_PAD`）；
+       而嵌进主窗口内容区当**一页**用时传 `pad=0` ——
+       外层已经给过留白了，再加一层会和其他页差 14px，切页时内容会跳。
     """
     # 正文区：圆角卡片（`stretch=True` —— 它要跟着窗口长大，不是跟着内容）。
     # ⚠️ 滚动条**放在卡片外面**（兄弟节点，坐在灰底上）：
@@ -5539,7 +5688,7 @@ def text_panel(parent, tk, fam, base, text):
     #    它那条直边会一直顶到卡片圆角上，看着就是「圆角破了」。
     #    挪出去之后它坐在页面底色上，谁也不碍着谁。
     wrap = tk.Frame(parent, bg=BG)
-    wrap.pack(fill="both", expand=True, padx=OUTER_PAD, pady=(OUTER_PAD, 0))
+    wrap.pack(fill="both", expand=True, padx=pad, pady=(pad, 0))
     sb = tk.Scrollbar(wrap)
     sb.pack(side="right", fill="y", padx=(8, 0))
     body_cv, body = round_panel(wrap, tk, 15, 13, 12, stretch=True)
@@ -5556,12 +5705,17 @@ def text_panel(parent, tk, fam, base, text):
     return wrap, txt
 
 
-def text_panel_bar(parent, tk, fam, base, command):
-    """长文本窗口底部那条「知道了」按钮栏（和 `text_panel` 配套）。"""
+def text_panel_bar(parent, tk, fam, base, command, label="知道了",
+                   pad=OUTER_PAD):
+    """长文本窗口底部那条按钮栏（和 `text_panel` 配套）。
+
+    ⚠️ 当**一页**用时按钮文字要改成「返回设置」而不是「知道了」——
+       「知道了」是弹窗的说法，嵌在页面里会让人以为要关掉什么。
+    """
     bar = tk.Frame(parent, bg=BG)
-    bar.pack(fill="x", padx=OUTER_PAD, pady=OUTER_PAD)
+    bar.pack(fill="x", padx=pad, pady=pad)
     h = base * 2 + 16
-    round_button(bar, "知道了", command, (fam, base),
+    round_button(bar, label, command, (fam, base),
                  bg=BLUE, fg="#ffffff", hover=BLUE_DARK, active="#1e40af",
                  parent_bg=BG, height=h, radius=pill_radius(h)
                  ).pack(side="right")
@@ -5686,19 +5840,32 @@ class SelfServiceWindow(object):
 
     🔴 三条硬要求（从上一版继承）：
 
-      1. **独立 Toplevel + 自带 worker 线程和自己的队列** —— 不走
+      1. **自带 worker 线程和自己的队列** —— 不走
          `LoginApp.state["queue"]`：那条队列的消息类型是给主窗口用的，
          塞新类型进去要改 `handle_msg`，改动面和风险都大得多。
       2. **网络请求绝不跑在 Tk 主线程**（会卡界面）。tkinter 也不是线程安全的，
          所以子线程**只往队列里放结果**，界面一律由 `after()` 轮询着改。
       3. 🔴 **cookie 只在内存**（`self_service.py` 里就是这么写的）——
-         窗口一关会话就结束。这是**故意**的：会话 cookie 等价于一次登录态。
+         面板一销毁会话就结束。这是**故意**的：会话 cookie 等价于一次登录态。
+
+    🔴 **2026-10-16：从「独立窗口」改成「主窗口里的一页」（`host=`）。**
+       用户原话：「每加一个新功能就要加一个窗口，那用户同时看好几个功能
+       不就全屏都是窗口了」。所以**没有 Toplevel 了** ——
+       `host` 是主窗口内容区里的一块 Frame，本类把界面搭进去。
+       ⚠️ 改成嵌入之后有三处跟着变，每一处漏掉都是静默故障：
+         · `_autosize()` 不再设几何 —— 尺寸由主窗口说了算，
+           再 `geometry()` 只会把主窗口拽变形；
+         · 正文宽度**要现场量**（`_body_w()`），不能再拿常量 `PANEL_W` 算，
+           因为主窗口可以被用户拖动改宽；
+         · 「关闭」按钮不画了 —— 退出这一页靠左边的导航栏，
+           画一个「关闭」只会让人以为会关掉整个程序。
 
     ⚠️ 一处**行为变化**：`_draw_data` 以前是「把整屏换成数据」，现在数据只是
        面板的一部分 —— 没有数据时（没同步过）只画图表卡（可能有本地历史）。
     """
 
-    def __init__(self, root, tk, fam, base, account, password, base_url):
+    def __init__(self, root, tk, fam, base, account, password, base_url,
+                 host=None):
         self.root = root
         self.tk = tk
         self.fam = fam
@@ -5716,6 +5883,23 @@ class SelfServiceWindow(object):
         self.q = queue.Queue()
         self.tries = 0            # 已发出的登录请求次数（防锁号闸门）
         self.closed = False
+        # 嵌入模式：`host` 非空 ⇒ 界面搭进那块 Frame，不建 Toplevel。
+        # 🔴 这个标志决定了好几处分支（几何 / 关闭按钮 / 留白），别在别处
+        #    用「`self.win` 是不是 Toplevel」去猜 —— 以后加一种容器就全错。
+        self.embedded = host is not None
+        # 正文宽度（列宽 / wraplength 的唯一来源）。先给单列时代的默认值兜底，
+        # `_render()` 第一句就按实际宽度重算。
+        self.cw = CHART_W
+        # 分列状态：`cols` 非空 = 正文分成了几列，`col_i` = 下一张卡放哪一列。
+        self.cols = []
+        self.col_i = 0
+        self._laid_w = -1         # 上次排版时量到的正文宽度（防重复重排）
+        self._relayout_job = None
+        # 🔴 屏上是不是**临时视图**（忙碌提示 / 验证码 / 失败提示）。
+        #    这些视图不是从 `_render()` 画的，所以「因为窗口宽度变了而重排」
+        #    会把它们冲掉 —— 用户正低头看验证码图，界面自己变回数据页，
+        #    而且**一个字都不提示**。见 `_relayout`。
+        self.view_locked = False
         # 🔴 验证码图片**必须留引用**（存成属性）—— 只放在局部变量里会被 GC 掉，
         #    症状是 Label 一片空白，而且**不报任何错**。这是 tkinter 的经典坑。
         self._cap_small = None
@@ -5749,24 +5933,38 @@ class SelfServiceWindow(object):
         # 上一次操作的结果提示（同步完了 / 清完了），画在正文末尾
         self.note = ""
 
-        self.win = tk.Toplevel(root)
-        self.win.title("账号中心 · %s · %s" % (account, APP_TITLE))
-        # 窗口底色 = **页面底色**（不是卡片底色）—— 正文是圆角卡片，
-        # 同色的话圆角就看不出来了。和 show_help 同一个理由。
+        # 嵌入模式下外层页面已经给过留白了，这里不再叠加 ——
+        # 否则从「设置」页切过来时内容会整体跳 14px。
+        pad = 0 if self.embedded else OUTER_PAD
+
+        if self.embedded:
+            # 一页，不是一窗。**没有 title/transient/iconbitmap/protocol** ——
+            # 那些都是 Toplevel 才有的东西，Frame 上调会 AttributeError。
+            # ⚠️ Frame 必须**自己 pack**：Toplevel 建出来就自动显示，
+            #    Frame 不 pack 的话宽度永远是 1 —— 而 `_body_w()` 量到的就是它，
+            #    于是排版永远走「量不到、用兜底值」那条路（两列失效、换行宽度错），
+            #    并且**不报任何错**。
+            self.win = tk.Frame(host, bg=BG)
+            self.win.pack(fill="both", expand=True)
+        else:
+            self.win = tk.Toplevel(root)
+            self.win.title("账号中心 · %s · %s" % (account, APP_TITLE))
+            # 窗口底色 = **页面底色**（不是卡片底色）—— 正文是圆角卡片，
+            # 同色的话圆角就看不出来了。
+            self.win.transient(root)          # 跟随主窗口，不单独占任务栏项
+            self.win.resizable(False, False)  # 尺寸由内容算（见 _autosize）
+            ico = icon_path()
+            if ico:
+                try:
+                    self.win.iconbitmap(default=ico)
+                except Exception:
+                    pass
+            self.win.protocol("WM_DELETE_WINDOW", self.close)
         self.win.configure(bg=BG)
-        self.win.transient(root)          # 跟随主窗口，不单独占任务栏项
-        self.win.resizable(False, False)  # 尺寸由内容算（见 _autosize），别让用户拖着变形
-        ico = icon_path()
-        if ico:
-            try:
-                self.win.iconbitmap(default=ico)
-            except Exception:
-                pass
-        self.win.protocol("WM_DELETE_WINDOW", self.close)
 
         # --- 顶部：标题 + 账号 + 「同步数据」 ---
         self.head = tk.Frame(self.win, bg=BG)
-        self.head.pack(fill="x", padx=OUTER_PAD, pady=(OUTER_PAD, 6))
+        self.head.pack(fill="x", padx=pad, pady=(2 if self.embedded else OUTER_PAD, 6))
         tk.Label(self.head, text="账号中心", bg=BG, fg=FG,
                  font=(fam, base + 4, "bold")).pack(side="left")
         # 🔴 账号**必须显示出来**：这个面板看的是「界面上那个账号」的数据，
@@ -5787,7 +5985,7 @@ class SelfServiceWindow(object):
         # ⚠️ 面板现在有三块（账号 / 图表 / 设备），矮屏上一定放不下，
         #    所以必须能滚 —— 主窗口也是这么做的。
         outer = tk.Frame(self.win, bg=BG)
-        outer.pack(fill="both", expand=True, padx=OUTER_PAD)
+        outer.pack(fill="both", expand=True, padx=pad)
         # 滚动条坐在一个**宽度固定**的列里（`_SCROLL_COL`），不用时只是空着。
         # 这样画布宽度恒定，图表不会被「滚动条出现/消失」挤到裁掉 —— 见常量那边的说明。
         self.scroll_col = tk.Frame(outer, bg=BG, width=_SCROLL_COL)
@@ -5808,18 +6006,25 @@ class SelfServiceWindow(object):
         #    会停在卡片 Canvas 的默认宽度（378px）—— 2026-10-12 实测，
         #    一个月 6 天的柱子**只画出来 4 根**，右边两根直接没了，
         #    而且不报任何错。（和「Canvas 的 reqwidth 不跟内容长」是同一个家族。）
-        self.canvas.bind("<Configure>",
-                         lambda e: self.canvas.itemconfigure(self._holder_id,
-                                                             width=e.width))
+        #
+        # ⚠️ 2026-10-16 起这件事还多了一层：**正文宽度同时是列宽和 wraplength
+        #    的来源**。主窗口能被用户拖动改宽，所以宽度一变，换行位置就过时了 ——
+        #    留在原地的后果是文字被静默裁掉（Label 的 reqwidth 大于列宽时，
+        #    列是固定宽的，多出来的部分直接看不见）。所以这里顺手安排一次重排。
+        self.canvas.bind("<Configure>", self._on_canvas)
 
         # --- 底部 ---
         self.foot = tk.Frame(self.win, bg=BG)
-        self.foot.pack(fill="x", padx=OUTER_PAD, pady=OUTER_PAD)
+        self.foot.pack(fill="x", padx=pad, pady=(6, 0) if self.embedded
+                       else OUTER_PAD)
         h = base * 2 + 16
-        round_button(self.foot, "关闭", self.close, (fam, base),
-                     bg="#dbe1eb", fg="#475569", hover="#ccd5e3",
-                     active="#bfc9da", parent_bg=BG, height=h,
-                     radius=pill_radius(h)).pack(side="right")
+        # 🔴 嵌入模式下**不画「关闭」**：退出这一页靠左边的导航栏。
+        #    画一个「关闭」会让人以为「关掉整个程序」（主窗口那个 X 才是）。
+        if not self.embedded:
+            round_button(self.foot, "关闭", self.close, (fam, base),
+                         bg="#dbe1eb", fg="#475569", hover="#ccd5e3",
+                         active="#bfc9da", parent_bg=BG, height=h,
+                         radius=pill_radius(h)).pack(side="right")
         # 「清掉本机历史」：**故意和主界面的「清除本机保存的账号密码」分开** ——
         # 那个不删流量历史（用户要的就是「以后不登录也能看」），所以这里给一个
         # 单独的入口，让想删的人删得掉。
@@ -5831,10 +6036,52 @@ class SelfServiceWindow(object):
         self._load_local()
         self._render()
         # ⚠️ 定位只做**这一次**（在第一次渲染之后）—— 放在 `_render()` 里的话，
-        #    每次同步完窗口都会跳一下，很烦。
-        self._place()
+        #    每次同步完窗口都会跳一下，很烦。嵌入模式没有「位置」可摆。
+        if not self.embedded:
+            self._place()
 
     # ------------------------------------------------------------ 窗口
+
+    def _on_canvas(self, e):
+        """画布宽度变了：撑开 holder，必要时**重排一次**。
+
+        ⚠️ 拖动主窗口时 `<Configure>` 会连发几十次，每次都重画会把界面拖卡，
+           所以①宽度差得不够多就跳过；②真的要重排也延后 200ms，
+           等手停下来再做（`_relayout` 里会再量一次当前宽度）。
+        """
+        try:
+            self.canvas.itemconfigure(self._holder_id, width=e.width)
+        except Exception:
+            pass
+        # 🔴 第一次 `<Configure>` 只是**建立基线**，不是「宽度真的变过」。
+        #    拿它去和初始的 -1 比会算出一个巨大的差值，白白安排一次重排 ——
+        #    而那一次重排会把正在显示的**验证码界面整个冲掉**
+        #    （2026-10-16 实测：点「确定」报「验证码不对」之后约 200ms，
+        #      界面自己变回了数据视图，用户以为那个按钮没反应）。
+        if self._laid_w < 0:
+            self._laid_w = e.width
+            return
+        if abs(e.width - self._laid_w) < 24:
+            return
+        if self._relayout_job is not None:
+            try:
+                self.win.after_cancel(self._relayout_job)
+            except Exception:
+                pass
+        self._relayout_job = self.win.after(200, self._relayout)
+
+    def _relayout(self):
+        """按新宽度重画一遍（换行宽度变了，旧的 wraplength 会裁字）。"""
+        self._relayout_job = None
+        if self.closed:
+            return
+        if self.view_locked:
+            # 🔴 现在屏上是**验证码 / 失败提示**这类临时视图。它们不是从
+            #    `_render()` 画出来的，重排会把用户刚敲进去的验证码冲掉。
+            #    把基线复位成 -1：等 `_render()` 下次跑的时候，宽度自然生效。
+            self._laid_w = -1
+            return
+        self._render()
 
     def _on_holder(self, _e=None):
         """正文大小变了 ⇒ 更新滚动范围。
@@ -5868,20 +6115,27 @@ class SelfServiceWindow(object):
         ⚠️ 高度**必须封顶**：内容比屏幕还高时窗口会伸出屏幕外，
           底下的「关闭」按钮就点不到了（而那正是唯一的退出方式）。
           封顶之后正文自己会滚。
+
+        🔴 嵌入模式下**只更新滚动范围，绝不碰几何** ——
+           尺寸是主窗口的，这里再 `geometry()` 会把主窗口拽变形
+           （而且 Frame 根本没有 geometry 方法，会直接抛异常）。
         """
         try:
             self.win.update_idletasks()
-            h = (self.head.winfo_reqheight() + self.foot.winfo_reqheight()
-                 + self.holder.winfo_reqheight() + 3 * OUTER_PAD + 12)
-            limit = int(self.win.winfo_screenheight() * 0.86)
-            h = max(320, min(h, limit))
-            self.win.geometry("%dx%d" % (PANEL_W, h))
+            if not self.embedded:
+                h = (self.head.winfo_reqheight() + self.foot.winfo_reqheight()
+                     + self.holder.winfo_reqheight() + 3 * OUTER_PAD + 12)
+                limit = int(self.win.winfo_screenheight() * 0.86)
+                h = max(320, min(h, limit))
+                self.win.geometry("%dx%d" % (PANEL_W, h))
             self._on_holder()
         except Exception:
             log("账号中心面板定尺寸失败:\n%s" % traceback.format_exc())
 
     def _place(self):
-        """把窗口摆在主窗口附近偏中间的位置。"""
+        """把窗口摆在主窗口附近偏中间的位置（**只在独立窗口模式下有意义**）。"""
+        if self.embedded:
+            return
         try:
             self.win.update_idletasks()
             x = self.root.winfo_rootx() + 40
@@ -5901,14 +6155,23 @@ class SelfServiceWindow(object):
             log("账号中心面板定位失败:\n%s" % traceback.format_exc())
 
     def close(self):
-        """关窗。置 `closed` 之后子线程再往队列里放东西也没人处理了。
+        """收摊。置 `closed` 之后子线程再往队列里放东西也没人处理了。
 
         ⚠️ **不主动清空 `self.svc`** —— 它持有内存里的会话 cookie，
         对象没人引用时跟着被回收，正是我们想要的（不落盘、不显式持久化）。
+
+        ⚠️ 嵌入模式下 `self.win` 是主窗口里的一块 Frame，
+        `destroy()` 只会拆掉这一页的控件，**不会关掉主窗口** —— 这正是要的。
         """
         if self.closed:
             return
         self.closed = True
+        if self._relayout_job is not None:
+            try:
+                self.win.after_cancel(self._relayout_job)
+            except Exception:
+                pass
+            self._relayout_job = None
         try:
             self.win.destroy()
         except Exception:
@@ -6305,19 +6568,106 @@ class SelfServiceWindow(object):
     def _clear(self):
         for w in list(self.body.winfo_children()):
             w.destroy()
+        # 分列状态跟着一起清 —— 列 Frame 刚被 destroy 掉，
+        # 留着引用会让 `_card()` 往一块死控件里塞东西。
+        self.cols = []
+        self.col_i = 0
+        self.colrow = None
+        # 正文宽度先按**单列**重算一遍：验证码 / 失败 / 忙碌这几个临时视图
+        # 只画一张卡，走的就是单列 —— 它们不调 `_start_cols()`，
+        # 不在这里重算的话会用到上一次（可能是半列宽）的旧值，文字被静默裁掉。
+        self.cw = max(200, self._body_w() - 2 * _CARD_PAD_X)
         # 🔴 顺手把 `_entry` 清掉：它指向的控件刚被 destroy 了，留着一个
         #    「已经死掉」的 widget 引用，下次 `.get()` 会抛 TclError。
         #    这类错误只在特定点击顺序下出现（比如验证码界面还没画完就按了回车），
         #    平时测不出来 —— 与其等它偶发，不如在这里断掉。
         self._entry = None
 
+    # ---------------------------------------------------------- 横向排版
+
+    # 两列排版的**宽度门槛**：正文窄于这个数就退回单列。
+    # 🔴 判据不是「窗口多宽」，而是「正文实际拿到多少」—— 窗口宽 ≠ 正文宽
+    #    （左边有导航栏、右边有滚动条列），拿窗口宽度判断会在窄屏上误判。
+    # 阈值怎么来的：单列时图表要 `CHART_W`(500) + 两侧卡片内边距(28) ≈ 528 才不裁；
+    #    两列时每列各拿到 (正文-16)/2，取 760 相当于每列 ~372、卡片内容 ~344 ——
+    #    说明文字折行还好，图表挤成 31 根细柱子但**不会被裁**（宽度是算出来的，
+    #    不是写死的），两列把总高度砍掉近一半，这个交换划算。
+    #    低于 760（每列不到 372）时说明文字会折成很多行，两列反而更难看。
+    MIN_2COL_W = 760
+    COL_GAP = 16              # 两列之间的缝
+
+    def _body_w(self):
+        """量出正文**实际**能用的宽度（像素）。
+
+        ⚠️ 为什么不拿 `PANEL_W` 算：嵌入模式下宽度是主窗口给的，
+           而且用户随时能拖动改宽。写死一个常量 = 换台电脑/拖一下窗口就错。
+        ⚠️ 第一次 `_render()` 时控件还没布局完（宽度是 1），
+           所以 `update_idletasks()` 之后再问；还是问不到就用单列时代的
+           默认宽度兜底 —— 那时下一帧的 `<Configure>` 会触发重排（见 `_on_canvas`）。
+        """
+        try:
+            self.win.update_idletasks()
+        except Exception:
+            pass
+        for wdg, minus in ((self.canvas, 0), (self.win, _SCROLL_COL + 2)):
+            try:
+                v = wdg.winfo_width()
+            except Exception:
+                v = 0
+            if v and v > 10:
+                return max(200, v - minus)
+        return CHART_W + 2 * _CARD_PAD_X        # 兜底：老的单列宽度
+
+    def _start_cols(self):
+        """按正文宽度决定铺几列，并把 `self.cw`（卡片内容宽度）算出来。
+
+        返回列数。`self.cols` 为空 = 单列（卡片直接塞 `self.body`）。
+
+        ⚠️ 两列时外面还要套一层 `self.colrow`（`fill="x"`）——
+           不套的话，两列用 `side="left"`、页脚说明用默认的 `side="top"`，
+           Tk 的 packer 会把页脚排到**两列右边那块空白**里去（先左后上，
+           上边那条是从"剩下的区域"里切），而不是排到它们下面。
+        """
+        avail = self._body_w()
+        n = 2 if avail >= self.MIN_2COL_W else 1
+        self.cols = []
+        self.colrow = None
+        if n > 1:
+            self.colrow = self.tk.Frame(self.body, bg=BG)
+            self.colrow.pack(fill="x")
+            for i in range(n):
+                c = self.tk.Frame(self.colrow, bg=BG)
+                # ⚠️ 必须 `fill="both", expand=True` 且两列**同权**：
+                #    宽度不等的话，`_card()` 里按算出来的列宽设的 wraplength
+                #    就和实际列宽对不上 —— 短的那列文字会被裁，而且不报错。
+                c.pack(side="left", fill="both", expand=True,
+                       padx=(0, self.COL_GAP) if i < n - 1 else 0)
+                self.cols.append(c)
+            colw = (avail - self.COL_GAP * (n - 1)) / float(n)
+        else:
+            colw = avail
+        # 卡片内容是「列宽 - 两侧卡片内边距」，和单列时代的 CHART_W 是同一个算法。
+        self.cw = max(200, int(colw) - 2 * _CARD_PAD_X)
+        self.col_i = 0
+        self._laid_w = avail
+        return n
+
+    def _col(self, i):
+        """下一张卡放进第 i 列。"""
+        self.col_i = i
+
     def _card(self, title):
-        """一张圆角卡片，返回往里塞控件的 Frame。"""
+        """一张圆角卡片，返回往里塞控件的 Frame。
+
+        ⚠️ 卡片的**父容器**是「当前这一列」（`self.cols` 为空时就是正文本身）——
+           标题 Label 也必须跟着进同一列，不然标题会跑到正文最上面去。
+        """
+        parent = self.cols[self.col_i] if self.cols else self.body
         if title:
-            self.tk.Label(self.body, text=title, bg=BG, fg=SUB,
+            self.tk.Label(parent, text=title, bg=BG, fg=SUB,
                           font=(self.fam, self.base - 1)
                           ).pack(anchor="w", pady=(8, 4))
-        cv, inner = round_panel(self.body, self.tk, _CARD_PAD_X, 12, 11)
+        cv, inner = round_panel(parent, self.tk, _CARD_PAD_X, 12, 11)
         cv.pack(fill="x")
         return inner
 
@@ -6347,6 +6697,7 @@ class SelfServiceWindow(object):
 
     def _busy_note(self, text):
         """把正文换成一句「正在…」。**只用在同步过程中**（那时没有别的东西可看）。"""
+        self.view_locked = True
         self._clear()
         inner = self._card(None)
         self.tk.Label(inner, text=text, bg=CARD, fg=SUB,
@@ -6371,30 +6722,80 @@ class SelfServiceWindow(object):
             log("账号中心面板按钮状态失败:\n%s" % traceback.format_exc())
 
     def _render(self):
-        """按当前状态把整个面板重画一遍。**所有界面改动只从主线程调这里。**"""
+        """按当前状态把整个面板重画一遍。**所有界面改动只从主线程调这里。**
+
+        🔴 顺序不能换：**先定列（列数 + `self.cw`），再画卡片**。
+           卡片的 `wraplength`、图表画布宽度全是从 `self.cw` 推出来的，
+           反过来会用到上一次的宽度 —— 那种错只在「窗口宽度变过」时出现，
+           表现是文字被静默裁掉。
+        """
         if self.closed:
             return
+        self.view_locked = False      # 数据视图：可以让重排自由重画
         self._set_sync_button()
         self._clear()
-        if self.data is not None:
-            self._card_account(self.data)
-        self._card_flow()
-        # 详单排在图表后面：读的顺序是「概要 → 趋势 → 明细 → 当前」。
-        if self.data is not None:
-            self._card_bill(self.data)
-        if self.data is not None:
-            self._card_devices(self.data.get("devices") or [])
-            # --- A 档第二批（2026-10-16 加）---
-            # 顺序：资料 → 钱 → 能买什么。都排在「当前状态」之后 ——
-            # 它们是**备查**用的，日常看一眼的是上面的状态和图表。
-            self._card_profile(self.data)
-            self._card_fee(self.data)
-            self._card_buspkg(self.data)
-        # C 档 + 官方文件：**不需要会话**，所以放在 `if self.data` 外面 ——
-        # 没同步过也能用（那几张只读卡没数据时是空的，但这张一直有用）。
-        self._card_links()
+        ncol = self._start_cols()
+        if ncol < 2:
+            order = [(0, k) for k in self._ONE]
+        else:
+            order = ([(0, k) for k in self._LEFT]
+                     + [(1, k) for k in self._RIGHT])
+        for col, key in order:
+            if not self._has_card(key):
+                continue
+            self._col(col)
+            self._card_call(key)()
         self._foot_note()
         self._autosize()
+
+    # ---- 卡片清单：**新增一张卡要改这里三处**，漏了会静默少一张卡 ----
+    # （`_LEFT` / `_RIGHT` 决定宽屏时放哪列，`_ONE` 决定窄屏时的先后，
+    #   `_card_call` 把名字接到真正的画卡函数上。）
+    #
+    # 为什么分成这两组（不是随便对半砍）：
+    #   左列 = 「我这个账号」—— 状态、流量趋势、账号资料。
+    #          这几张是**关于账号本身**的，看的时候是一件事。
+    #   右列 = 「我在用它」—— 谁在线、用了哪些会话、花了多少钱、能买什么、
+    #          要办事去哪。这几张是**关于使用过程**的，而且会随数据长短差很多。
+    # 高度上两列也大致相当（实测左 ≈1195 / 右 ≈1255，见 `selfwin_test.py`
+    # 的两列平衡断言）—— 差太多的话短的那列底下会空一大块。
+    # ⚠️ 「可购套餐」原本在左列，2026-10-16 截图之后挪到了右列：它在那组里
+    #    排在最后、又是最短的一张，左列整个就比右列多了 160px 的空白。
+    _LEFT = ("account", "flow", "profile")
+    _RIGHT = ("devices", "bill", "fee", "buspkg", "links")
+    # 单列（窄屏）时的顺序 —— 就是加两列之前那个顺序：
+    # 概要 → 趋势 → 明细 → 当前 → 备查 → 链接。
+    _ONE = ("account", "flow", "bill", "devices", "profile", "fee", "buspkg",
+            "links")
+    # 哪几张卡需要「同步过一次」。不需要的只有两张：流量图表（读本机历史）
+    # 和「去学校网页办」（就是几个网址）—— 没同步过也要画，否则面板是个空壳。
+    _NEEDS_DATA = ("account", "bill", "devices", "profile", "fee", "buspkg")
+
+    def _has_card(self, key):
+        return not (key in self._NEEDS_DATA and self.data is None)
+
+    def _card_call(self, key):
+        """把卡片名接到画卡函数上。
+
+        ⚠️ 用 `raise` 而不是静默返回：名字写错时**必须当场炸**。
+           返回一个空操作的话，界面上只是少一张卡，没有任何报错 ——
+           正是本项目最忌讳的那种失败。
+        """
+        d = self.data
+        table = {
+            "account": lambda: self._card_account(d),
+            "flow": self._card_flow,
+            "bill": lambda: self._card_bill(d),
+            "devices": lambda: self._card_devices(d.get("devices") or []),
+            "profile": lambda: self._card_profile(d),
+            "fee": lambda: self._card_fee(d),
+            "buspkg": lambda: self._card_buspkg(d),
+            "links": self._card_links,
+        }
+        if key not in table:
+            raise ValueError("_card_call: 不认识的卡片名 %r（会静默少一张卡）"
+                             % (key,))
+        return table[key]
 
     def _foot_note(self):
         days = self_history.days_of(self.store, self.account)
@@ -6415,11 +6816,11 @@ class SelfServiceWindow(object):
                     "这几项这次是空的，不代表「没有」。"
                     % self.data["center_error"])
         self.tk.Label(self.body, text=txt, bg=BG, fg=SUB, justify="left",
-                      wraplength=CHART_W, font=(self.fam, self.base - 2)
+                      wraplength=self.cw, font=(self.fam, self.base - 2)
                       ).pack(anchor="w", pady=(8, 0))
         if getattr(self, "note", ""):
             self.tk.Label(self.body, text=self.note, bg=BG, fg=BLUE_DARK,
-                          justify="left", wraplength=CHART_W,
+                          justify="left", wraplength=self.cw,
                           font=(self.fam, self.base - 2)).pack(anchor="w", pady=(2, 0))
 
     # ------------------------------------------------------------ 账号卡
@@ -6449,7 +6850,7 @@ class SelfServiceWindow(object):
                 extra.append("时间：%s" % st["date"])
             if extra:
                 self.tk.Label(inner, text="　".join(extra), bg=CARD, fg=SUB,
-                              justify="left", wraplength=CHART_W - 20,
+                              justify="left", wraplength=self.cw - 20,
                               font=(self.fam, self.base - 2)).pack(anchor="w")
 
             # --- 停机 / 复机按钮（B 档，2026-10-16 加）---
@@ -6573,7 +6974,7 @@ class SelfServiceWindow(object):
                       text="（口径：只统计生成了记录的会话。和账号卡里"
                            "「学校记录：累计」不是同一个数 —— 两个都对。）",
                       bg=CARD, fg=SUB, justify="left",
-                      wraplength=CHART_W - 20,
+                      wraplength=self.cw - 20,
                       font=(self.fam, self.base - 3)).pack(anchor="w", pady=(3, 0))
         if tot and got and tot != got:
             self.tk.Label(inner, text="⚠️ 服务端共 %d 次，只取回 %d 次"
@@ -6603,7 +7004,7 @@ class SelfServiceWindow(object):
                                   self_service.fmt_flow(x.get("down")),
                                   x.get("cause") or ""),
                           bg=CARD, fg=SUB, justify="left",
-                          wraplength=CHART_W - 20,
+                          wraplength=self.cw - 20,
                           font=(self.fam, self.base - 2)).pack(anchor="w")
         if len(ss) > len(show):
             self.tk.Label(inner, text="（共 %d 次，这里只列最近 %d 次）"
@@ -6642,7 +7043,7 @@ class SelfServiceWindow(object):
             #    而猜它的含义（1=电脑 2=手机…）就是编 —— 两条都不能要。
             #    ⚠️ 数据层**仍然保留**这个字段（白名单里），只是界面不用。
             self.tk.Label(inner, text="　".join(extra), bg=CARD, fg=SUB,
-                          justify="left", wraplength=CHART_W - 20,
+                          justify="left", wraplength=self.cw - 20,
                           font=(self.fam, self.base - 2)).pack(anchor="w")
             # --- 「下线这台」按钮（B 档，2026-10-16 加）---
             # 🔴 只在有会话时才画（`_can_act`）。点了会二次确认 + 现取一次
@@ -6749,7 +7150,7 @@ class SelfServiceWindow(object):
                           text="（学校用这几项判断账号有没有被多人共享上网；"
                                "检测到会限制或停机。）",
                           bg=CARD, fg=SUB, justify="left",
-                          wraplength=CHART_W - 20,
+                          wraplength=self.cw - 20,
                           font=(self.fam, self.base - 3)
                           ).pack(anchor="w", pady=(3, 0))
 
@@ -6784,7 +7185,7 @@ class SelfServiceWindow(object):
                 if x.get("os"):
                     line += "　" + x["os"]
                 self.tk.Label(inner, text=line, bg=CARD, fg=FG, justify="left",
-                              wraplength=CHART_W - 20,
+                              wraplength=self.cw - 20,
                               font=(self.fam, self.base - 1)
                               ).pack(anchor="w", pady=(2, 0))
                 # --- 「解绑」按钮（B 档，2026-10-16 加）---
@@ -6904,7 +7305,7 @@ class SelfServiceWindow(object):
                           text="（要办套餐请到学校自助服务网页 —— 涉及付款，"
                                "本软件不代办。）",
                           bg=CARD, fg=SUB, justify="left",
-                          wraplength=CHART_W - 20,
+                          wraplength=self.cw - 20,
                           font=(self.fam, self.base - 2)
                           ).pack(anchor="w", pady=(3, 0))
             return
@@ -6965,7 +7366,7 @@ class SelfServiceWindow(object):
         f = self.tk.Frame(parent, bg=CARD)
         f.pack(fill="x", pady=2)
         self.tk.Label(f, text=label, bg=CARD, fg=FG, justify="left",
-                      wraplength=CHART_W - 96,
+                      wraplength=self.cw - 96,
                       font=(self.fam, self.base - 1)).pack(side="left")
         h = self.base * 2 + 6
         round_chip(f, self.tk, "打开", (self.fam, self.base - 2), BLUE_DARK,
@@ -6988,7 +7389,7 @@ class SelfServiceWindow(object):
                            "网页。\n（浏览器里要再登录一次；登录后如果没直接跳到"
                            "那一页，在左边菜单里找一下。）",
                       bg=CARD, fg=SUB, justify="left",
-                      wraplength=CHART_W - 20,
+                      wraplength=self.cw - 20,
                       font=(self.fam, self.base - 2)).pack(anchor="w")
         for label, route in self.SELF_LINKS:
             self._link_row(inner, label, "%s/self/index.html#/%s"
@@ -7024,11 +7425,11 @@ class SelfServiceWindow(object):
 
         if not days:
             cv = self.tk.Canvas(inner, bg=CARD, highlightthickness=0, bd=0,
-                                width=CHART_W, height=110)
+                                width=self.cw, height=110)
             cv.pack(fill="x")
-            cv.create_text(CHART_W / 2, 50, text="（本机还没有流量数据）",
+            cv.create_text(self.cw / 2, 50, text="（本机还没有流量数据）",
                            fill=SUB, font=(self.fam, self.base))
-            cv.create_text(CHART_W / 2, 74,
+            cv.create_text(self.cw / 2, 74,
                            text="点右上角「同步数据」读一次，以后不登录也能看",
                            fill=SUB, font=(self.fam, self.base - 2))
             return
@@ -7093,20 +7494,20 @@ class SelfServiceWindow(object):
 
         ⚠️ 三条「不这么写就会难看/看不懂」的规矩：
 
-          1. **柱顶数值标签要自动避让。** 一个月最多 31 根柱子，`CHART_W`
-             放不下 31 个「12.34 GB」。所以按可用间距决定「每隔几根标一个」，
-             但**最高的那根永远标** —— 那是用户最想看的一个数。
+          1. **柱顶数值标签要自动避让。** 一个月最多 31 根柱子，卡片宽度
+             （`self.cw`）放不下 31 个「12.34 GB」。所以按可用间距决定
+             「每隔几根标一个」，但**最高的那根永远标** —— 那是用户最想看的一个数。
           2. **日期刻度同理**，挤不下就隔几根标一个。
           3. **`None` 不是 0。** 服务端没给某天就是没这根柱子（画成空位），
              而「确实用了 0」要画成一根 0 高度的柱子。两者不能混
              （`self_history` 那边已经把 `None` 保住了，这里别把它当 0）。
         """
         cv = self.tk.Canvas(parent, bg=CARD, highlightthickness=0, bd=0,
-                            width=CHART_W, height=CHART_H + 30)
+                            width=self.cw, height=CHART_H + 30)
         cv.pack(fill="x")
         n = len(bars)
         if not n:
-            cv.create_text(CHART_W / 2, CHART_H / 2, text="这个月没有数据",
+            cv.create_text(self.cw / 2, CHART_H / 2, text="这个月没有数据",
                            fill=SUB, font=(self.fam, self.base - 1))
             return
 
@@ -7114,14 +7515,14 @@ class SelfServiceWindow(object):
         base_y = CHART_H                  # x 轴（柱子从这里往上长）
         plot_h = base_y - top_pad
         vmax = max(float(b["value"] or 0.0) for b in bars) or 1.0
-        slot = float(CHART_W) / n
+        slot = float(self.cw) / n
         # 柱宽：跟着间距走，但**上下都夹住** ——
         # 下限 4px（一个月 31 根时还能看见），上限 44px
         # （只画 2 个月时不然会变成两根巨大的色块）。
         bw = max(4.0, min(44.0, slot * 0.56))
 
         # x 轴
-        cv.create_line(0, base_y, CHART_W, base_y, fill=LINE)
+        cv.create_line(0, base_y, self.cw, base_y, fill=LINE)
 
         # 日均线（虚线）。**它算的是「本图这几根柱子」的平均**，
         # 和下面汇总里那个「日均」是**同一个口径**（2026-10-12 实测发现：
@@ -7131,8 +7532,8 @@ class SelfServiceWindow(object):
         avg = total / n
         if avg > 0:
             ay = base_y - plot_h * (avg / vmax)
-            cv.create_line(0, ay, CHART_W, ay, fill="#c7d2fe", dash=(4, 3))
-            cv.create_text(CHART_W - 2, ay - 7, anchor="e",
+            cv.create_line(0, ay, self.cw, ay, fill="#c7d2fe", dash=(4, 3))
+            cv.create_text(self.cw - 2, ay - 7, anchor="e",
                            text="日均 %s" % self_service.fmt_flow_short(avg),
                            fill=SUB, font=(self.fam, self.base - 4))
 
@@ -7224,23 +7625,25 @@ class SelfServiceWindow(object):
     # ------------------------------------------------------------ 验证码 / 失败
 
     def _draw_fail(self, msg):
+        self.view_locked = True
         self._clear()
         inner = self._card(None)
         self.tk.Label(inner, text="读不到数据", bg=CARD, fg=DANGER,
                       font=(self.fam, self.base, "bold")).pack(anchor="w")
-        self.tk.Label(inner, text=msg, bg=CARD, fg=FG, wraplength=CHART_W - 20,
+        self.tk.Label(inner, text=msg, bg=CARD, fg=FG, wraplength=self.cw - 20,
                       justify="left", font=(self.fam, self.base)
                       ).pack(anchor="w", pady=(6, 0))
         self.tk.Label(inner,
                       text="（这个功能要连上校园网、并且学校自助服务能访问才行。\n"
                            "　本机已经存下来的流量历史不受影响，下次点「同步数据」再试）",
-                      bg=CARD, fg=SUB, wraplength=CHART_W - 20, justify="left",
+                      bg=CARD, fg=SUB, wraplength=self.cw - 20, justify="left",
                       font=(self.fam, self.base - 1)).pack(anchor="w", pady=(6, 0))
         self._back_row(inner)
         self._autosize()
 
     def _draw_captcha(self, png, note=None):
         """画验证码输入界面。`note` 非空时显示成一行红色提示（验证码错了）。"""
+        self.view_locked = True
         self._clear()
         inner = self._card(None)
 
@@ -7331,11 +7734,12 @@ class SelfServiceWindow(object):
 
     def _draw_login_err(self, msg):
         """🔴 非验证码类的登录失败 —— **不许重试**。"""
+        self.view_locked = True
         self._clear()
         inner = self._card(None)
         self.tk.Label(inner, text="登录不上自助服务", bg=CARD, fg=DANGER,
                       font=(self.fam, self.base, "bold")).pack(anchor="w")
-        self.tk.Label(inner, text=msg, bg=CARD, fg=FG, wraplength=CHART_W - 20,
+        self.tk.Label(inner, text=msg, bg=CARD, fg=FG, wraplength=self.cw - 20,
                       justify="left", font=(self.fam, self.base)
                       ).pack(anchor="w", pady=(6, 0))
         self.tk.Label(inner,
@@ -7445,12 +7849,45 @@ class LoginApp:
             except Exception:
                 pass
 
-        # --- 布局骨架 ---
-        # 页面 = 冷灰底 + 一张张白卡片。原来是「一个大白卡包住全部内容」，
-        # 分区之间只有一条 1px 细线，层次出不来；改成每区一张卡、卡间留 10px 灰缝，
-        # 一眼能分出「状态 / 账号 / 设置 / 隐私」几块。
-        outer = tk.Frame(self.root, bg=BG)
-        outer.pack(fill="both", expand=True, padx=OUTER_PAD, pady=OUTER_PAD)
+        # --- 布局骨架：**左侧导航 + 右侧内容**（2026-10-16 改）---
+        #
+        # 🔴 原来是「一个功能开一个 Toplevel」：设置一个窗口、「账号中心」一个
+        #    窗口、「使用说明」又一个窗口。用户原话：
+        #      「每加一个新功能就要加一个窗口，那用户同时看好几个功能
+        #        不就全屏都是窗口了」
+        #    所以现在**整个程序只有一个窗口**，功能都在内容区里进出。
+        #    加新功能 = 往 `self.PAGES` 里加一行 + 写一个 `_page_xxx()`，
+        #    不再多开窗口。
+        #
+        # ⚠️ 导航放左边而不是顶部标签：竖向空间是这个界面最紧的资源
+        #    （内容 827px / 上限 906px），横向很富裕。见 NAV_W 那边的说明。
+        shell = tk.Frame(self.root, bg=BG)
+        shell.pack(fill="both", expand=True, padx=OUTER_PAD, pady=OUTER_PAD)
+        self.nav = tk.Frame(shell, bg=BG, width=NAV_W)
+        self.nav.pack(side="left", fill="y")
+        # ⚠️ `pack_propagate(False)`：不让子控件把导航栏撑宽。
+        #    不关掉的话它会跟着内容长，`NAV_W` 就成了摆设。
+        self.nav.pack_propagate(False)
+        self.content = tk.Frame(shell, bg=BG)
+        self.content.pack(side="left", fill="both", expand=True,
+                          padx=(NAV_GAP, 0))
+        # 内容区里的每一页都是一个 Frame，同一时刻只 pack 一个。
+        # 「设置」页就是原来那套内容，**一行都没动**，只是换了个爹。
+        self.page_settings = tk.Frame(self.content, bg=BG)
+        self.page_center = None      # 懒建（建的时候要开面板、连线程）
+        self.page_help = None
+
+        outer = tk.Frame(self.page_settings, bg=BG)
+        # ⚠️ 这里**不再加 padx/pady** —— `shell` 已经给过最外层留白了，
+        #    再加一层会和「账号中心」那一页差 14px，切页时内容会跳一下。
+        outer.pack(fill="both", expand=True)
+
+        # 导航栏 + 初始页。**必须在内容都建完之后**：
+        # 导航项要按 `self_service_available()` 决定显不显示「账号中心」。
+        self.page = ""
+        self.panel = None
+        self._build_nav()
+        self.show_page("settings")
 
         # 内容放进可滚动区域。屏幕矮的时候（1366x768、1080p@150%…）内容会比窗口高，
         # 没有滚动的话底部「开机自启」就永远够不到 —— 那是真的没法开自启，不是难看。
@@ -7521,7 +7958,7 @@ class LoginApp:
         # ⚠️ 视觉上必须让人看出「这行字能点」：只绑 cursor 是没用的 ——
         # 截图里它跟普通灰字一模一样，用户根本不会去点。所以给它加：
         #   ① 下划线（链接的通用约定）
-        #   ② 浅蓝圆角底（和后面的灰底「使用说明」按钮区分开，但不抢主按钮的视觉）
+        #   ② 浅蓝圆角底（和周围的灰底区分开，但不抢主按钮的视觉）
         # 这两个加起来，一眼就知道是可点的东西。
         #
         # 2026-10-04 从 `tk.Label` 换成 Canvas 圆角片（`round_chip`）：
@@ -7538,11 +7975,13 @@ class LoginApp:
         #    这类错**没有任何报错**，只有把截图放大才看得出来。
         #    取值参照账号行「选用」按钮（#f1f5f9 落在白卡 #ffffff 上，差 14 级）——
         #    这里也取与 BG 差 18 级左右的一档，保证一眼能看出是个按钮。
-        round_button(head, "使用说明", lambda: self.show_help(), (self.fam, self.SMALL),
-                     bg="#dbe1eb", fg="#475569", hover="#ccd5e3", active="#bfc9da",
-                     parent_bg=BG, height=self.SMALL + 16,
-                     radius=pill_radius(self.SMALL + 16)
-                     ).pack(side="right")
+        #
+        # 🔴 2026-10-16：原来这里还有个「使用说明」按钮，**删掉了**。
+        #    它和左侧导航栏里的「使用说明」是同一个页面 —— 两个入口并列，
+        #    用户会以为「这两处打开的不是一个东西」。导航栏是**唯一**的页面入口。
+        #    ⚠️ 删掉之后**内容高度一个像素都没变**：这一行的高度由标题字号
+        #    （`self.TITLE`，比这个按钮高）决定，不是由这个按钮。
+        #    `content_h_probe.py` 复核过（仍是 827），`geometry_test.CONTENT_H` 不用动。
 
         # --- 状态条 ---
         # 圆角卡 + 彩色圆角图标徽章 + 文字。
@@ -7580,26 +8019,14 @@ class LoginApp:
             command=lambda: self.on_speed_probe())
         self.btn_probe.pack(side="right")
 
-        # 「账号中心」入口（2026-10-12 加，郑航自助服务）。
-        #
-        # 🔴 为什么不新开一张卡：和上面「测一下速度」**完全同一个理由** ——
-        #    内容高度 827px、上限 906px，加一张卡（约 90px）就压线了。
-        #    放进状态卡右侧既不动高度、语义也对（它也是"网络状态"这件事）。
-        # 🔴 为什么不新增主按钮：**主按钮固定三个是界面铁律**（`set_busy` 的
-        #    控件元组就是那三个）。这里和「测一下速度」一样是状态卡里的圆角片，
-        #    不进那个元组；忙碌拦截由 `on_self_service` 自己做。
-        # ⚠️ 高度**必须**和上面那个圆角片一模一样（`self.SMALL + 14`）——
-        #    这一行的高度由最高的子控件决定，只要一样高，整卡高度**一个像素不变**。
-        #    改这个数就必须重跑 `content_h_probe.py`。
-        # ⚠️ 只有郑航有自助服务；嘉兴（深澜 Srun）没有这个入口，所以这里要判一下。
-        #    对嘉兴用户来说等于没加东西（同一行、同高，宽度也够）。
-        self.btn_self = None
-        if self_service_available():
-            self.btn_self = round_chip(
-                status_body, tk, "账号中心", (self.fam, self.SMALL), BLUE_DARK,
-                BLUE_SOFT, height=self.SMALL + 14, hover="#d3e0ff",
-                command=lambda: self.on_self_service())
-            self.btn_self.pack(side="right", padx=(0, 6))
+        # ⚠️ 「账号中心」的入口**搬到左侧导航栏了**（2026-10-16）。
+        #    原来这里是状态卡右侧的一个圆角片（和「测一下速度」并排）——
+        #    现在整个程序是「一个窗口多个页面」，导航栏是**唯一**的页面入口。
+        #    留一个重复入口只会让人以为「这两个地方打开的不是同一个东西」，
+        #    所以这里**故意不留**。
+        # ⚠️ 删掉它之后这一行的高度**一个像素都没变**：行高由「测一下速度」
+        #    那个圆角片决定（`self.SMALL + 14`），它还在。
+        #    `content_h_probe.py` 复核过，`geometry_test.CONTENT_H` 不用动。
 
         self.draw_status_icon(NET_UNKNOWN)
 
@@ -7714,6 +8141,170 @@ class LoginApp:
                       # 账号列表里每行的「删除」按钮。render_accounts 每次重建列表都会换一批，
                       # 所以这里存的是**当前这一批**。set_busy 必须能拿到它们 —— 见下面的说明。
                       "row_btns": []}
+
+    # ------------------------------------------------------------ 页面 / 导航
+
+    # 🔴 **加新功能就来这里加一行**，别再开新窗口。
+    #    (key, 导航栏文字, 图标)。图标必须是 `_ICON_SHAPES` 里有的名字
+    #    （写错了 `nav_button` 会当场抛异常，不会静默画个空白）。
+    # ⚠️ 「账号中心」只有郑航有（嘉兴是深澜 Srun），`_build_nav` 会自己跳过。
+    PAGES = (
+        ("settings", "设置", "power"),
+        ("center", "账号中心", "user"),
+        ("help", "使用说明", "list"),
+    )
+
+    def _build_nav(self):
+        """搭左侧导航栏。
+
+        ⚠️ 导航面板的 `pad_x`/`pad_y` **必须 >= radius**（`round_panel` 的硬约束，
+           不满足会当场抛异常）—— 这里取 12/12/12。
+        """
+        cv, body = round_panel(self.nav, self.tk, 12, 12, 12)
+        cv.pack(fill="both", expand=True)
+        self.nav_btns = {}
+        inner_w = NAV_W - 24              # 减去卡片两侧内边距
+        h = self.BASE * 2 + 18
+        for key, label, icon in self.PAGES:
+            if key == "center" and not self_service_available():
+                continue
+            b = nav_button(body, self.tk, label, icon, (self.fam, self.BASE),
+                           (lambda k=key: self.show_page(k)),
+                           width=inner_w, height=h, page=CARD)
+            b.pack(fill="x", pady=(0, 4))
+            self.nav_btns[key] = b
+
+    def show_page(self, key):
+        """切到某一页。
+
+        🔴 **这是「一个窗口多个页面」的落点。** 以前每个功能开一个 Toplevel，
+           现在功能都在这个窗口的内容区里进出 —— 同时看好几个功能也不会
+           「满屏都是窗口」。
+
+        ⚠️ 切页**不销毁**别的页（只 `pack_forget`）：账号中心里那个内存会话
+           （cookie）和本机历史都挂在面板对象上，销毁了就得重新读一次验证码。
+           真正要销毁的场合（账号换了 / 清了凭据）走 `_drop_center()`。
+        """
+        if key not in self.nav_btns:
+            return
+        if key == "center":
+            target = self._ensure_center()
+            if target is None:
+                # 账号密码没填全 / 面板建不起来。提示 `_ensure_center` 已经弹过了，
+                # 这里退回设置页 —— 别把用户丢在一张空白页上（那看着像程序坏了）。
+                key, target = "settings", self.page_settings
+        elif key == "help":
+            target = self._ensure_help()
+        else:
+            target = self.page_settings
+        # ⚠️ `self.page` / 高亮都放在**最后**统一设：`_ensure_center()` 可能
+        #    间接再进一次 `show_page`（重建面板那条路），先设的话会被它改掉。
+        self.page = key
+        for k, b in self.nav_btns.items():
+            b.set_active(k == key)
+        for p in (self.page_settings, self.page_center, self.page_help):
+            if p is not None and p is not target:
+                p.pack_forget()
+        target.pack(fill="both", expand=True)
+
+    def _center_creds(self):
+        """取「账号中心」要用的 (账号, 密码, 门户地址)。取不到就提示并返回 None。
+
+        🔴 用的是**界面上填的那份账号密码**（没填就退回已保存的那份）——
+           自助服务要用同一份凭据去登录，不该再问用户要一遍。
+           这也意味着：**界面上填的是哪个账号，看到的就是哪个账号的数据**。
+        """
+        cfg = load_config()
+        uid = (self.var_uid.get() or "").strip() or (cfg.get("userId") or "")
+        pwd = self.pwd_field.get() or (cfg.get("passwd") or "")
+        if not uid or not pwd:
+            self.show("「账号中心」要用账号密码登录学校自助服务。\n"
+                      "请先在上面把账号密码填好（或保存一个账号）再点。", "err")
+            return None
+        base = (cfg.get("portalHost") or DEFAULTS["portalHost"]).rstrip("/")
+        return uid, pwd, base
+
+    def _ensure_center(self):
+        """按需建「账号中心」那一页。建不成就返回 None。
+
+        🔴 **懒建**：面板一建出来就会挂一个 `after()` 轮询和一个后台线程，
+           启动时不该干这事（用户可能根本不点它）。
+        """
+        creds = self._center_creds()
+        if creds is None:
+            return None
+        uid, pwd, base = creds
+        if self.page_center is not None:
+            # 账号没换 ⇒ 沿用旧面板（内存会话还在，不用重新读验证码）。
+            if getattr(self.panel, "account", None) == uid:
+                return self.page_center
+            # 🔴 账号换了就必须重建：面板里的会话和本机历史都是**按账号**的，
+            #    沿用旧面板会显示上一个账号的数据 —— 而两边的数字都"看着正常"，
+            #    用户根本看不出错（这正是账号卡顶上要写清账号的原因）。
+            self._drop_center(go_settings=False)
+        box = self.tk.Frame(self.content, bg=BG)
+        # 🔴 **先摆进布局，再建面板**。面板在构造时就要量正文宽度
+        #    （决定分几列、每一行文字多宽换行），没摆进布局的话量到的是 1px，
+        #    只能退回兜底的旧宽度 —— 表现是「打开的一瞬间是单列，
+        #    两百毫秒之后才跳成两列」。不报错，但一眼就看得出来是毛病。
+        box.pack(fill="both", expand=True)
+        box.update_idletasks()
+        try:
+            panel = SelfServiceWindow(self.root, self.tk, self.fam, self.BASE,
+                                      uid, pwd, base, host=box)
+        except Exception:
+            log("打开账号中心面板失败:\n%s" % traceback.format_exc())
+            self.show("打不开「账号中心」面板。", "err")
+            box.destroy()
+            return None
+        self.page_center = box
+        self.panel = panel
+        return box
+
+    def _drop_center(self, go_settings=True):
+        """把「账号中心」这一页整个丢掉（账号变了 / 清了凭据时用）。
+
+        ⚠️ 正在看这一页时要**先切回设置页** —— 否则用户会盯着一张已经
+           被销毁的空白页，还以为程序卡了。
+        ⚠️ `go_settings=False` 是给 `_ensure_center()` 自己用的：
+           它是**在 `show_page("center")` 里被调用的**，那里再套一层
+           `show_page("settings")` 会把页面的最终状态搞乱（外层回来之后
+           又会把 center 页 pack 上，导航高亮和实际显示对不上）。
+        """
+        if self.panel is not None:
+            try:
+                self.panel.close()
+            except Exception:
+                log("收起账号中心面板异常:\n%s" % traceback.format_exc())
+        self.panel = None
+        if self.page_center is not None:
+            try:
+                self.page_center.destroy()
+            except Exception:
+                pass
+        self.page_center = None
+        if go_settings and self.page == "center":
+            self.show_page("settings")
+
+    def _ensure_help(self):
+        """按需建「使用说明」那一页。
+
+        ⚠️ 正文和按钮栏都走模块级的 `text_panel` / `text_panel_bar` ——
+           和命令行 `--help` 那个独立窗口共用**同一份实现**。
+           2026-10-04 圆角化时只改了一份、症状是「弹窗截图字节一字没变」，
+           那次教训就是因为存在第二份实现。
+        """
+        if self.page_help is not None:
+            return self.page_help
+        self.page_help = self.tk.Frame(self.content, bg=BG)
+        text_panel(self.page_help, self.tk, self.fam, self.BASE,
+                   HELP_TEXT + SWITCH_HELP, pad=0)
+        # ⚠️ 按钮写「返回设置」而不是「知道了」：「知道了」是弹窗的说法，
+        #    嵌在页面里会让人以为点了会关掉什么。
+        text_panel_bar(self.page_help, self.tk, self.fam, self.BASE,
+                       lambda: self.show_page("settings"),
+                       label="返回设置", pad=0)
+        return self.page_help
 
     # ------------------------------------------------------------ 通用小控件
 
@@ -7882,9 +8473,29 @@ class LoginApp:
     # ------------------------------------------------------------ 状态与刷新
 
     def on_wheel(self, ev):
-        # 内容比视口高才滚，否则别抢事件（短内容时滚轮该干嘛干嘛）
-        if self.holder.winfo_reqheight() > self.canvas.winfo_height():
-            self.canvas.yview_scroll(-1 if ev.delta > 0 else 1, "units")
+        """滚轮：按**当前页**决定滚哪个可滚动区。
+
+        ⚠️ 2026-10-16 起窗口里不止一个可滚动区（设置页一个、账号中心页一个）——
+           还像原来那样只滚 `self.canvas` 的话，在账号中心页滚轮**完全无效**，
+           而且不报任何错（滚的是看不见的那一块）。这类「静默无效」正是
+           本项目最忌讳的失败方式，所以这里显式按页分派。
+        ⚠️ 说明页走 `tk.Text`，**它自带滚轮支持**，这里不掺和 ——
+           掺和进去就会连带把看不见的设置页也滚一遍。
+        """
+        if self.page == "center" and self.panel is not None \
+                and not self.panel.closed:
+            pairs = ((self.panel.canvas, self.panel.holder),)
+        elif self.page == "settings":
+            pairs = ((self.canvas, self.holder),)
+        else:
+            return
+        for cv, holder in pairs:
+            # 内容比视口高才滚，否则别抢事件（短内容时滚轮该干嘛干嘛）
+            try:
+                if holder.winfo_reqheight() > cv.winfo_height():
+                    cv.yview_scroll(-1 if ev.delta > 0 else 1, "units")
+            except Exception:
+                pass
 
     def draw_status_icon(self, st):
         """按状态重画徽章（浅底 + 同色系图标）。
@@ -8431,34 +9042,19 @@ class LoginApp:
         return (0, "测速完成（到 %s 的下载速度）\n%s" % (host, speed_describe(info)))
 
     def on_self_service(self):
-        """点「账号中心」触发（郑航自助服务）。
-
-        🔴 用的是**界面上填的那份账号密码**（没填就退回已保存的那份）——
-           自助服务要用同一份凭据去登录，不该再问用户要一遍。
-           这也意味着：**界面上填的是哪个账号，看到的就是哪个账号的数据**。
+        """点导航栏的「账号中心」触发（郑航自助服务）。
 
         ⚠️ 和 `on_speed_probe` 不同，这里不走 `start_job` ——
-           它要弹一个**带验证码输入框的窗口**，而 `start_job` 收尾时只会
-           改状态栏文字。窗口自己管自己的线程和队列（见 `SelfServiceWindow`）。
-           忙碌拦截因此要自己做（这个入口不在 `set_busy` 的控件元组里）。
+           面板有自己的线程和队列，`start_job` 那套（收尾只改状态栏文字）
+           管不了它。忙碌拦截因此要自己做。
+        ⚠️ 2026-10-16：从「开一个窗口」改成「切到一页」。
+           账号密码的校验和面板的创建都在 `_ensure_center` 里，
+           这里只负责「忙不忙」和「切页」。
         """
         if self.state["busy"]:
             self.show("正在处理上一个操作，请稍候", "info")
             return
-        cfg = load_config()
-        uid = (self.var_uid.get() or "").strip() or (cfg.get("userId") or "")
-        pwd = self.pwd_field.get() or (cfg.get("passwd") or "")
-        if not uid or not pwd:
-            self.show("「账号中心」要用账号密码登录学校自助服务。\n"
-                      "请先在上面把账号密码填好（或保存一个账号）再点。", "err")
-            return
-        base = (cfg.get("portalHost") or DEFAULTS["portalHost"]).rstrip("/")
-        try:
-            SelfServiceWindow(self.root, self.tk, self.fam, self.BASE,
-                              uid, pwd, base)
-        except Exception:
-            log("打开账号中心面板失败:\n%s" % traceback.format_exc())
-            self.show("打不开「账号中心」面板。", "err")
+        self.show_page("center")
 
     def form(self):
         uid = self.var_uid.get().strip()
@@ -8567,6 +9163,12 @@ class LoginApp:
         self.var_uid.set("")
         self.pwd_field.set("")
         self.render_accounts()
+        # 🔴 **「账号中心」那一页也要整个丢掉**（2026-10-16 加）：
+        #    它内存里存着一份**已经登录的会话 cookie**，还有拉回来的详单 /
+        #    费用记录（带身份证号那种）。清凭据却留着这些，
+        #    等于「用户以为清干净了、其实还挂着一个能看数据的页面」。
+        #    这条是隐私问题，不是洁癖。
+        self._drop_center()
         if failed:
             self.show("有文件没删掉：%s\n（可能被别的程序占着，过一会儿再试一次）"
                       % "、".join(failed), "err")
@@ -8613,44 +9215,18 @@ class LoginApp:
                        self.action_runner(lambda: do_switch(uid, pwd, prev)))
 
     def show_help(self):
-        """使用说明弹窗。
+        """切换到「使用说明」这一页，返回那一页的 Frame。
 
         说明文字内置在 HELP_TEXT 里，所以程序不依赖外部 .txt —— 单独一个 exe
-        拷到别的电脑上，照样点得开说明。
+        拷到别的电脑上，照样翻得开说明。
+
+        ⚠️ 2026-10-16：从**弹窗**改成**一页**。用户要的是「少开窗口」，
+           而且这个说明是随手翻的东西，挂在一个单独窗口上反而挡着后面的设置。
+           实现搬到 `_ensure_help()`，这里只做转发 ——
+           `ui_shot.py` / `run()` 的自检仍按这个名字调。
         """
-        win = self.tk.Toplevel(self.root)
-        win.title("使用说明 · %s v%s" % (APP_TITLE, VERSION))
-        # 窗口底色 = **页面底色**，不是卡片底色 —— 正文区是一张圆角卡片，
-        # 卡片和窗口同色的话圆角就看不出来了（这是刚把直角改成圆角时最
-        # 容易漏的一步：改卡片忘了改窗口）。
-        win.configure(bg=BG)
-        win.transient(self.root)         # 跟随主窗口，不单独占一个任务栏项
-        ico = icon_path()
-        if ico:
-            try:
-                win.iconbitmap(default=ico)
-            except Exception:
-                pass
-
-        # 正文 + 按钮栏都走模块级的 `text_panel` / `text_panel_bar` ——
-        # 和 `show_text_window()`（命令行 `--help` 用）共用**同一份实现**。
-        # 这两段以前是各写一份的：2026-10-04 圆角化时只改了一份，
-        # 症状是**弹窗截图字节一字没变**，靠那个才发现还有第二份。
-        text_panel(win, self.tk, self.fam, self.BASE, HELP_TEXT + SWITCH_HELP)
-        text_panel_bar(win, self.tk, self.fam, self.BASE, win.destroy)
-
-        if self.smoke:
-            win.withdraw()               # 自检时不真的弹出来
-        else:
-            win.update_idletasks()
-            w = min(720, max(520, int(self.root.winfo_width() * 0.92)))
-            h = min(700, max(440, int(self.root.winfo_height() * 0.92)))
-            x = self.root.winfo_rootx() + (self.root.winfo_width() - w) // 2
-            y = self.root.winfo_rooty() + (self.root.winfo_height() - h) // 3
-            win.geometry("%dx%d+%d+%d" % (w, h, max(0, x), max(0, y)))
-            win.minsize(420, 320)
-            win.focus_set()
-        return win
+        self.show_page("help")
+        return self.page_help
 
     def on_logout(self):
         if not self.messagebox.askyesno(
@@ -8750,13 +9326,21 @@ class LoginApp:
                 log(ui_contrast_check(self.root))
             finally:
                 self.messagebox = real_mb
-            # 顺便把说明弹窗也建一次，确认它能起来（不显示，建完就销毁）
+            # 顺便把「使用说明」那一页建一次，确认它能起来。
+            # ⚠️ 说明页是**懒建**的（点导航栏才建），自检不主动点一遍就永远
+            #    测不到 —— 那种情况下一个 NameError 能一路带进发布版，
+            #    用户点一下才发现是空白页。
+            # 🔴 **但「账号中心」那一页故意不在自检里建**：
+            #    它①要读用户真实账号密码（自检不该依赖这个）、
+            #    ②会起一个后台线程 + 一个 `after()` 轮询。
+            #    在无人的 --guitest 里起线程是自找麻烦。
+            #    它的创建路径由 `selfwin_test.py` 的嵌入模式那一段覆盖。
             try:
-                hv = self.show_help()
-                hv.update_idletasks()
-                hv.destroy()
+                self.show_page("help")
+                self.page_help.update_idletasks()
+                self.show_page("settings")
             except Exception:
-                log("说明弹窗自检失败:\n%s" % traceback.format_exc())
+                log("说明页自检失败:\n%s" % traceback.format_exc())
             # 自检路径不走 mainloop，显式销毁，别把 Tk 留给解释器收尾
             try:
                 self.root.destroy()

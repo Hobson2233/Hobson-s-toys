@@ -117,15 +117,36 @@ def spy(sw, sh, reqh):
 
 
 def _find(root):
-    """按结构找到 (holder, inner)。对不上就返回 (None, None)。"""
+    """按结构找到 (holder, inner)。对不上就返回 (None, None)。
+
+    ⚠️ 2026-10-16：主窗口改成了「左侧导航 + 右侧内容」，中间多了
+       shell / nav / content / page_settings 四层 —— 原来那句
+       `root.winfo_children()[0]` 数的是层数，结构一变就静默失效
+       （表现是「量不出来」，不是报错）。
+       现在改成在整棵树里找**第一个「Canvas 里只装一个 Frame、
+       那个 Frame 里也只有一个 Frame」**的结构：那是内容区那个滚动画布
+       独有的形状。找不到就老实说量不出来，绝不拿一棵错的树算数字。
+    """
     try:
-        outer = root.winfo_children()[0]
-        canvas = next(c for c in outer.winfo_children()
-                      if c.winfo_class() == "Canvas")
-        holder = canvas.winfo_children()[0]
-        return holder, holder.winfo_children()[0]
+        for canvas in _all_canvas(root):
+            kids = canvas.winfo_children()
+            if len(kids) != 1 or kids[0].winfo_class() != "Frame":
+                continue
+            inner = kids[0].winfo_children()
+            if len(inner) == 1 and inner[0].winfo_class() == "Frame":
+                return kids[0], inner[0]
+        return None, None
     except Exception:
         return None, None
+
+
+def _all_canvas(w):
+    out = []
+    for c in w.winfo_children():
+        if c.winfo_class() == "Canvas":
+            out.append(c)
+        out.extend(_all_canvas(c))
+    return out
 
 
 _orig_mainloop = tk.Tk.mainloop
