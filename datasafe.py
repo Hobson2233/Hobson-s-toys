@@ -43,8 +43,12 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)
 import campus_login as C      # noqa: E402
 
-# 会被重定向的路径常量。和 campus_login 里的 5 个一一对应。
+# 会被重定向的路径常量。和 campus_login 里的 6 个一一对应。
 _PATH_ATTRS = ("CONFIG_FILE", "ACCOUNTS_FILE", "LOG_FILE", "RESULT_FILE",
+               # 2026-10-17 加：轮转出来的上一份日志（`log()` 满 1 MB 时挪过去）。
+               # ⚠️ 它落在数据目录里，所以沙箱**必须**盖住它；否则测试一触发轮转
+               #    就会把真实日志改名，`assert_untouched()` 会报「数据被改动」。
+               "LOG_BACKUP_FILE",
                # 2026-10-12 加：账号中心的本地流量历史。
                # ⚠️ 它**必须**在这里 —— 否则探针/测试一同步就会把历史写到
                #    **真实**数据目录里去（沙箱盖不住这条路径），
@@ -223,8 +227,16 @@ def assert_untouched():
     now = snapshot()
     changed = [p for p in now if now[p] != _state["snap"].get(p)]
     logname = os.path.basename(C.LOG_FILE)
-    hard = [p for p in changed if os.path.basename(p) != logname]
-    soft = [p for p in changed if os.path.basename(p) == logname]
+
+    def _is_log(p):
+        # ⚠️ 用**前缀**匹配，不只比全名：日志满 1 MB 会轮转成 `campus-login.log.1`
+        #    （2026-10-17 加），那也是日志，同样只该降级成警告。
+        #    只比全名的话，轮转那一瞬间整条 fast 会报「🔴 真实数据被改动了」——
+        #    又是一个把「程序自己在干活」说成「测试写坏了数据」的假警报。
+        return os.path.basename(p).startswith(logname)
+
+    hard = [p for p in changed if not _is_log(p)]
+    soft = [p for p in changed if _is_log(p)]
     if hard:
         raise RuntimeError(
             "datasafe: 🔴 真实数据被改动了！\n  " + "\n  ".join(

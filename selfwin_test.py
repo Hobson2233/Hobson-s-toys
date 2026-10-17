@@ -1742,7 +1742,7 @@ def test_actions(root):
     pump(root, 0.4)
     try:
         # ① 没同步过 ⇒ 一个写操作按钮都不许有（没有会话，点了也是白点）
-        for name in ("下线这台", "解绑", "停机", "复机"):
+        for name in ("下线这台", "解绑", "申请停机", "申请复机"):
             check_true("没同步过 ⇒ 没有「%s」按钮" % name,
                        find_button(w, name) is None, "")
 
@@ -1750,7 +1750,7 @@ def test_actions(root):
         w.data = json.loads(json.dumps(FAKE_DATA))
         w._render()
         pump(root, 0.4)
-        for name in ("下线这台", "解绑", "停机"):
+        for name in ("下线这台", "解绑", "申请停机"):
             check_true("同步后出现「%s」" % name,
                        find_button(w, name) is not None, "")
         b = find_button(w, "下线这台")
@@ -1815,7 +1815,7 @@ def test_actions(root):
         w.ask = lambda msg: True
         w.ask_text = lambda title, prompt, initial: "测试原因"
         FakeSvc.posts = []
-        find_button(w, "停机").invoke()
+        find_button(w, "申请停机").invoke()
         ok = pump(root, 6.0,
                   lambda: any(p[0] == "selfstopping.do" for p in FakeSvc.posts))
         check_true("停机请求发出去了", ok, "")
@@ -1830,7 +1830,7 @@ def test_actions(root):
         pump(root, 0.4)
         w.ask_text = lambda title, prompt, initial: "   "
         FakeSvc.posts = []
-        find_button(w, "停机").invoke()
+        find_button(w, "申请停机").invoke()
         pump(root, 0.8)
         check("原因为空 ⇒ 一个请求都不发", FakeSvc.posts, [])
         check_true("并且说清了为什么", "不能为空" in w.note, w.note)
@@ -1838,7 +1838,7 @@ def test_actions(root):
         # 取消输入 ⇒ 也不发
         w.ask_text = lambda title, prompt, initial: None
         FakeSvc.posts = []
-        find_button(w, "停机").invoke()
+        find_button(w, "申请停机").invoke()
         pump(root, 0.8)
         check("取消输入 ⇒ 一个请求都不发", FakeSvc.posts, [])
 
@@ -1850,10 +1850,10 @@ def test_actions(root):
         w.ask_text = lambda title, prompt, initial: "测试原因"
         w._render()
         pump(root, 0.4)
-        check_true("停机中 ⇒ 有「复机」", find_button(w, "复机") is not None, "")
-        check_true("停机中 ⇒ 没有「停机」", find_button(w, "停机") is None, "")
+        check_true("停机中 ⇒ 有「申请复机」", find_button(w, "申请复机") is not None, "")
+        check_true("停机中 ⇒ 没有「申请停机」", find_button(w, "申请停机") is None, "")
         FakeSvc.posts = []
-        find_button(w, "复机").invoke()
+        find_button(w, "申请复机").invoke()
         ok = pump(root, 6.0,
                   lambda: any(p[0] == "selfrecovery.do" for p in FakeSvc.posts))
         check_true("复机请求发出去了", ok, "")
@@ -1869,8 +1869,8 @@ def test_actions(root):
         w.data = d
         w._render()
         pump(root, 0.4)
-        check_true("状态「未知」⇒ 不画「停机」", find_button(w, "停机") is None, "")
-        check_true("状态「未知」⇒ 不画「复机」", find_button(w, "复机") is None, "")
+        check_true("状态「未知」⇒ 不画「停机」", find_button(w, "申请停机") is None, "")
+        check_true("状态「未知」⇒ 不画「复机」", find_button(w, "申请复机") is None, "")
 
         # ⑧ 🔴 失败分类：四类各自说人话，而且**都只发一次**
         w.data = json.loads(json.dumps(FAKE_DATA))

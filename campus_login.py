@@ -351,6 +351,13 @@ def data_dir():
 CONFIG_FILE = os.path.join(data_dir(), "config.json")
 ACCOUNTS_FILE = os.path.join(data_dir(), "accounts.json")
 LOG_FILE = os.path.join(data_dir(), "campus-login.log")
+# 日志满了之后轮转到的上一份（见 `log()` 与 `_rotate_log()`）。
+# 🔴 它是一个**新的落盘文件**，所以两处清单必须同时加：
+#    · `PRIVATE_FILES` —— 否则「清除本机保存的账号密码与日志」会漏掉它，
+#      用户以为清干净了，实际旧日志（含学号、IP、失败原因）还在盘上；
+#    · `datasafe._PATH_ATTRS` —— 否则测试/探针的沙箱盖不住这条路径。
+#    （红线 62 的原文就是这件事。）
+LOG_BACKUP_FILE = os.path.join(data_dir(), "campus-login.log.1")
 RESULT_FILE = os.path.join(data_dir(), "last-result.json")
 # 守护进程的「有人在跑」标记。里面记 pid 和启动时刻。
 # ⚠️ 这个文件**可能被残留**：退出走的是 TerminateProcess（见 exit_now），
@@ -387,6 +394,10 @@ LEGACY_DIR = r"C:\tools"          # 最老的 PowerShell 版部署位置，首�
 # 本机保存过的隐私文件清单（--purge 用；显式列举，不用通配符）
 PRIVATE_FILES = ("config.json", "accounts.json", "last-result.json",
                  "campus-login.log", "selftest.txt", "guitest.txt",
+                 # 轮转出来的上一份日志。🔴 **必须在清单里** ——
+                 # 它和 campus-login.log 内容同源（学号、本机 IP、失败原因都有），
+                 # 漏了它就成了「以为清了日志，其实旧的那份还在」。
+                 "campus-login.log.1",
                  # 自助服务「上次的登录态」。🔴 **必须在清单里** ——
                  # 只清密码、留着一个还能用的会话，是最糟的那种「以为清干净了」。
                  "self-session.json")
@@ -418,9 +429,41 @@ def legacy_data_dirs():
 
 
 # ==================== 日志 ====================
+LOG_MAX_BYTES = 1 << 20          # 单份日志上限 1 MB；超出就轮转（见 _rotate_log）
+
+
+def _rotate_log():
+    """日志超过 `LOG_MAX_BYTES` 就把当前那份挪成 `.1`，只留一份旧的。
+
+    🔴 为什么要它（2026-10-17 全量排查时发现）：
+       守护线程每 30 秒一行、每次登录/更新十几行，而日志**只增不减** ——
+       实测三周 400 KB，按这个速度一年 5~6 MB。更麻烦的是 `log()` 每次都
+       open/write/close 整个文件，文件越大越慢（红线 61 实测过 1~2.5 秒），
+       而**界面线程也会写日志** ⇒ 「越用越慢」这件事没有上限。
+       日志本身是排障的唯一线索，不能删；所以是**轮转**，不是清空。
+
+    ⚠️ 轮转失败一律静默：日志写不进去不该影响主流程。
+       常见失败原因是另一个进程正开着它（Windows 不允许改名被占用的文件）——
+       下一行日志再来一次就行。
+    ⚠️ 最多占 2 MB（当前 1 MB + `.1` 1 MB），不会无限累积。
+    """
+    try:
+        if os.path.getsize(LOG_FILE) < LOG_MAX_BYTES:
+            return
+    except OSError:
+        return
+    try:
+        if os.path.exists(LOG_BACKUP_FILE):
+            os.remove(LOG_BACKUP_FILE)
+        os.replace(LOG_FILE, LOG_BACKUP_FILE)
+    except OSError:
+        pass
+
+
 def log(msg):
     line = "%s  %s" % (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), msg)
     try:
+        _rotate_log()
         with open(LOG_FILE, "a", encoding="utf-8") as f:
             f.write(line + "\n")
     except Exception:
@@ -4060,9 +4103,11 @@ HELP_TEXT = (("校园网自动登录 —— 使用说明（v%s）\n" % VERSION) 
   验证码。登进去之后会顺手把「每天流量」攒在本机，以后不登录也能翻历史。
 
   ⚠️ 三件事说在前头：
-    · 数据是**只读**的。本程序不发任何改动的请求（不踢设备下线、不解绑、
-      不缴费、不改密码）。充值、办套餐这类涉及付款的事会**跳到你学校自己的
-      网页**去办，本程序不代办。
+    · **查**数据是只读的，**改**状态要你自己点。界面上有四个动作按钮：
+      停机 / 复机 / 把某台在线设备下线 / 解绑一个 MAC 槽位。每一个都先弹
+      确认框，确认之后才真的发给学校；失败**不会自动重试**（免得「其实
+      已经成功了，又做一遍」）。充值、办套餐这类涉及付款的事仍然跳到你
+      学校自己的网页去办，本程序不代办，也不改你的密码。
     · 「上网详单」和「停机状态」每次都从学校现取，不留在本机；只有每天流量
       那几个数字会攒在本机（按账号分开）。想清掉点「清掉本机历史」。
     · 窗口够宽时卡片会自动分成两列，不用一路往下滚。
@@ -7488,13 +7533,20 @@ class SelfServiceWindow(object):
             #    让用户去学校网页。这是红线 51 的同类：不认识的取值别硬套。
             if self._can_act():
                 if state == "正常":
+                    # ⚠️ 文案是「申请停机」不是「停机」（2026-10-17 改）：
+                    #    按钮紧挨着「停机状态：正常」那一行，而软红底的小胶囊
+                    #    和旁边表示状态的徽章长得一模一样 —— 只写「停机」时，
+                    #    它读起来像**一个状态标签**（「我已停机」），不像按钮。
+                    #    用户看到「正常」和「停机」并排只会困惑，甚至点进去看看
+                    #    「我到底停机了没有」，而这是个不可逆的写操作。
+                    #    加「申请」两个字，动词身份一眼就清楚，宽度也够。
                     self._mini_button(
-                        inner, "停机", self._stop_now,
+                        inner, "申请停机", self._stop_now,
                         DANGER_SOFT, DANGER, DANGER_HOVER, DANGER_ACTIVE
                     ).pack(anchor="e", pady=(dp(6), dp(0)))
                 elif state == "停机中":
                     self._mini_button(
-                        inner, "复机", self._recover,
+                        inner, "申请复机", self._recover,
                         BLUE_SOFT, BLUE_DARK, BLUE_HOVER, BLUE_PRESS
                     ).pack(anchor="e", pady=(dp(6), dp(0)))
 
