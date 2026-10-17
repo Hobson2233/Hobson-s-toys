@@ -4511,6 +4511,69 @@ def minsize_for(sw, sh):
             min(520, max(320, sh - SCREEN_MARGIN_H)))
 
 
+# ==================== 窗口外框圆角（2026-10-17） ====================
+# 🔴 先说实话：**在 Win11 上这个调用基本是「显式化」，视觉上不会有变化。**
+#    实测（`_lab/corner_check.py`，抓屏幕做对照实验）：本机 Win11 上
+#    Tk 窗口**本来就是圆角**的 —— 把偏好设成 `DONOTROUND(1)` 也变不回直角。
+#    所以别指望靠它「把方窗口变圆」，它做不到那件事，因为本来就已经是圆的。
+#
+#    那为什么还留着：这是一条**兜底**。圆角是 Win11 的默认行为，但它是
+#    系统级的、可以被别的因素改掉（组策略、第三方「窗口美化」工具、
+#    某些远程桌面环境）。显式声明一次，成本为零，能挡住「哪天突然变方」。
+#
+# ⚠️ 只加圆角，**不碰标题栏颜色**（`DWMWA_CAPTION_COLOR` = 35）：
+#    标题栏的底色和文字色是**两条互相独立的属性**（文字是
+#    `DWMWA_TEXT_COLOR` = 36）。只改底色不改文字，在**深色模式的 Windows**
+#    上就变成「浅底 + 白字」，标题直接读不出来 —— 那比直角严重得多。
+#    所以这里保持零风险：只做圆角，别的一概不动。
+#
+# ⚠️ `DwmSetWindowAttribute` 在 Win10 及更早版本上不认识 33 这个属性，
+#    会返回 `E_INVALIDARG`。返回值**必须检查**、失败就安静跳过 ——
+#    在 Win10 上跑得好好的程序，不该因为一个纯装饰特性起不来。
+DWM_CORNER_ROUND = 2            # DWMWCP_ROUND（另有 0=DEFAULT / 1=DONOTROUND / 3=ROUNDSMALL）
+DWMWA_CORNER_PREFERENCE = 33
+
+
+def enable_round_corners(win):
+    """把窗口外框的圆角偏好显式声明成 Win11 的圆角。返回是否调用成功。
+
+    🔴 返回值只代表「这个 API 调用成功了」，**不代表「窗口因此变圆了」** ——
+       在 Win11 上它本来就是圆的（见上面那段实测）。别拿这个返回值当
+       「圆角已生效」的证据。
+
+    纯装饰：返回 False 只表示「这个系统上没做成」，**调用方不需要做任何补救**。
+    """
+    try:
+        if not sys.platform.startswith("win"):
+            return False
+        import ctypes
+        from ctypes import wintypes
+
+        win.update_idletasks()
+        user32 = ctypes.windll.user32
+        # 🔴 HWND 的取法：Tk 顶层窗口的 `winfo_id()` 给的是 Tk 自己那个 HWND，
+        #    而真正被 DWM 合成的**往往是它的 parent**（Tk 会套一层 wrapper）。
+        #    实测两种都出现过，所以先试 parent、拿不到再退回自身。
+        #    ⚠️ 必须显式声明 argtypes：HWND 在 64 位上是**指针宽度**，
+        #       不声明的话 ctypes 按 C int 传，高 32 位会被截断。
+        user32.GetParent.argtypes = [wintypes.HWND]
+        user32.GetParent.restype = wintypes.HWND
+        hwnd = user32.GetParent(win.winfo_id()) or win.winfo_id()
+        if not hwnd:
+            return False
+
+        dwmapi = ctypes.windll.dwmapi
+        dwmapi.DwmSetWindowAttribute.argtypes = [
+            wintypes.HWND, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD]
+        dwmapi.DwmSetWindowAttribute.restype = ctypes.c_long
+        pref = ctypes.c_int(DWM_CORNER_ROUND)
+        hr = dwmapi.DwmSetWindowAttribute(
+            hwnd, DWMWA_CORNER_PREFERENCE, ctypes.byref(pref), ctypes.sizeof(pref))
+        return hr == 0
+    except Exception:
+        return False
+
+
 def drain_queue(q, handle, empty_exc=queue.Empty):
     """把队列里的消息全部处理掉，返回 (成功条数, 出错条数)。
 
@@ -8024,6 +8087,13 @@ class LoginApp:
         self.fam, self.BASE = _ui_font(self.root, tkfont)
         self.TITLE = self.BASE + 5
         self.SMALL = self.BASE - 2
+        # 分区标题的字号（2026-10-17 加）。原来是 SMALL —— 比正文还小一号的
+        # 灰字，一屏看下去标题压不住正文，也就是「层次不清」。
+        # 🔴 Win11 的分区标题是**加粗 + 和正文同号**，靠字重和颜色（近黑）拉开，
+        #    不靠放大。所以这里取 BASE 而不是 BASE+1。
+        #    ⚠️ 改这里必须连带重标定 `title_row_h()`（它按字号算行高）和
+        #       `geometry_test.CONTENT_H`（标题行变高会顶高每一张卡）。
+        self.SEC_FS = self.BASE
 
         self.root.option_add("*Font", (self.fam, self.BASE))
         ico = icon_path()
@@ -8258,8 +8328,14 @@ class LoginApp:
                                        (self.fam, self.SMALL), FG)
         self.pwd_field.box.pack(fill="x")
 
-        # --- 按钮（从上到下排列，每个占一整行）---
+        # --- 按钮（横排、右对齐，Win11 对话框的摆法）---
         # 🔴 三个主按钮是界面铁律：`set_busy` 的控件元组就是这三个，改数量要同步改它。
+        #
+        # 🔴 **造的顺序 = 从右往左**（2026-10-17）：`side="right"` 是「先 pack 的
+        #    贴最右」，所以这里先 primary、最后 danger，视觉上从左到右才是
+        #    「退出当前账号 / 仅保存 / 切换到此账号」—— 主按钮在最右，符合 Win11。
+        #    ⚠️ 顺序写反**不报任何错**，只会让主按钮跑到最左边（变成 macOS 的
+        #       规矩），所以这句话钉在这儿。见 `mkbtn` 的说明。
         btns = tk.Frame(c_form, bg=CARD)
         btns.pack(fill="x", pady=(dp(16), dp(0)))
         self.btn_switch = self.mkbtn(btns, "切换到此账号",
@@ -8529,19 +8605,27 @@ class LoginApp:
         return body
 
     def sec(self, parent, text, right=None):
-        """分区小标题：圆角彩色图标徽章 + 深色标题字。
+        """分区标题：圆角彩色图标徽章 + **加粗近黑**的标题字（Win11 的层次画法）。
 
-        ⚠️ 高度和加图标之前**完全一致**（22px 徽章 vs 22px 的 Label 行高，
-           外层都是 pady=(0,7)）—— 所以换上去之后内容高度一个像素都没变。
-           这条是刻意的：改竖向间距就要重标定 CONTENT_H，能不碰就不碰。
+        🔴 2026-10-17 改：标题字号 `SMALL` → `SEC_FS`（= 正文同号），
+           颜色 `SEC_FG` → 近黑。原来它是「比正文还小一号的灰字」，
+           一屏看下去标题压不住正文，就是用户说的「层次不清」。
+           Win11 的分区标题靠**字重**拉开层次，不靠放大、更不靠换颜色。
+
+        ⚠️ 高度**不再是固定 22px** 了：标题行高 = `max(徽章 22, 标题字行高)`，
+           字号一涨行高就跟着涨。所以改 `SEC_FS` 必须同步：
+             · `title_row_h()` —— 它按字号算，会自动跟；
+             · `geometry_test.CONTENT_H` —— **这个不会自动跟，必须重量**。
+           漏掉后者的表现是「窗口比内容矮一点」，底下那张卡被静默裁掉一截。
 
         `right` 是一个**工厂函数**，不是控件：`sec` 收下它、把「标题行」这个 Frame
         交给它，由它现场造出要右对齐的控件并返回。
         🔴 为什么必须是工厂（2026-10-12 踩到）：Tk 里**控件的 master 在创建时就定死了**，
            `pack()` 只会把它放进自己的 master —— 先在别处建好、再交给这里 pack，
            它**不会**跑到标题行里去，而且**不报任何错**，只是位置不对。
-        ⚠️ `right` 造出来的控件**也必须 <= 22px 高**，否则整行被撑高 ——
+        ⚠️ `right` 造出来的控件**也必须 <= 标题行高**，否则整行被撑高 ——
            这类错同样**不报任何异常**，只表现为「窗口莫名其妙变高了」。
+           现在那个高度是 `title_row_h()` 算出来的，别再按老值 22 写死。
         """
         style = self.SEC_STYLE.get(text)
         if style is None:
@@ -8556,20 +8640,21 @@ class LoginApp:
         #    对没有 right 的分区没有任何视觉影响（子控件本来就是左对齐的）。
         head.pack(fill="x", pady=(dp(0), dp(7)))
         icon_badge(head, self.tk, icon, fg, soft).pack(side="left")
-        self.lbl(head, text, self.SMALL, True, SEC_FG).pack(side="left", padx=(dp(8), dp(0)))
+        self.lbl(head, text, self.SEC_FS, True, SEC_FG).pack(side="left", padx=(dp(8), dp(0)))
         if right is not None:
             right(head).pack(side="right")
         return head
 
     def title_row_h(self):
-        """分区标题那一行的高度（= `linespace(SMALL)`，本机实测 22px）。
+        """分区标题那一行的高度（= `linespace(SEC_FS)`，按字体算出来的）。
 
         学校选择片必须**恰好**这么高，才不会把标题行撑高（见 sec / school_selector）。
         按字体算而不是写死数字 —— 换字号时会自己跟着走。
+        🔴 2026-10-17：跟着 `SEC_FS` 走，不再是 `SMALL`（标题字号涨了一档）。
         """
         import tkinter.font as tkfont
         try:
-            return int(tkfont.Font(font=(self.fam, self.SMALL)).metrics("linespace"))
+            return int(tkfont.Font(font=(self.fam, self.SEC_FS)).metrics("linespace"))
         except Exception:
             return self.SMALL + 13
 
@@ -8648,19 +8733,40 @@ class LoginApp:
         e.bind("<FocusOut>", lambda ev: panel_set_line(cv, LINE))
         return cv, e
 
+    # 主按钮之间的水平间距（设计像素）。Win11 的对话框按钮之间就是这么大。
+    BTN_GAP = 8
+
     def mkbtn(self, parent, text, cmd, kind="ghost"):
+        """造一个主按钮，**横排、右对齐、宽度跟着文字走**（Win11 对话框的摆法）。
+
+        🔴 2026-10-17 改的摆法：原来是 `fill="x"` + 纵向排列 —— 三个按钮各占
+           一整行、横贯卡片，一共吃掉 134px 高。用户原话「可以让它横着排版，
+           充分发挥电脑优势」。现在横排右对齐：高度只占一行（40px），
+           省下的 ~94px 全给了内容区。
+
+        ⚠️ **右对齐的顺序靠 pack 顺序反着来**：`side="right"` 的控件是
+           「先 pack 的贴最右」，所以调用方必须先造主按钮（primary）、
+           最后造 danger —— 视觉上从左到右才是「退出 / 仅保存 / 切换到此账号」，
+           主按钮落在最右边，正是 Win11 的规矩（确认键在右）。
+           调用方顺序写反了**不会报错**，只会让主按钮跑到最左边 ——
+           所以 `_card_form` 那边有一句注释钉着这件事。
+
+        ⚠️ `pack` 里**不能带 `fill="x"`**：`round_button` 已经按文字量好了宽度
+           （见它内部 `measure(text) + pad_x`），一旦 `fill="x"` 就会把这个
+           宽度覆盖掉，又变回通栏 —— 而且不报任何错。
+        """
         style = {
             "primary": (BLUE, "#ffffff", BLUE_DARK, BLUE_ACTIVE),
             "ghost":   (BTN_SOFT, BTN_FG, BTN_HOVER, BTN_ACTIVE),
             "danger":  (DANGER_SOFT, DANGER, DANGER_HOVER, DANGER_ACTIVE),
         }[kind]
-        # 胶囊形：半径 = 高度的一半减 1（见 pill_radius 的说明）。
-        # 原来是 9 —— 在 34px 高的按钮上只有一丝倒角，看着还是方的。
+        # 高度按字号算（换字号时自己跟着走）。半径走圆角规范里的「控件」那一档，
+        # 不再用胶囊 —— Win11 的按钮是**小圆角**，不是两头全圆的胶囊。
         h = self.BASE * 2 + 14
         b = round_button(parent, text, cmd, (self.fam, self.BASE),
                          bg=style[0], fg=style[1], hover=style[2], active=style[3],
                          parent_bg=CARD, height=h, radius=R_CTRL)
-        b.pack(fill="x", pady=(dp(0), dp(7)))
+        b.pack(side="right", padx=(dp(self.BTN_GAP), dp(0)))
         return b
 
     # ------------------------------------------------------------ 状态与刷新
@@ -9502,6 +9608,11 @@ class LoginApp:
         self.root.geometry("%dx%d+%d+%d" % (w, h, x, y))
         ms = minsize_for(sw / UI_SCALE, sh / UI_SCALE)   # 同上：认设计像素
         self.root.minsize(dp(ms[0]), dp(ms[1]))
+        # 窗口圆角（Win11）的**兜底声明**。⚠️ 实测过：本机 Win11 上窗口本来
+        # 就是圆的，这里不会带来视觉变化，它的作用是「防止哪天被系统策略或
+        # 第三方美化工具改回直角」。详见 `enable_round_corners` 的说明。
+        # 放在 geometry 之后：窗口得先有真实尺寸，DWM 才认得这个偏好。
+        self.round_corners = enable_round_corners(self.root)
         if self.smoke:
             self.root.update_idletasks()
             # 🔴 自检里所有模态弹窗都要换成**自动返回**的假框（2026-10-11）。
