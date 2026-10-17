@@ -402,6 +402,9 @@ python refresh_screenshot.py          # ⚠️ 必须在提交**之前**（它�
 git -C repo commit ...
 # 4. 打 tag（锚点）
 git -C repo tag v0.6.0
+# 4b. 🔴 **把分支和 tag 推上去**（2026-10-17 漏过一次）
+git -C repo push origin main
+git -C repo push origin refs/tags/v0.6.0
 # 5. 构建 —— 这一步会**拒绝**在脏工作区上构建
 python repo/build.py                  # 产出 repo/distN/ + BUILD-INFO.txt
 python make_site.py && python make_manifest.py
@@ -411,6 +414,22 @@ python deploy/deploy.py --verify
 python api_push.py --release v0.6.0 --release-body-file rel_notes_v0.6.0.md
 python deploy/deploy.py --verify-sources
 ```
+
+⚠️ **`api_push.py --release` 只建 Release，不碰分支**（脚本自己写着「单独用」）。
+2026-10-17 发 0.6.0 时就照着上面这段跑，结果：**分支没推**（远端落后 22 个提交），
+而远端 `v0.6.0` 还指着**上一轮撤掉的旧 tag**（`80585e8`）—— Release 建出来了、
+资产也是对的，但「View source」和源码包全是旧代码。症状是**没有任何报错**。
+
+所以发完必须核对三件事，一条都不能靠「脚本说成功」：
+
+```bash
+git -C repo ls-remote --tags origin | grep v0.6.0   # 必须等于本地 git rev-parse HEAD
+git -C repo status -sb | head -1                    # 不能有 [ahead N]
+```
+
+🔴 **本地删过 tag 不等于远端删过**。`80585e8` 那条提交就是「撤掉提前打的 v0.6.0 tag」——
+本地删了，远端还留着，下次发版会被它顶替。真遇上就 `git push --force origin
+refs/tags/vX.Y.Z` 挪到正确提交（**仅限这个 tag 从未正式发布过**；发过的 tag 永不移动）。
 
 ⚠️ **旧顺序是「先打包、后提交」**。那个顺序下，exe 是在**工作区可能有未提交改动**的
 状态下打出来的，谁也没法证明它对应哪次提交。现在改成「**提交 → tag → 构建**」，
