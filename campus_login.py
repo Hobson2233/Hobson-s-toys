@@ -73,8 +73,16 @@ import self_history
 # 实测两边重合 15 个，改配色要记得改两处，迟早会漏。
 # 和 updater 同理：顶层 import，**打包时必须让 PyInstaller 看见它**。
 from palette import (BG, CARD, FG, SUB, LINE, FIELD, SEC_FG,
-                     BLUE, BLUE_DARK, BLUE_SOFT,
-                     OK, OK_SOFT, DANGER, DANGER_SOFT, WARN, WARN_SOFT)
+                     BLUE, BLUE_DARK, BLUE_SOFT, BLUE_HOVER, BLUE_ACTIVE,
+                     OK, OK_SOFT, DANGER, DANGER_SOFT, WARN, WARN_SOFT,
+                     # 2026-10-17 换 Fluent 时新增：导航窗格一套 + 次要控件一套。
+                     # 原来是散在本文件里的字面量（`#f1f5f9` / `#e7ecf3` /
+                     # `#d3e0ff` / `#dbe1eb`…），换配色时得逐个 grep 才不会漏。
+                     NAV_BG, NAV_HOVER, NAV_ACTIVE, NAV_BAR,
+                     BTN_SOFT, BTN_SOFT_ON_BG, BTN_HOVER, BTN_ACTIVE, BTN_PRESS,
+                     BTN_FG, DANGER_HOVER, DANGER_ACTIVE, CHECK_EDGE, NEUTRAL_SOFT,
+                     MUTED, BLUE_PRESS, OK_FG, DANGER_FG, BLUE_FG,
+                     CHART_AVG, CHART_ZERO)
 
 APP_NAME = "CampusLogin"
 APP_TITLE = "校园网自动登录"
@@ -1790,10 +1798,10 @@ NET_TEXT = {
 }
 
 NET_COLOR = {
-    NET_OFF_CAMPUS: "#94a3b8",
-    NET_OK: "#16a34a",
-    NET_NEED_LOGIN: "#dc2626",
-    NET_UNKNOWN: "#94a3b8",
+    NET_OFF_CAMPUS: MUTED,
+    NET_OK: OK,
+    NET_NEED_LOGIN: DANGER,
+    NET_UNKNOWN: MUTED,
 }
 
 
@@ -3859,7 +3867,7 @@ HELP_TEXT = (("校园网自动登录 —— 使用说明（v%s）\n" % VERSION) 
 
   左边竖着一排入口：设置 / 账号中心 / 使用说明。点一下就换页，不用为每个功能
   各开一个窗口 —— 想同时看好几样，来回点也不会满屏都是窗口。当前在哪一页，
-  那一行就是蓝底。
+  那一行就是白底 + 左边一道蓝色竖条。
 
   · 设置      就是这一页：账号、开机自启、隐私、网络状态。
   · 账号中心  「你有账号的那所学校（郑航）」的账号情况，见下一节。
@@ -4121,7 +4129,7 @@ class PasswordField(object):
         # 水平：左边旧 `1+10=11`、新 `8+3=11`；右边旧 `1+8=9`、新 `1+8=9`。
         # `self.box` 仍然是那个「可以 pack 的控件」（现在是 Canvas）——
         # pwd_gui_test 和 run_gui 都是直接 pack 它，没有别的用法。
-        self.box, _body = round_panel(parent, tk, 8, 5, 5)
+        self.box, _body = round_panel(parent, tk, dp(8), dp(5), R_CTRL)
         self.entry = tk.Entry(_body, font=font_main, relief="flat", bd=0,
                               bg=CARD, fg=fg, highlightthickness=0,
                               insertbackground=fg)
@@ -4371,6 +4379,28 @@ def dp(v):
 
 OUTER_PAD = dp(14)      # 最外层留白
 INNER_PAD = dp(14)      # 卡片内留白
+
+# ---------------------------------------------------------------- 圆角规范（2026-10-17）
+# 🔴 换 Win11 Fluent 时立的规矩：**圆角只有四档**，每一档有明确的用途。
+#    在这之前是「每个控件各写一个数」（卡片 14 / 状态卡 11 / 导航项 9 /
+#    导航面板 12 / 输入框 5 / 按钮是胶囊），五个数各不一样 ——
+#    那本身就是「没有规则」的观感来源，也正是「看着不专业」的一部分。
+#
+#    Win11 的实际取值就是「大容器 8、小控件 4~5」这么简单，照抄即可：
+#      · `R_CARD`   —— 卡片 / 面板 / 导航窗格这类**大容器**
+#      · `NAV_R`    —— 导航项（比卡片小一档）
+#      · `R_CTRL`   —— 按钮 / 输入框这类**控件**
+#      · `R_CHIP`   —— 徽章 / 标签（胶囊，跟着高度走，见 `pill_radius`）
+#
+#    ⚠️ 这四个都必须是**物理像素**（`dp()` 过）—— 它们最终喂给
+#       `_draw_round_rect`，和 `winfo_width()` 量出来的物理尺寸直接比。
+#    ⚠️ 还有一条硬约束：`round_panel` 要求 `pad_x >= radius` 且 `pad_y >= radius`。
+#       改大 `R_CARD` 时要连带检查卡片的 `padx` / `ipady`。
+R_CARD = dp(8)
+NAV_R = dp(6)
+R_CTRL = dp(5)
+# 导航项选中时左侧那条强调竖条的宽度（Win11 用 3px）。
+NAV_BAR_W = dp(3)
 
 # ---- 「一个窗口、多个页面」的骨架（2026-10-16） ----
 # 🔴 用户原话：「如果咱们软件每加一个新功能就要加一个窗口，那用户同时看好几个
@@ -4899,10 +4929,10 @@ def update_wiring_check(btn_ver):
 #    写死在 NET_COLOR 旁边就得把 `#e7f7ec` 再抄一遍 —— 抄一遍就是一处漂移源。
 #    NET_COLOR 本身不依赖任何 UI 常量（命令行也要用），所以它留在原处。
 NET_SOFT = {
-    NET_OFF_CAMPUS: "#eef2f7",
+    NET_OFF_CAMPUS: NEUTRAL_SOFT,
     NET_OK: OK_SOFT,
     NET_NEED_LOGIN: DANGER_SOFT,
-    NET_UNKNOWN: "#eef2f7",
+    NET_UNKNOWN: NEUTRAL_SOFT,
 }
 
 
@@ -4925,13 +4955,13 @@ def _walk_widgets(w):
 
 
 # 两个颜色至少差这么多（单通道最大差，0~255）才算「看得出是两种颜色」。
-# 参照现有取值定：账号行「选用」按钮 #f1f5f9 落在白卡 #ffffff 上，差 14 ——
+# 参照现有取值定：次要按钮 BTN_SOFT #f5f5f5 落在白卡 CARD #ffffff 上，差 10 ——
 # 那是肉眼一眼就能分辨的程度。取 8 留一点余量，但足够拦住「几乎同色」。
 _CONTRAST_MIN = 8
 
 # 默认「禁用灰」在浅底上撞了背景时改用的颜色。
-# 比 BG(#eef1f6) 深 15 级、比 CARD(#ffffff) 深 32 级，两个底上都看得出来。
-_DISABLED_FALLBACK = "#dfe5ee"
+# 比 BG(#f3f3f3) 深 29 级、比 CARD(#ffffff) 深 41 级，两个底上都看得出来。
+_DISABLED_FALLBACK = "#d6d6d6"
 
 
 def _color_delta(a, b):
@@ -4961,12 +4991,15 @@ def ui_contrast_check(root):
     """在**真实控件树**里核对：每个圆角按钮的填充色都和它坐的背景分得开。
 
     为什么需要（2026-10-04 实测踩到）：
-        「使用说明」按钮的静止底色一开始写成了 `#eef1f6` —— 那正是页面底色 BG。
+        「使用说明」按钮的静止底色一开始写成了页面底色 BG 的那个值。
         结果按钮和背景完全融成一片，截图里就剩四个灰字，跟普通说明文字没区别，
         用户根本不会去点。这类错**不抛任何异常**：逻辑自检全绿、窗口照常显示、
         `--guitest` 也是 GUI_OK，只有把截图放大若干倍才看得出来。
-        静态读源码同样靠不住 —— `bg="#eef1f6"` 和几百行外的 `BG = "#eef1f6"`
-        隔着半屏，肉眼对不上。
+        静态读源码同样靠不住 —— 那个字面色和几百行外的 `BG` 常量隔着半屏，
+        肉眼对不上（而且换配色时它们会**一起变**，更看不出问题）。
+        ⚠️ 2026-10-17 换 Fluent 时同一个坑又露头了一次（新的 BG 是浅灰，
+           「落在页面灰底上的按钮」很容易选到和它只差 2 级的颜色）——
+           是这个自检在构建时拦下的，不是靠眼睛。
 
         所以这里**不看源码，直接问控件**：「你的填充色和你的背景色一样吗？」
         要查的三种填充色都挂在按钮上（见 round_button 里的 `_rb_*`）：
@@ -5088,7 +5121,16 @@ def round_chip(parent, tk, text, font, fg, soft, page=CARD, pad_x=dp(9),
 
     st = {"text": text, "font": font, "fg": fg, "bg": soft, "hover": hover,
           "hovering": False, "state": "normal"}
-    r = pill_radius(height) if radius is None else radius
+    # 🔴 2026-10-17（换 Fluent）：**能点的用 `R_CTRL`，纯标签才用胶囊**。
+    #    Win11 里「可以点的东西」是 4~5px 的小圆角矩形，只有徽章 / 计数那种
+    #    **纯展示**的才是胶囊。原来这里一律胶囊，于是「检查更新」「测一下速度」
+    #    「选用」「删除」全都长得像徽章 —— 分不出哪个能点。
+    #    ⚠️ 判据是 `command` 传没传，**不是**「看着像不像按钮」：
+    #       传了 command 就是按钮，没传就是标签，这在调用点是一目了然的。
+    if radius is None:
+        r = R_CTRL if command else pill_radius(height)
+    else:
+        r = radius
 
     def measure():
         try:
@@ -5166,9 +5208,17 @@ def round_chip(parent, tk, text, font, fg, soft, page=CARD, pad_x=dp(9),
 
 
 def nav_button(parent, tk, text, icon, font, command, width, height=dp(38),
-               fg=SUB, active_fg=BLUE_DARK, active_fill=BLUE_SOFT, page=BG,
-               hover="#eef2f7"):
+               fg=SUB, active_fg=BLUE, active_fill=NAV_ACTIVE, page=NAV_BG,
+               hover=NAV_HOVER):
     """左侧导航栏里的一项：**左边图标 + 右边一行字**，整条可点。
+
+    🔴 2026-10-17 改成 Win11 的画法（换 Fluent 时）：
+        选中项 = **白色圆角底 + 左侧一条强调竖条**，未选中项完全透明。
+        原来是「浅蓝底 + 深蓝字」—— 那是网页后台侧栏的观感。
+        ⚠️ 底色也跟着从 `BG` 换成了 `NAV_BG`（比内容区深一档）——
+           Win11 的导航窗格不是一张白卡片，见 palette.NAV_BG 的说明。
+           这一条由 `ui_contrast_test` 的「导航项底色必须和 NAV_BG 分得开」
+           那段钉着（悬停态差 11 级）。
 
     🔴 为什么不直接用 `round_chip`（导航项和它长得像）：
         `round_chip` 的宽度是**按文字量出来的**、文字还是**居中**的。
@@ -5177,12 +5227,12 @@ def nav_button(parent, tk, text, icon, font, command, width, height=dp(38),
         看着就是「没做完」。所以这里单独写一个。
 
     🔴 **故意不挂 `_rb_bg`**（`round_chip` / `round_button` 都挂了）：
-        未选中的导航项**本来就是透明的**（露出底下那张白面板），
+        未选中的导航项**本来就是透明的**（露出底下的导航窗格底色），
         这是标签页的通用画法，不是「按钮和背景同色」那种缺陷。
         挂上去会被 `ui_contrast_check` 判成「按钮隐形」而误报 ——
         而那个自检是**硬拦构建**的（UI_FAIL_PHRASE）。宁可少查一项，
         也不能让一条会误报的自检天天挡发布。
-        选中态靠 `set_active(True)` 的浅蓝底区分，这一条由
+        选中态靠 `set_active(True)` 的白底 + 强调条区分，这一条由
         `selfwin_test.py` 的导航段单独钉着。
 
     ⚠️ 图标名不认识时**当场抛异常**，不静默画空白：
@@ -5216,9 +5266,21 @@ def nav_button(parent, tk, text, icon, font, command, width, height=dp(38),
         else:
             bg = hover if st["hovering"] else None
         if bg:
-            _draw_round_rect(cv, 0, 0, width, height, 9, bg)
-        _draw_icon(cv, icon, col, 20, height / 2.0, 15.0)
-        cv.create_text(38, height / 2.0, text=st["text"], font=font,
+            _draw_round_rect(cv, 0, 0, width, height, NAV_R, bg)
+        if on:
+            # 选中项的左侧强调竖条（Win11 导航窗格的标志性画法）。
+            # ⚠️ 画在白色高亮**里面**、贴着左边缘。画在高亮外面就得给每一项
+            #    都留出这一条的空白，`NAV_W` 会跟着变 —— 不值当。
+            # ⚠️ 半径取 `bw//2 - 1` 而不是 `bw//2`：`_draw_round_rect` 在
+            #    `2r >= 短边` 时会**静默退回画直角矩形**（那是给 r<=0 准备的兜底），
+            #    `bw//2` 正好踩在边界上。和 `pill_radius` 同一个坑。
+            bw = NAV_BAR_W
+            bh = min(height - dp(12), dp(18))
+            _draw_round_rect(cv, dp(6), (height - bh) / 2.0,
+                             dp(6) + bw, (height + bh) / 2.0,
+                             max(1, bw // 2 - 1), NAV_BAR)
+        _draw_icon(cv, icon, col, dp(20), height / 2.0, dp(15))
+        cv.create_text(dp(38), height / 2.0, text=st["text"], font=font,
                        fill=col, anchor="w")
         cv._rb_text = st["text"]
 
@@ -5243,7 +5305,7 @@ def nav_button(parent, tk, text, icon, font, command, width, height=dp(38),
 
 
 def round_check(parent, tk, text, var, command, font, page=CARD, fg=FG,
-                box=dp(18), radius=dp(5), gap=dp(9), pad_y=dp(3), disabled_fg="#a3adbb"):
+                box=dp(18), radius=dp(5), gap=dp(9), pad_y=dp(3), disabled_fg=MUTED):
     """圆角复选框：Canvas 画的圆角方框 + 对勾，右边跟一句说明文字。返回外层 Frame。
 
     ⚠️ 为什么不用 `tk.Checkbutton`：
@@ -5279,7 +5341,7 @@ def round_check(parent, tk, text, var, command, font, page=CARD, fg=FG,
             edge = _DISABLED_FALLBACK
             inner = _DISABLED_FALLBACK if on else page
         else:
-            edge = BLUE if on else "#c7d0dc"
+            edge = BLUE if on else CHECK_EDGE
             inner = BLUE if on else page
         cv.delete("all")
         # 1.5px 圆角描边 = 外圈描边色 + 内圈缩进 1.5 的填充色。
@@ -5348,7 +5410,7 @@ def round_panel(parent, tk, pad_x, pad_y, radius, fill=CARD, line=LINE, page=BG,
                 stretch=False):
     """造一个圆角面板，返回 `(canvas, body)`。
 
-    用法：`cv, body = round_panel(parent, tk, 19, 15, 14)`，把内容塞进 body，
+    用法：`cv, body = round_panel(parent, tk, dp(19), dp(15), R_CARD)`，把内容塞进 body，
     再 `cv.pack(fill="x", ...)`。
 
     ⚠️ 约束（**必须成立，否则圆角会被内容糊成方的**）：
@@ -5582,7 +5644,7 @@ def icon_badge(parent, tk, name, fg, soft, box=dp(22), radius=dp(7), icon=13.0,
 
 def round_button(parent, text, command, font, bg, fg, hover, active, parent_bg,
                  height=dp(38), radius=dp(9), width=None, pad_x=dp(30),
-                 disabled_bg="#eef1f6", disabled_fg="#a3adbb"):
+                 disabled_bg=BG, disabled_fg=MUTED):
     """造一个圆角按钮，返回控件。
 
     ⚠️ 为什么是**工厂函数**而不是 `class RoundButton(tk.Canvas)`：
@@ -5618,9 +5680,12 @@ def round_button(parent, text, command, font, bg, fg, hover, active, parent_bg,
 
     st = {"state": "normal", "hover": False, "pressed": False}
 
-    # ⚠️ 默认的「禁用灰」`#eef1f6` 在**页面底色**上会跟背景融成一片（它正是 BG 本身），
-    #    那样一禁用按钮就整个消失了，用户只会觉得界面坏了。这里只在它真的和
-    #    背景分不开时才换一档更深的灰，调用方传了能用的颜色就不动它。
+    # ⚠️ 默认的「禁用灰」就是**页面底色本身**（`disabled_bg=BG`）——
+    #    那样一禁用按钮就会跟背景融成一片，用户只会觉得界面坏了。这里只在它
+    #    真的和背景分不开时才换一档更深的灰，调用方传了能用的颜色就不动它。
+    #    🔴 默认值写成常量 `BG` 而不是抄一遍它的字面量：抄一遍就是一处漂移源
+    #       （换配色时必漏），而且 `ui_contrast_test` 里那条「两个默认色确实是
+    #       同一个值」的断言会静默变成测空气。2026-10-17 换 Fluent 时踩到过。
     disabled_bg = _pick_disabled_bg(disabled_bg, parent_bg)
 
     # 不给宽度就按文字量出来。Canvas 的默认宽度是 378px —— 拿它当按钮宽度
@@ -5790,7 +5855,7 @@ def text_panel(parent, tk, fam, base, text, pad=OUTER_PAD):
     wrap.pack(fill="both", expand=True, padx=pad, pady=(pad, 0))
     sb = tk.Scrollbar(wrap)
     sb.pack(side="right", fill="y", padx=(dp(8), dp(0)))
-    body_cv, body = round_panel(wrap, tk, 15, 13, 12, stretch=True)
+    body_cv, body = round_panel(wrap, tk, dp(15), dp(13), R_CARD, stretch=True)
     body_cv.pack(side="left", fill="both", expand=True)
     txt = tk.Text(body, wrap="word", font=(fam, base), bg=CARD, fg=FG,
                   relief="flat", bd=0, padx=dp(14), pady=dp(12), cursor="arrow",
@@ -5815,8 +5880,8 @@ def text_panel_bar(parent, tk, fam, base, command, label="知道了",
     bar.pack(fill="x", padx=pad, pady=pad)
     h = base * 2 + 16
     round_button(bar, label, command, (fam, base),
-                 bg=BLUE, fg="#ffffff", hover=BLUE_DARK, active="#1e40af",
-                 parent_bg=BG, height=h, radius=pill_radius(h)
+                 bg=BLUE, fg="#ffffff", hover=BLUE_DARK, active=BLUE_ACTIVE,
+                 parent_bg=BG, height=h, radius=R_CTRL
                  ).pack(side="right")
     return bar
 
@@ -5880,7 +5945,7 @@ SELF_LOGIN_MAX = 3
 CAPTCHA_W, CAPTCHA_H = 130, 40
 CAPTCHA_ZOOM = dp(4)
 
-# 卡片的内边距（和 `round_panel(pad_x=14, pad_y=12, radius=11)` 对应）。
+# 卡片的内边距（和 `round_panel(pad_x=14, pad_y=12, radius=R_CARD)` 对应）。
 # 放在这里是为了让下面的宽度算式**只有一处** —— 面板宽度、画布宽度、
 # 验证码放不放得下，全从这几个数推出来。
 _PANEL_PAD = dp(14)
@@ -6077,15 +6142,15 @@ class SelfServiceWindow(object):
         # 🔴 账号**必须显示出来**：这个面板看的是「界面上那个账号」的数据，
         #    而本机历史是按账号存的 —— 不写清楚是哪个账号，用户会以为看的是
         #    另一个（而且两边数据都「看着正常」，看不出错）。
-        round_chip(self.head, tk, account, (fam, base - 2), SUB, "#e9edf3",
+        round_chip(self.head, tk, account, (fam, base - 2), SUB, NEUTRAL_SOFT,
                    page=BG).pack(side="left", padx=(dp(10), dp(0)))
         round_chip(self.head, tk, "学校自助服务 · 只读", (fam, base - 2), SUB,
-                   "#e9edf3", page=BG).pack(side="left", padx=(dp(6), dp(0)))
+                   NEUTRAL_SOFT, page=BG).pack(side="left", padx=(dp(6), dp(0)))
         h = base * 2 + 14
         self.btn_sync = round_button(
             self.head, "同步数据", self.start_sync, (fam, base),
-            bg=BLUE, fg="#ffffff", hover=BLUE_DARK, active="#1e40af",
-            parent_bg=BG, height=h, radius=pill_radius(h))
+            bg=BLUE, fg="#ffffff", hover=BLUE_DARK, active=BLUE_ACTIVE,
+            parent_bg=BG, height=h, radius=R_CTRL)
         self.btn_sync.pack(side="right")
 
         # --- 中间：可滚动正文 ---
@@ -6129,14 +6194,14 @@ class SelfServiceWindow(object):
         #    画一个「关闭」会让人以为「关掉整个程序」（主窗口那个 X 才是）。
         if not self.embedded:
             round_button(self.foot, "关闭", self.close, (fam, base),
-                         bg="#dbe1eb", fg="#475569", hover="#ccd5e3",
-                         active="#bfc9da", parent_bg=BG, height=h,
-                         radius=pill_radius(h)).pack(side="right")
+                         bg=BTN_SOFT_ON_BG, fg=BTN_FG, hover=BTN_ACTIVE,
+                         active=BTN_PRESS, parent_bg=BG, height=h,
+                         radius=R_CTRL).pack(side="right")
         # 「清掉本机历史」：**故意和主界面的「清除本机保存的账号密码」分开** ——
         # 那个不删流量历史（用户要的就是「以后不登录也能看」），所以这里给一个
         # 单独的入口，让想删的人删得掉。
         round_chip(self.foot, tk, "清掉本机历史", (fam, base - 1), SUB,
-                   "#e9edf3", page=BG, height=h, hover="#dbe1eb",
+                   NEUTRAL_SOFT, page=BG, height=h, hover=BTN_ACTIVE,
                    command=self.clear_history).pack(side="right", padx=(dp(0), dp(10)))
 
         self.win.after(80, self._pump)
@@ -6777,7 +6842,7 @@ class SelfServiceWindow(object):
             self.tk.Label(parent, text=title, bg=BG, fg=SUB,
                           font=(self.fam, self.base - 1)
                           ).pack(anchor="w", pady=(dp(8), dp(4)))
-        cv, inner = round_panel(parent, self.tk, _CARD_PAD_X, 12, 11)
+        cv, inner = round_panel(parent, self.tk, _CARD_PAD_X, dp(12), R_CARD)
         cv.pack(fill="x")
         return inner
 
@@ -6803,7 +6868,7 @@ class SelfServiceWindow(object):
         return round_button(parent, text, command, (self.fam, self.base - 1),
                             bg=bg, fg=fg, hover=hover, active=active,
                             parent_bg=CARD, height=h, pad_x=dp(14),
-                            radius=pill_radius(h))
+                            radius=R_CTRL)
 
     def _busy_note(self, text):
         """把正文换成一句「正在…」。**只用在同步过程中**（那时没有别的东西可看）。"""
@@ -6972,12 +7037,12 @@ class SelfServiceWindow(object):
                 if state == "正常":
                     self._mini_button(
                         inner, "停机", self._stop_now,
-                        "#fdecec", DANGER, "#fbdcdc", "#f8caca"
+                        DANGER_SOFT, DANGER, DANGER_HOVER, DANGER_ACTIVE
                     ).pack(anchor="e", pady=(dp(6), dp(0)))
                 elif state == "停机中":
                     self._mini_button(
                         inner, "复机", self._recover,
-                        BLUE_SOFT, BLUE_DARK, "#dbe6ff", "#cddcff"
+                        BLUE_SOFT, BLUE_DARK, BLUE_HOVER, BLUE_PRESS
                     ).pack(anchor="e", pady=(dp(6), dp(0)))
 
         self._row(inner, "上网套餐", d.get("plan") or "-")
@@ -7161,7 +7226,7 @@ class SelfServiceWindow(object):
             if self._can_act():
                 self._mini_button(
                     inner, "下线这台", (lambda x=x: self._kick(x)),
-                    "#fdecec", DANGER, "#fbdcdc", "#f8caca"
+                    DANGER_SOFT, DANGER, DANGER_HOVER, DANGER_ACTIVE
                 ).pack(anchor="e", pady=(dp(6), dp(0)))
 
     # ------------------------------------------------------------ 账号资料卡
@@ -7304,7 +7369,7 @@ class SelfServiceWindow(object):
                 if self._can_act():
                     self._mini_button(
                         inner, "解绑", (lambda y=x: self._unbind(y)),
-                        "#fdecec", DANGER, "#fbdcdc", "#f8caca"
+                        DANGER_SOFT, DANGER, DANGER_HOVER, DANGER_ACTIVE
                     ).pack(anchor="e", pady=(dp(4), dp(0)))
 
         if not shown[0] and not binds:
@@ -7524,8 +7589,8 @@ class SelfServiceWindow(object):
             on = (self.view == key)
             round_chip(bar, self.tk, label, (self.fam, self.base - 1),
                        "#ffffff" if on else SUB,
-                       BLUE if on else "#eef1f6", page=CARD, height=dp(22),
-                       hover=None if on else "#e2e8f0",
+                       BLUE if on else NEUTRAL_SOFT, page=CARD, height=dp(22),
+                       hover=None if on else BTN_ACTIVE,
                        command=(lambda k=key: self.set_view(k))).pack(
                 side="left", padx=(dp(0), dp(6)))
         if self.view == "day" and days:
@@ -7563,7 +7628,7 @@ class SelfServiceWindow(object):
             if sym == " ":
                 continue
             round_chip(nav, self.tk, sym, (self.fam, self.base), BLUE_DARK,
-                       BLUE_SOFT, page=CARD, height=dp(20), hover="#d3e0ff",
+                       BLUE_SOFT, page=CARD, height=dp(20), hover=BLUE_HOVER,
                        command=(lambda d=delta: self.shift_month(d))
                        ).pack(side="left", padx=(dp(0), dp(4)))
         self.tk.Label(nav, text="%s 年 %s 月" % (self.ym[:4], int(self.ym[5:])),
@@ -7642,7 +7707,7 @@ class SelfServiceWindow(object):
         avg = total / n
         if avg > 0:
             ay = base_y - plot_h * (avg / vmax)
-            cv.create_line(0, ay, self.cw, ay, fill="#c7d2fe", dash=(4, 3))
+            cv.create_line(0, ay, self.cw, ay, fill=CHART_AVG, dash=(4, 3))
             cv.create_text(self.cw - 2, ay - 7, anchor="e",
                            text="日均 %s" % self_service.fmt_flow_short(avg),
                            fill=SUB, font=(self.fam, self.base - 4))
@@ -7663,7 +7728,7 @@ class SelfServiceWindow(object):
             else:
                 # 确实用了 0 ⇒ 画一小段浅色，和「没有这根柱子」区分开
                 cv.create_rectangle(cx - bw / 2, base_y - 2, cx + bw / 2,
-                                    base_y, fill="#cbd5e1", outline="")
+                                    base_y, fill=CHART_ZERO, outline="")
             if i == imax or i % step == 0:
                 cv.create_text(cx, base_y - hgt - 11,
                                text=self_service.fmt_flow_short(v),
@@ -7818,13 +7883,13 @@ class SelfServiceWindow(object):
         if not left:
             round_button(btns, "确定", self._submit, (self.fam, self.base),
                          bg=BLUE, fg="#ffffff", hover=BLUE_DARK,
-                         active="#1e40af", parent_bg=CARD, height=h,
-                         radius=pill_radius(h)).pack(side="left", padx=(dp(0), dp(8)))
+                         active=BLUE_ACTIVE, parent_bg=CARD, height=h,
+                         radius=R_CTRL).pack(side="left", padx=(dp(0), dp(8)))
         round_chip(btns, self.tk, "换一张", (self.fam, self.base),
                    BLUE_DARK, BLUE_SOFT, page=CARD, height=h,
                    command=self._renew).pack(side="left", padx=(dp(0), dp(8)))
         round_chip(btns, self.tk, "取消", (self.fam, self.base), SUB,
-                   "#eef1f6", page=CARD, height=h, hover="#e2e8f0",
+                   NEUTRAL_SOFT, page=CARD, height=h, hover=BTN_ACTIVE,
                    command=self._cancel).pack(side="left")
         self._autosize()
 
@@ -7902,27 +7967,36 @@ class LoginApp:
     """
 
     # 卡片的内边距与圆角半径。**这三个数是几何常量，不是审美参数** ——
-    # 它们和旧实现（1px 描边的 Frame + `body.pack(padx=18, pady=14)`）
-    # **逐像素等价**：
-    #     旧：box 高 = body + 2×14(ipady) + 2×1(highlightthickness) = body + 30
-    #         body 宽 = inner 宽 - 2×18 - 2×1                        = inner 宽 - 38
-    #     新：cv  高 = body + 2×15                                    = body + 30
-    #         body 宽 = cv 宽 - 2×19                                  = inner 宽 - 38
-    # 也就是说：**光换卡片实现本身，内容高度一个像素都没变**（实测验证过：
-    # 旧/新实现在同一份数据下都量到 814）。
-    # 🔴 但这一轮改版最后 CONTENT_H 还是从 830 变成了 **827**，来源是另外三处
-    #    （列表容器去掉方角描边 −2、开机自启换成圆角复选框 +1、隐私区的小链接
-    #      换成圆角片 −2）。所以别把「card() 是等价的」误读成「这一轮不用重量」。
+    # 改一个数字，窗口高度就跟着变（窗口高度 = 内容高度，见 `window_geometry`）。
+    #
+    # 📜 历史（2026-10-04 把卡片从「1px 描边的 Frame」换成圆角 Canvas 时）：
+    #     当时刻意做到**逐像素等价** ——
+    #       旧：box 高 = body + 2×14(ipady) + 2×1(highlightthickness) = body + 30
+    #           body 宽 = inner 宽 - 2×18 - 2×1                        = inner 宽 - 38
+    #       新：cv  高 = body + 2×15                                    = body + 30
+    #           body 宽 = cv 宽 - 2×19                                  = inner 宽 - 38
+    #     所以「光换卡片实现本身」内容高度一个像素都没变（实测：新旧都量到 814）。
+    #     ⚠️ 别把这条历史误读成「改卡片不用重量」——同一轮里另外三处改动
+    #        （列表去掉方角描边 −2、自启换圆角复选框 +1、隐私小链接换圆角片 −2）
+    #        还是让 CONTENT_H 从 830 变成了 827。
     # 🔴 谁要动这三个数，必须同时跑 `content_h_probe.py` 重新量，
     #    并把结果同步进 `geometry_test.py` 的 CONTENT_H / MEASURED_HEIGHTS。
     # 🔴 还有一条硬约束：`pad_x >= radius` 且 `pad_y >= radius`（round_panel 会断言）。
     #    违反的话 body 那块白矩形会盖住圆角，看着就像「圆角没生效」。
     #
+    # 🔴 2026-10-17（换 Fluent）：**这三个数原来没有套 `dp()`** —— 是个漏网的
+    #    单位 bug。2026-10-16 打开高 DPI 感知之后，所有尺寸的含义都从
+    #    「设计像素」变成了「物理像素」（见 `dp()` 的说明），而这三个数漏掉了，
+    #    于是 150% 的屏上卡片内边距实际只有 15px（设计上要的是 15 设计像素
+    #    = 22.5px）—— 卡片挤得像没有内边距，这正是用户说「UI 太丑」的一部分。
+    #    补上 `dp()` 之后卡片才恢复该有的呼吸感。
+    #    ⚠️ 连带后果：内容高度涨了（5 张卡 × 每张 +14px），`CONTENT_H` 必须重量。
+    #
     # （放在类属性而不是 __init__ 里：`card()` 的默认参数要在**类定义时**求值，
     #   那一刻还没有 self —— 见 `card()` 的签名。）
-    CARD_PAD_X = 19
-    CARD_PAD_Y = 15
-    CARD_R = 14
+    CARD_PAD_X = dp(19)
+    CARD_PAD_Y = dp(15)
+    CARD_R = R_CARD
 
     def __init__(self, smoke=False):
         import tkinter as tk
@@ -8076,15 +8150,17 @@ class LoginApp:
         # `set_busy()` 改文字/配色和 `update_wiring_check()` 的点击自检都照常工作。
         self.btn_ver = round_chip(head, tk, "v%s　检查更新" % VERSION,
                                   (self.fam, self.SMALL, "underline"), BLUE_DARK, BLUE_SOFT,
-                                  page=BG, height=self.SMALL + 14, hover="#d3e0ff",
+                                  page=BG, height=self.SMALL + 14, hover=BLUE_HOVER,
                                   command=lambda: self.on_check_update())
         self.btn_ver.pack(side="left", padx=(dp(10), dp(0)))
         # ⚠️ 静止态底色**必须比页面底色 BG 明显深一点**（2026-10-04 实测踩到）：
-        #    第一版这里写的是 `bg="#eef1f6"` —— 那正是 BG 本身，于是按钮和背景完全
-        #    融成一片，截图里就剩四个灰字，和普通说明文字毫无区别，用户根本不会去点。
+        #    第一版这里写的是「BG 本身那个值」，于是按钮和背景完全融成一片，
+        #    截图里就剩四个灰字，和普通说明文字毫无区别，用户根本不会去点。
         #    这类错**没有任何报错**，只有把截图放大才看得出来。
-        #    取值参照账号行「选用」按钮（#f1f5f9 落在白卡 #ffffff 上，差 14 级）——
-        #    这里也取与 BG 差 18 级左右的一档，保证一眼能看出是个按钮。
+        #    ⚠️ 2026-10-17 换 Fluent 时**又差点踩一次**：新的 BG 是 `#f3f3f3`，
+        #       而「落在页面灰底上的次要按钮」那档 `BTN_SOFT_ON_BG`(`#e9e9e9`)
+        #       就是照着「和 BG 差 10 级」选的 —— 别再顺手改回浅色。
+        #       `ui_contrast_test.py` 第 7 节把这一对钉着。
         #
         # 🔴 2026-10-16：原来这里还有个「使用说明」按钮，**删掉了**。
         #    它和左侧导航栏里的「使用说明」是同一个页面 —— 两个入口并列，
@@ -8102,7 +8178,7 @@ class LoginApp:
         #
         # ⚠️ 内边距 12/17 是量出来的：旧实现是「1px 描边 + pady=11」= 24，
         #    这里 2×12 = 24，**逐像素等价**。半径必须 <= 内边距（round_panel 会断言）。
-        status_cv, status_body = round_panel(inner, tk, 17, 12, 11)
+        status_cv, status_body = round_panel(inner, tk, dp(17), dp(12), R_CARD)
         status_cv.pack(fill="x", pady=(dp(0), dp(10)))
         st_icon = tk.Canvas(status_body, width=dp(22), height=dp(22), bg=CARD,
                             highlightthickness=0, bd=0)
@@ -8125,7 +8201,7 @@ class LoginApp:
         # （主按钮固定三个是界面铁律）。
         self.btn_probe = round_chip(
             status_body, tk, "测一下速度", (self.fam, self.SMALL), BLUE_DARK, BLUE_SOFT,
-            height=self.SMALL + 14, hover="#d3e0ff",
+            height=self.SMALL + 14, hover=BLUE_HOVER,
             command=lambda: self.on_speed_probe())
         self.btn_probe.pack(side="right")
 
@@ -8240,7 +8316,7 @@ class LoginApp:
         # 一模一样，用户根本不会去点。下划线 + 浅红底 + hover 加深，才看得出能点。
         self.btn_purge = round_chip(c_priv, tk, "清除本机保存的账号密码",
                                     (self.fam, self.SMALL, "underline"), DANGER, DANGER_SOFT,
-                                    height=self.SMALL + 14, hover="#fbdada",
+                                    height=self.SMALL + 14, hover=DANGER_HOVER,
                                     command=lambda: self.on_purge())
         self.btn_purge.pack(anchor="w", pady=(dp(10), dp(0)))
 
@@ -8268,19 +8344,26 @@ class LoginApp:
         """搭左侧导航栏。
 
         ⚠️ 导航面板的 `pad_x`/`pad_y` **必须 >= radius**（`round_panel` 的硬约束，
-           不满足会当场抛异常）—— 这里取 12/12/12。
+           不满足会当场抛异常）—— 这里取 12/12 配 `R_CARD`(8)。
+
+        🔴 2026-10-17 换 Fluent：面板底色从 `CARD`（白）改成 `NAV_BG`（比内容区
+           深一档的灰），且**描边同色**（= 看不见描边）。Win11 的导航窗格是
+           和窗口同色的一整条，不是一张浮在上面的白卡片。
         """
-        cv, body = round_panel(self.nav, self.tk, 12, 12, 12)
+        cv, body = round_panel(self.nav, self.tk, dp(12), dp(12), R_CARD,
+                               fill=NAV_BG, line=NAV_BG)
         cv.pack(fill="both", expand=True)
         self.nav_btns = {}
-        inner_w = NAV_W - 24              # 减去卡片两侧内边距
+        # ⚠️ 两侧内边距要和上面 `round_panel` 的 `pad_x` 一致（都是 dp(12)），
+        #    否则导航项会伸进圆角里、或者右边空出一截。
+        inner_w = NAV_W - 2 * dp(12)
         h = self.BASE * 2 + 18
         for key, label, icon in self.PAGES:
             if key == "center" and not self_service_available():
                 continue
             b = nav_button(body, self.tk, label, icon, (self.fam, self.BASE),
                            (lambda k=key: self.show_page(k)),
-                           width=inner_w, height=h, page=CARD)
+                           width=inner_w, height=h, page=NAV_BG)
             b.pack(fill="x", pady=(dp(0), dp(4)))
             self.nav_btns[key] = b
 
@@ -8510,7 +8593,7 @@ class LoginApp:
         self.chip_school = round_chip(
             row, self.tk, self._school_chip_text(), (self.fam, self.SMALL),
             BLUE_DARK, BLUE_SOFT, page=CARD, pad_x=dp(11), height=self.title_row_h(),
-            hover="#d3e0ff", command=lambda: self._open_school_menu(holder["cv"]))
+            hover=BLUE_HOVER, command=lambda: self._open_school_menu(holder["cv"]))
         holder["cv"] = self.chip_school
         self.chip_school.pack(side="left")
         return row
@@ -8555,7 +8638,7 @@ class LoginApp:
             半径必须 <= pad_y，而 pad_y 一加大整块就变高。
             顺带也符合常规做法：输入框的圆角本来就该比卡片小。
         """
-        cv, box = round_panel(parent, self.tk, 8, 6, 5, fill=FIELD)
+        cv, box = round_panel(parent, self.tk, dp(8), dp(6), R_CTRL, fill=FIELD)
         cv.pack(fill="x")
         e = self.tk.Entry(box, font=(self.fam, self.BASE), relief="flat", bd=0,
                           bg=FIELD, fg=FG, highlightthickness=0, insertbackground=FG,
@@ -8567,16 +8650,16 @@ class LoginApp:
 
     def mkbtn(self, parent, text, cmd, kind="ghost"):
         style = {
-            "primary": (BLUE, "#ffffff", BLUE_DARK, "#1e40af"),
-            "ghost":   ("#f1f5f9", "#334155", "#e7ecf3", "#dbe2ea"),
-            "danger":  (DANGER_SOFT, DANGER, "#fbdada", "#f8caca"),
+            "primary": (BLUE, "#ffffff", BLUE_DARK, BLUE_ACTIVE),
+            "ghost":   (BTN_SOFT, BTN_FG, BTN_HOVER, BTN_ACTIVE),
+            "danger":  (DANGER_SOFT, DANGER, DANGER_HOVER, DANGER_ACTIVE),
         }[kind]
         # 胶囊形：半径 = 高度的一半减 1（见 pill_radius 的说明）。
         # 原来是 9 —— 在 34px 高的按钮上只有一丝倒角，看着还是方的。
         h = self.BASE * 2 + 14
         b = round_button(parent, text, cmd, (self.fam, self.BASE),
                          bg=style[0], fg=style[1], hover=style[2], active=style[3],
-                         parent_bg=CARD, height=h, radius=pill_radius(h))
+                         parent_bg=CARD, height=h, radius=R_CTRL)
         b.pack(fill="x", pady=(dp(0), dp(7)))
         return b
 
@@ -8613,8 +8696,8 @@ class LoginApp:
         浅底和图标色**必须成对换** —— 只换图标色的话，红图标压在浅绿底上
         看着就是「画错了」，而这类错在截图里不一定显眼，只能靠这里锁死。
         """
-        col = NET_COLOR.get(st, "#94a3b8")
-        soft = NET_SOFT.get(st, "#eef2f7")
+        col = NET_COLOR.get(st, MUTED)
+        soft = NET_SOFT.get(st, NEUTRAL_SOFT)
         self.st_icon.delete("all")
         _draw_round_rect(self.st_icon, 0, 0, 22, 22, 7, soft)
         _draw_icon(self.st_icon, "globe", col, 11, 11, size=13)
@@ -8643,9 +8726,9 @@ class LoginApp:
             self.warn_auto.pack_forget()
 
     def show(self, text, kind="info"):
-        color = {"ok": (OK_SOFT, "#14532d"),
-                 "err": (DANGER_SOFT, "#7f1d1d"),
-                 "info": (BLUE_SOFT, "#1e3a8a")}[kind]
+        color = {"ok": (OK_SOFT, OK_FG),
+                 "err": (DANGER_SOFT, DANGER_FG),
+                 "info": (BLUE_SOFT, BLUE_FG)}[kind]
         self.msg.configure(text=text, bg=color[0], fg=color[1])
         self.msg.pack(fill="x", ipady=dp(10), pady=(dp(0), dp(10)))
 
@@ -8731,7 +8814,7 @@ class LoginApp:
                            BLUE_DARK, BLUE_SOFT).pack(side="left", padx=(dp(8), dp(0)))
             if uid == store.get("lastOnline"):
                 round_chip(line, self.tk, "上次登录", (self.fam, self.SMALL - 1),
-                           "#15803d", OK_SOFT).pack(side="left", padx=(dp(4), dp(0)))
+                           OK_FG, OK_SOFT).pack(side="left", padx=(dp(4), dp(0)))
             # 🔴 这个账号是在**另一所学校**下保存的（2026-10-12 加）。
             #    账号库两校共用，所以列表里会混着别的学校的账号 ——
             #    点错一次就会把 A 校的密码发到 B 校的门户（把密码交给第三方）。
@@ -8764,17 +8847,17 @@ class LoginApp:
             rh = self.SMALL + 16
             round_button(right, "选用", lambda u=uid: self.pick(u),
                          (self.fam, self.SMALL),
-                         bg="#f1f5f9", fg="#334155", hover="#e7ecf3", active="#dbe2ea",
-                         parent_bg=CARD, height=rh, radius=pill_radius(rh), pad_x=dp(26)
+                         bg=BTN_SOFT, fg=BTN_FG, hover=BTN_HOVER, active=BTN_ACTIVE,
+                         parent_bg=CARD, height=rh, radius=R_CTRL, pad_x=dp(26)
                          ).pack(side="left", padx=(dp(0), dp(6)))
             # 「删除」原来的静止态是**白底**，在白卡片上完全看不出是个按钮
             # （截图放大后才发现的）。给一层很浅的红：既看得出能点，
             # 又不会像「退出当前账号」那样抢眼。
             b_del = round_button(right, "删除", lambda u=uid: self.drop(u),
                                  (self.fam, self.SMALL),
-                                 bg="#fef6f6", fg=DANGER, hover=DANGER_SOFT,
-                                 active="#f8caca", parent_bg=CARD,
-                                 height=rh, radius=pill_radius(rh), pad_x=dp(26))
+                                 bg=DANGER_SOFT, fg=DANGER, hover=DANGER_HOVER,
+                                 active=DANGER_ACTIVE, parent_bg=CARD,
+                                 height=rh, radius=R_CTRL, pad_x=dp(26))
             b_del.pack(side="left")
             # 新建的按钮必须**按当前忙碌状态**初始化：任务结束时 handle_msg 是先
             # load_all()（会重建列表）再 set_busy(False) 的，中间那一刻如果新按钮

@@ -51,6 +51,21 @@ def btn(text, bg, parent_bg, disabled_bg="#dfe5ee"):
                 _rb_disabled_bg=disabled_bg)
 
 
+def shift(color, n):
+    """把 `#rrggbb` 的每个通道各减 n。用来构造「只差 n 级」的近色。
+
+    🔴 为什么**算出来**而不是写死字面量（2026-10-17 换 Fluent 时改的）：
+        原来这一节写的是 `#ebeff4` / `#e7ebf1` / `#e6eaf0` 三个字面量，
+        它们是「当时那个 BG」减 3 / 7 / 8 —— 换配色时它们**不再和 BG 相关**，
+        于是「差 3 级必须拦下」这条断言会**静默变成测别的东西**：
+        新 BG `#f3f3f3` 减那些老值，差的是 8 / 12 / 13，前两条直接放行，
+        报出来是「门槛失效」，真实原因却是「测试数据过期了」。
+        算出来之后，无论 BG 换成什么，这一节量的都还是**阈值本身**。
+    """
+    s = color.lstrip("#")
+    return "#" + "".join("%02x" % max(0, int(s[i:i + 2], 16) - n) for i in (0, 2, 4))
+
+
 def verdict(root):
     """跑一次自检，返回 (是否拦下, 消息)。
 
@@ -84,14 +99,14 @@ def main():
     print()
     print("=== 2. 正常界面不会被误伤 ===")
     root = Fake(
-        btn("使用说明", "#dbe1eb", C.BG),
+        btn("使用说明", C.BTN_SOFT_ON_BG, C.BG),
         btn("切换到此账号", C.BLUE, C.CARD),
-        btn("仅保存", "#f1f5f9", C.CARD),
+        btn("仅保存", C.BTN_SOFT, C.CARD),
         btn("退出当前账号", C.DANGER_SOFT, C.CARD),
-        btn("选用", "#f1f5f9", C.CARD),
-        btn("删除", "#fef6f6", C.CARD),
+        btn("选用", C.BTN_SOFT, C.CARD),
+        btn("删除", C.DANGER_SOFT, C.CARD),
         # 账号行上「这个账号属于别的学校」那个警示片（2026-10-12 加）。
-        # 它的底色是**最浅的一档**（WARN_SOFT #fffbeb 落在白卡上），
+        # 它的底色是**最浅的一档**（WARN_SOFT 落在白卡上），
         # 所以必须放进这棵树里 —— 它是最可能踩到阈值的一个。
         btn("郑州航空工业管理学院", C.WARN_SOFT, C.CARD),
     )
@@ -107,13 +122,13 @@ def main():
     check("  且消息里点名是哪个按钮", "使用说明" in msg, True)
     check("  且消息里带上两个颜色", C.BG in msg, True)
     # ② 只差 3 级：肉眼同样分不出，`==` 判不出来，必须靠阈值拦
-    hit, _ = verdict(Fake(btn("近色按钮", "#ebeff4", C.BG)))
+    hit, _ = verdict(Fake(btn("近色按钮", shift(C.BG, 3), C.BG)))
     check("静止态只差 3 级 -> 拦下（阈值在起作用）", hit, True)
     # ③ 差 7 级：正好在阈值之下
-    hit, _ = verdict(Fake(btn("差 7 级", "#e7ebf1", C.BG)))
+    hit, _ = verdict(Fake(btn("差 7 级", shift(C.BG, 7), C.BG)))
     check("静止态差 7 级（阈值 8 之下）-> 拦下", hit, True)
     # ④ 边界：正好 8 级，不该拦（否则阈值就成了摆设，早晚误伤）
-    hit, _ = verdict(Fake(btn("差 8 级", "#e6eaf0", C.BG)))
+    hit, _ = verdict(Fake(btn("差 8 级", shift(C.BG, 8), C.BG)))
     check("静止态正好差 8 级 -> 放行（边界不误伤）", hit, False)
     # ⑤ 禁用态隐形同样算缺陷 —— 「禁用」不该等于「消失」
     hit, msg = verdict(Fake(btn("禁用隐形", C.BLUE, C.BG,
@@ -137,17 +152,25 @@ def main():
     print()
     print("=== 6. 禁用态的自动兜底（_pick_disabled_bg）===")
     check("撞上 BG -> 换成兜底灰",
-          C._pick_disabled_bg("#eef1f6", C.BG), C._DISABLED_FALLBACK)
+          C._pick_disabled_bg(C.BG, C.BG), C._DISABLED_FALLBACK)
     check("撞上 CARD -> 换成兜底灰",
-          C._pick_disabled_bg("#ffffff", C.CARD), C._DISABLED_FALLBACK)
+          C._pick_disabled_bg(C.CARD, C.CARD), C._DISABLED_FALLBACK)
     check("本身就能用 -> 原样不动",
           C._pick_disabled_bg("#dfe5ee", C.BG), "#dfe5ee")
     check("兜底灰落在 BG 上确实分得开",
           C._color_delta(C._DISABLED_FALLBACK, C.BG) >= C._CONTRAST_MIN, True)
     check("兜底灰落在 CARD 上确实分得开",
           C._color_delta(C._DISABLED_FALLBACK, C.CARD) >= C._CONTRAST_MIN, True)
-    check("两个默认色**确实**是同一个值（否则第 1 项测的是空气）",
-          C.BG, "#eef1f6")
+    # 🔴 2026-10-17：这条原来写的是 `check(..., C.BG, "#eef1f6")` —— 把 BG 的
+    #    字面量钉在测试里。换 Fluent 时 BG 变成 #f3f3f3，这条**立刻失败**，
+    #    而它想守的其实不是「BG 等于某个数」，是「`round_button` 的
+    #    `disabled_bg` 默认值 == BG」（不然上面第 1 项测的是空气）。
+    #    所以改成直接读签名 —— 这样它测的是**那个不变量本身**，
+    #    BG 换成什么都不会误报，而真把默认值写死成别的颜色时照样会响。
+    import inspect
+    _dflt = inspect.signature(C.round_button).parameters["disabled_bg"].default
+    check("round_button 的 disabled_bg 默认值 == BG（否则第 1 项测的是空气）",
+          _dflt, C.BG)
 
     print()
     print("=== 7. 新加的语义浅底必须过阈值（不然「看得见」只是嘴上说说）===")
@@ -158,7 +181,16 @@ def main():
                                  ("WARN_SOFT 在页面底上", C.WARN_SOFT, C.BG),
                                  ("BLUE_SOFT 在白卡上", C.BLUE_SOFT, C.CARD),
                                  ("OK_SOFT 在白卡上", C.OK_SOFT, C.CARD),
-                                 ("DANGER_SOFT 在白卡上", C.DANGER_SOFT, C.CARD)):
+                                 ("DANGER_SOFT 在白卡上", C.DANGER_SOFT, C.CARD),
+                                 # 2026-10-17 加：导航项也是「按钮」，只是它
+                                 # **故意不挂 `_rb_bg`**（未选中态本来就该透明，
+                                 # 挂了会被判成隐形而误报），所以 `ui_contrast_check`
+                                 # 管不到它 —— 那两档颜色就由这里兜住。
+                                 ("NAV_HOVER 在导航窗格上", C.NAV_HOVER, C.NAV_BG),
+                                 ("NAV_ACTIVE 在导航窗格上", C.NAV_ACTIVE, C.NAV_BG),
+                                 ("次要按钮 BTN_SOFT 在白卡上", C.BTN_SOFT, C.CARD),
+                                 ("次要按钮 BTN_SOFT_ON_BG 在页面底上",
+                                  C.BTN_SOFT_ON_BG, C.BG)):
         _d = C._color_delta(_soft, _page)
         check("%-18s 色差 %d >= %d" % (_name, _d, C._CONTRAST_MIN),
               _d >= C._CONTRAST_MIN, True)
