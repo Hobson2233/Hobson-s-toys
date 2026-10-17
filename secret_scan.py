@@ -362,7 +362,19 @@ def main():
     files = staged_files() if a.staged else worktree_files()
     label = "暂存区" if a.staged else "工作区（按 .gitignore 排除后）"
     print("扫描 %s：%d 个文件" % (label, len(files)))
-    print()
+    # 🔴 0 个文件时**不许**安安静静地打「通过」（2026-10-17 踩到）。
+    #    本脚本只扫**自己所在的那个仓库**（所有 git 调用都是 `cwd=HERE`）。
+    #    工作区根目录是**另一个**独立的 git 仓库，在根目录下跑
+    #    `repo/secret_scan.py --staged`，它问的是 repo/ 的暂存区 —— 那里空着 ——
+    #    于是打印「通过 —— 读了 0 个文件」，看着像过了一道闸，其实什么都没查。
+    #    这跟「把没读到显示成没有记录」是同一类毛病：把「没检查」说成「检查通过」。
+    if a.staged and not files:
+        print("  [!!] 暂存区是空的 —— 这个「通过」**没有验证任何内容**")
+        print("       如果你刚在别的目录 git add，那是扫错仓库了：")
+        print("       本脚本只扫自己所在的仓库（%s/）" % os.path.basename(HERE))
+        print()
+    else:
+        print()
 
     # 阳性对照 1：文件名列表里不能出现 git 的加引号形式。
     # 出现了就说明某个文件会因路径打不开而被跳过（`设置.ico` 就中过这一枪）。
