@@ -861,6 +861,52 @@ def read_self_session(account, base, now=None):
     return pairs, ""
 
 
+SELF_SESSION_TOUCH_AGE = 3600      # 保活探活成功后，最多每小时刷一次时间戳
+
+
+def touch_self_session(account, base, now=None):
+    """把存档里的 `savedAt` 往前推，**cookie 一个字节都不动**。返回 `(ok, 说明)`。
+
+    🔴 为什么需要它（2026-10-17 补的真 bug）：
+       `SELF_SESSION_AGE` 那 24 小时是从**上次写档**算起的，而写档只在
+       「同步取数成功」时发生。保活每 10 分钟探一次，会话一直是活的，
+       但 `savedAt` 停在昨天 —— 于是「程序开着过一夜、第二天关掉再开」
+       会被判成「存档超过 24 小时」，明明会话还能用，却要重新读一次验证码。
+       保活既然**证明了**它还活着，时间戳就该跟着走。
+
+    ⚠️ 只改时间戳、**不重新加密 cookie**：不碰 `self.svc` 的 jar，
+       就不会和主线程的取数抢同一份 cookie（那条路是整份重写）。
+    ⚠️ 每小时最多写一次盘 —— 别把保活变成「每 10 分钟写一次文件」。
+    ⚠️ 账号 / 地址对不上就**不动**：那是别人的档，凭什么替他续命。
+    """
+    account = (account or "").strip()
+    base = (base or "").rstrip("/")
+    raw = read_json(SELF_SESSION_FILE)
+    if not isinstance(raw, dict):
+        return False, "没存过"
+    if raw.get("v") != SELF_SESSION_VERSION:
+        return False, "存档格式不认（v=%r）" % (raw.get("v"),)
+    if (raw.get("account") or "") != account:
+        return False, "存档是另一个账号的"
+    if (raw.get("base") or "") != base:
+        return False, "门户地址变了"
+    try:
+        saved = int(raw.get("savedAt") or 0)
+    except Exception:
+        saved = 0
+    stamp = int(time.time() if now is None else now)
+    if saved <= 0:
+        return False, "存档里没有保存时间"
+    if 0 <= stamp - saved < SELF_SESSION_TOUCH_AGE:
+        return False, "还新"          # 正常情况，不写盘、也别记日志
+    raw["savedAt"] = stamp
+    try:
+        write_json(SELF_SESSION_FILE, raw)
+    except Exception as e:
+        return False, "写不进去（%s）" % e
+    return True, ""
+
+
 def clear_self_session(account=None):
     """删掉磁盘上的登录态。返回是否真的删掉了一个文件。
 
@@ -6839,6 +6885,7 @@ class SelfServiceWindow(object):
         """
         if alive is True:
             self.session_alive = True
+            self._touch_session()
             self._keepalive_tick()
             return
         if alive is False:
@@ -6850,6 +6897,23 @@ class SelfServiceWindow(object):
             return
         # alive is None ⇒ 不知道 ⇒ 下一轮再试，别下结论
         self._keepalive_tick()
+
+    def _touch_session(self):
+        """会话刚被证明还活着 ⇒ 把存档的时间戳往前推。
+
+        ⚠️ 放在主线程（`_on_keepalive` 里）而不是保活线程：`_save_session()`
+           也在主线程整份重写同一个文件，两边并发就会互相覆盖。
+           这里只写「一小时最多一次」的小文件，不会卡界面。
+        """
+        try:
+            ok, why = touch_self_session(self.account, self.svc.base)
+            if why and why != "还新":
+                # 「还新」是正常情况（一小时内刚存过），不值得记日志
+                log("账号中心：登录态存档没刷新（%s）" % why)
+            return ok
+        except Exception:
+            log("账号中心：刷新登录态存档异常:\n%s" % traceback.format_exc())
+            return False
 
     def _keepalive_stop(self):
         """停掉保活（关面板时调）。"""

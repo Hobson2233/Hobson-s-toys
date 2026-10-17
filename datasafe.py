@@ -208,19 +208,35 @@ def sandbox(copy_real=False, tag="probe"):
 
 
 def assert_untouched():
-    """核对真实数据文件一个字节都没变。变了就抛异常并指出是哪个。"""
+    """核对真实数据文件一个字节都没变。变了就抛异常并指出是哪个。
+
+    ⚠️ **日志是唯一的例外**（2026-10-17 实测踩到）：`campus-login.log` 是
+       追加式的诊断文件，用户正开着桌面程序时，守护线程每 30 秒就写一行。
+       那时整条 `fast` 会被判红，报的却是「🔴 真实数据被改动了」——
+       一句话把「你在用着程序」说成「测试写坏了数据」，是**假警报**。
+       所以日志改动降级成**警告**（照旧打印，但不让测试失败）；
+       `accounts.json` / `config.json` / `self-session.json` 这些真正的数据
+       文件仍然一有改动就炸 —— 那条护栏一个字都不放松。
+    """
     if _state["snap"] is None:
         return "datasafe: 没调用过 sandbox()，无从核对"
     now = snapshot()
     changed = [p for p in now if now[p] != _state["snap"].get(p)]
-    if changed:
+    logname = os.path.basename(C.LOG_FILE)
+    hard = [p for p in changed if os.path.basename(p) != logname]
+    soft = [p for p in changed if os.path.basename(p) == logname]
+    if hard:
         raise RuntimeError(
             "datasafe: 🔴 真实数据被改动了！\n  " + "\n  ".join(
                 "%s\n     之前 %s\n     现在 %s"
-                % (p, _state["snap"].get(p), now[p]) for p in changed))
+                % (p, _state["snap"].get(p), now[p]) for p in hard))
     watched = len(set(candidate_dirs()))
-    return ("datasafe: 真实数据全部未改动（盯了 %d 个候选目录里的 %d 个文件）"
-            % (watched, len(now)))
+    msg = ("datasafe: 真实数据全部未改动（盯了 %d 个候选目录里的 %d 个文件）"
+           % (watched, len(now)))
+    if soft:
+        msg += ("\n  ⚠️ 但日志被追加过（%s）—— 大概率是桌面程序正开着，"
+                "守护线程在写日志；这不影响测试结论。" % ", ".join(soft))
+    return msg
 
 
 def _self_check():
@@ -287,6 +303,29 @@ def _self_check():
 
     # 6) 假沙箱路径的边界：同前缀但不是子目录，不该被放行
     check("边界：同前缀目录不算沙箱内", not _inside(d + "_x", d))
+
+    # 7) 日志例外：**只**改日志 ⇒ 警告不报错；改数据文件 ⇒ 仍然当场炸。
+    #    这一对是阳性/阴性对照 —— 只测「不炸」的话，把 assert_untouched
+    #    整个改成 pass 也能过。
+    fake_log = os.path.join(real, "campus-login.log")
+    fake_cfg = os.path.join(real, "config.json")
+    orig_snap, orig_state = globals()["snapshot"], _state["snap"]
+    try:
+        _state["snap"] = {fake_log: "aaa", fake_cfg: "bbb"}
+        globals()["snapshot"] = lambda: {fake_log: "zzz", fake_cfg: "bbb"}
+        msg = assert_untouched()
+        check("只改日志 ⇒ 不报错，但要留下警告",
+              "日志被追加过" in msg, "  " + msg.splitlines()[-1][:60])
+        globals()["snapshot"] = lambda: {fake_log: "aaa", fake_cfg: "zzz"}
+        raised = False
+        try:
+            assert_untouched()
+        except RuntimeError:
+            raised = True
+        check("改数据文件 ⇒ 仍然当场炸（护栏没被放松）", raised)
+    finally:
+        globals()["snapshot"] = orig_snap
+        _state["snap"] = orig_state
 
     if fails:
         print("失败 %d 项: %s" % (len(fails), ", ".join(fails)))

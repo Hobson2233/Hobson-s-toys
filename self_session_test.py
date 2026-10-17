@@ -172,8 +172,35 @@ check("cookie 值全是空串 ⇒ 不存",
       C.save_self_session(ACCT, BASE, [("a", ""), ("", "b")], now=NOW)[0], False)
 
 
-# ------------------------------------------------------------ 7. 清除
-section("7. 清除要幂等，而且进隐私清单")
+# ------------------------------------------------------------ 7. 保活刷新时间戳
+section("7. 保活探活成功后要把时间戳往前推（否则开着过夜就被判过期）")
+_wipe()
+C.save_self_session(ACCT, BASE, COOK, now=NOW)
+# 🔴 这一条是这次真 bug 的复现：存档是「昨天」写的，但会话一直被保活证明有效。
+#    不刷新时间戳的话，24 小时一到就整份丢掉 —— 明明会话还能用。
+check("存档放一天后再读：被判过期（改之前的真实行为）",
+      C.read_self_session(ACCT, BASE, now=NOW + 25 * 3600)[0], [])
+check_true("保活探活成功后 touch：刷新了", C.touch_self_session(
+    ACCT, BASE, now=NOW + 25 * 3600)[0], "")
+check("刷完之后 25 小时那份又能读了",
+      C.read_self_session(ACCT, BASE, now=NOW + 25 * 3600)[0], COOK)
+check("cookie 一个字节都没变（只改了时间戳）", C.read_self_session(
+    ACCT, BASE, now=NOW + 25 * 3600 + 60)[0], COOK)
+check("🔴 账号对不上 ⇒ 不替他续命", C.touch_self_session(
+    "2025999999", BASE, now=NOW + 25 * 3600), (False, "存档是另一个账号的"))
+check("🔴 门户地址变了 ⇒ 不动",
+      C.touch_self_session(ACCT, "http://1.2.3.4", now=NOW + 25 * 3600),
+      (False, "门户地址变了"))
+check("刚存过 ⇒ 不重复写盘（每小时最多一次）", C.touch_self_session(
+    ACCT, BASE, now=NOW + 25 * 3600 + 60), (False, "还新"))
+_wipe()
+check("没存过 ⇒ 安静返回，不凭空造一份",
+      C.touch_self_session(ACCT, BASE, now=NOW), (False, "没存过"))
+check_true("而且真的没造出文件", not os.path.isfile(C.SELF_SESSION_FILE), "")
+
+
+# ------------------------------------------------------------ 8. 清除
+section("8. 清除要幂等，而且进隐私清单")
 C.save_self_session(ACCT, BASE, COOK, now=NOW)
 check_true("第一次清：删掉了", C.clear_self_session(), "")
 check_true("第二次清：不报错", C.clear_self_session() is False, "")
