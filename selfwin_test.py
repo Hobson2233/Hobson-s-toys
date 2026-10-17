@@ -483,12 +483,19 @@ def tk_image_size(root, name):
 
 
 def pump(root, seconds=6.0, until=None):
-    """把事件循环转起来，直到 `until()` 成立或超时。返回是否等到。"""
+    """把事件循环转起来，直到 `until()` 成立或超时。返回是否等到。
+
+    ⚠️ `root.update()` 抛异常时**必须打出来**再跳出：以前是 `except: break`，
+       一声不响 —— 于是「Tk 那边出了个偶发异常」在报告里长成
+       「界面上没出现某段文字」，查起来方向完全是错的。
+    """
     t0 = time.time()
     while time.time() - t0 < seconds:
         try:
             root.update()
         except Exception:
+            print("  [泵异常] root.update() 抛了（这条要当线索，别当成超时）：\n%s"
+                  % traceback.format_exc())
             break
         if until is not None and until():
             return True
@@ -923,6 +930,76 @@ def test_sync_net_fail(root):
     w.close()
 
 
+def test_keepalive(root):
+    """🔴 会话保活（2026-10-17 加）：同步成功后自动续命，过期就自己收摊。
+
+    为什么必须**真跑事件循环**才测得到：保活是 `after()` 排的定时器。
+    只调函数、不转事件循环的话，那个定时器一次都不会触发 ——
+    测试会全绿，而线上一次都不探（这是最典型的「假绿」）。
+    """
+    print("\n— 会话保活（2026-10-17 加）")
+    reset_fake()
+    reset_history()
+    FakeSvc.script = {"has_session": "yes", "login": "ok"}
+    old_ms = C.SELF_KEEPALIVE_MS
+    C.SELF_KEEPALIVE_MS = 80        # 压到 80ms，否则这条测试要等 10 分钟
+    try:
+        w = open_panel(root)
+        w._today = lambda: "2026-10-12"
+        check("刚打开时没有保活定时器", w.keepalive_job, None)
+        check("刚打开时会话状态是「不知道」（三态，不许瞎猜）",
+              w.session_alive, None)
+
+        w.start_sync()
+        ok = pump(root, 6.0, lambda: "账号状态" in texts_of(w.win))
+        check_true("同步成功", ok, "")
+        check("同步成功后会话状态是「有效」", w.session_alive, True)
+        # ⚠️ **别在这里断言 `keepalive_job is not None`** —— 定时器每 80ms
+        #    触发一次，而 `_keepalive_run` 里会先把它置成 None 再丢线程，
+        #    所以这个句柄在「触发的这一瞬间」必然是 None。
+        #    写这条断言就是给自己造一个随机红的测试（实测第一次跑就红了）。
+        #    真正要验的是「它在持续探测」—— 看下面那个次数增长。
+
+        n0 = FakeSvc.calls.count("has_session")
+        FakeSvc.off_main = True          # 只验保活这一批是否在主线程
+        pump(root, 1.2)
+        n1 = FakeSvc.calls.count("has_session")
+        check_true("保活真的在探（%d → %d 次）" % (n0, n1), n1 > n0, "")
+        check_true("保活探测跑在后台线程（不在主线程卡界面）",
+                   FakeSvc.off_main, "")
+
+        # 🔴 保活**不许重画界面** —— 用户可能正在看图表，
+        #    被一次后台探测把界面刷一遍是最讨厌的那种「自己会动」。
+        texts_before = texts_of(w.win)
+        note_before = w.note
+        pump(root, 0.6)
+        check("保活期间界面文字没被重画", texts_of(w.win), texts_before)
+        check("保活期间提示语没被覆盖", w.note, note_before)
+
+        # 会话真的过期 ⇒ 自己停下，不空转
+        FakeSvc.script = {"has_session": "no"}
+        ok = pump(root, 3.0, lambda: w.session_alive is False)
+        check_true("探到会话过期", ok, "")
+        check("定时器句柄清掉了", w.keepalive_job, None)
+        n2 = FakeSvc.calls.count("has_session")
+        pump(root, 0.8)
+        check("停了之后不再发请求（不空转）",
+              FakeSvc.calls.count("has_session"), n2)
+
+        # 🔴 网络不通 = 「不知道」，**不是**「会话没了」⇒ 必须继续试
+        FakeSvc.script = {"has_session": "raise"}
+        w._keepalive_start()
+        pump(root, 1.0)
+        check_true("网络不通时保活继续试（不把「不知道」当成「没了」）",
+                   w.keepalive_job is not None, "")
+        check("网络不通也不会把会话状态写成「过期」", w.session_alive, True)
+
+        w.close()
+        check("close 之后定时器句柄被清掉", w.keepalive_job, None)
+    finally:
+        C.SELF_KEEPALIVE_MS = old_ms
+
+
 def test_job_crash_visible(root):
     """🔴 后台任务抛**非预期**异常时，必须变成界面上的提示，不许静默卡住。
 
@@ -939,7 +1016,21 @@ def test_job_crash_visible(root):
     pump(root, 6.0, lambda: w._cap_big is not None)
     w._entry.insert(0, "a1b2")
     w._submit()
+    beats0 = w.pump_beats
     ok = pump(root, 6.0, lambda: "内部错误" in " ".join(texts_of(w.win)))
+    if not ok:
+        # 失败时把「那一刻面板是什么状态」打出来 —— 否则这条偶发红只能靠猜。
+        print("    [诊断] closed=%s syncing=%s tries=%s actions=%s"
+              % (w.closed, w.syncing, w.tries, w.actions))
+        print("    [诊断] 泵心跳 %d → %d（没涨 = 泵停了，涨了 = 消息没收到）"
+              % (beats0, w.pump_beats))
+        print("    [诊断] 队列里还剩 %d 条" % w.q.qsize())
+        print("    [诊断] 已入队的消息：%s（已关窗丢弃 %d 条）"
+              % (w.puts, w.puts_dropped))
+        print("    [诊断] 后台异常次数：%d" % w.crashes)
+        print("    [诊断] 已处理的消息：%s" % w.handled)
+        print("    [诊断] 请求记录：%s" % FakeSvc.calls)
+        print("    [诊断] 界面文字：%s" % texts_of(w.win))
     check_true("异常变成了界面上的提示（没静默卡住）", ok, "")
     check_true("提示里带上了异常类型，好排查",
                any("RuntimeError" in x for x in texts_of(w.win)), "")
@@ -1830,6 +1921,7 @@ def main():
             test_sync_login_fail(root)
             test_sync_tries_gate(root)
             test_sync_net_fail(root)
+            test_keepalive(root)
             test_job_crash_visible(root)
             test_clear_history(root)
             test_chart_views(root)

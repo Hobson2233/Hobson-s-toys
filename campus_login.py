@@ -5999,6 +5999,24 @@ def show_text_window(title, text, width=None, height=None):
 #    （服务端返回的 errmsg 能区分「验证码错」和「密码错」，见 self_service.SelfError）
 SELF_LOGIN_MAX = 3
 
+# 🔴 「保活」间隔（2026-10-17 加）。为什么需要它：
+#    自助服务的会话靠一条 `JSESSIONID-BOSS-0` cookie 撑着，而它是
+#    **session cookie**（没有 Max-Age / Expires）—— 客户端存多久都不算数，
+#    真正的上限由**服务端**的空闲超时决定。
+#    ⇒ 程序开着、但一直不去点「同步数据」的时候，会话会静默过期；
+#      等用户隔了半小时再点，就又得读一次验证码 —— 这正是用户反馈的
+#      「每次同步都要登录一次」。
+#    ⇒ 只要**定期轻轻访问一下**，服务端的空闲计时就会被重置
+#      （Tomcat 默认就是这种「有访问就续命」的滑动过期）。
+#
+# ⚠️ 为什么是 10 分钟：Tomcat 默认 `session-timeout` 是 30 分钟，
+#    10 分钟留了 3 倍余量；再密就是白花请求（一天 144 次已经很少了）。
+# ⚠️ 这个探测**只读**：打的就是 `getindexinfo.do`，和「同步数据」开头
+#    那次探活是同一个调用（`SelfService.has_session()`）。
+# 🔴 万一服务端是**固定寿命**（到点就死，访问也不续），保活就无效 ——
+#    那时它会探到 False 然后自己停下来，不会无限空转。
+SELF_KEEPALIVE_MS = 10 * 60 * 1000
+
 # 验证码图的原始尺寸（学校那边实测 130x40）和显示倍数。
 # 🔴 这几个数和**窗口宽度**绑在一起：面板宽度就是按「放下放大后的验证码」定的，
 #    改放大倍数必须同时改 `PANEL_W`（下面几行就是按这个算出来的）。
@@ -6116,6 +6134,14 @@ class SelfServiceWindow(object):
         self.password = password
         self.svc = self_service.SelfService(base=base_url)
         self.q = queue.Queue()
+        # 队列泵的心跳（只给测试判断「泵还在不在转」，见 `_pump`）
+        self.pump_beats = 0
+        # 每种消息各处理了几条（只给测试用：区分「消息没送到」和「送到了但没画」）
+        self.handled = {}
+        # 每种消息各**入队**了几条（同上；和 `handled` 一比就知道消息丢在哪一段）
+        self.puts = {}
+        self.puts_dropped = 0     # 面板已关、结果被丢掉的消息条数
+        self.crashes = 0          # 后台任务抛非预期异常的次数（同上，只给测试）
         self.tries = 0            # 已发出的登录请求次数（防锁号闸门）
         self.closed = False
         # 嵌入模式：`host` 非空 ⇒ 界面搭进那块 Frame，不建 Toplevel。
@@ -6160,6 +6186,13 @@ class SelfServiceWindow(object):
         #    界面也不该出现任何写操作按钮（见 `_can_act`）。
         self.actions = None
         self.acting = ""          # 正在进行的写操作名（空串 = 空闲；防连点）
+        # --- 会话保活（2026-10-17 加，见 SELF_KEEPALIVE_MS 上面的说明） ---
+        # `keepalive_job` = `after()` 的句柄（None = 没在跑）
+        # `session_alive` = None 未知 / True 有效 / False 已过期
+        #    ⚠️ 三态是**故意**的：把「没探过」当成「有效」或「过期」都是在
+        #       把「不知道」说成事实（红线 50）。
+        self.keepalive_job = None
+        self.session_alive = None
         # 🔴 写操作成功后会**自动刷新**一次。刷新走的是 `_on_synced`，
         #    那里默认会把 `self.note` 覆盖成「已同步：…」—— 那样用户刚看到的
         #    「已下线」就被盖掉了，等于不知道刚才那一下成没成。
@@ -6401,6 +6434,8 @@ class SelfServiceWindow(object):
         if self.closed:
             return
         self.closed = True
+        # 先停保活：它挂着 `after()`，窗口一销毁那个回调就是野指针
+        self._keepalive_stop()
         if self._relayout_job is not None:
             try:
                 self.win.after_cancel(self._relayout_job)
@@ -6427,21 +6462,42 @@ class SelfServiceWindow(object):
             try:
                 fn()
             except Exception as e:
-                log("账号中心面板后台任务异常:\n%s" % traceback.format_exc())
+                # 计数只给测试用：区分「压根没进兜底」和「进了兜底但卡在 log()」
+                self.crashes += 1
+                # 🔴 **先把结果交给界面，再写日志**（2026-10-17 调过来的）。
+                #    原来的顺序是 log() 在前，而 `log()` 每次都会
+                #    `open/write/close` 一次文件 —— 单线程实测中位 14 ms、
+                #    20 个线程抢的时候单次能到 1 秒以上（Windows 上开关文件
+                #    加上杀毒软件扫描就是这个量级）。
+                #    ⇒ 写日志是**给排查用的**，凭什么让用户多等；
+                #      而且它一慢，界面就停在「正在登录…」不动。
+                #    ⚠️ 这条不是猜的：`_lab/probe_log_slow.py` 量出来的。
                 self._put("fail", "内部错误（已记日志）：%s: %s"
                           % (type(e).__name__, e))
+                log("账号中心面板后台任务异常:\n%s" % traceback.format_exc())
 
         threading.Thread(target=_wrapped, daemon=True).start()
 
     def _put(self, kind, payload=None):
-        if not self.closed:
-            self.q.put((kind, payload))
+        if self.closed:
+            # 面板已经关了，结果没人要 —— 但**要留个数**：
+            # 「消息被丢掉了」和「消息压根没发出来」在界面上长得一样。
+            self.puts_dropped += 1
+            return
+        # 计数只给测试用（和 `handled` 一比就知道消息丢在入队还是出队那一段）
+        self.puts[kind] = self.puts.get(kind, 0) + 1
+        self.q.put((kind, payload))
 
     def _pump(self):
         """主线程里轮询队列。**所有界面改动都只在这里发生。**"""
+        # 心跳计数：只给测试用（`selfwin_test` 靠它判断「泵到底还在不在转」）。
+        # 🔴 没有这个数就只能看到「界面上没有某段文字」，而泵停掉和
+        #    消息发丢在界面上**长得一模一样**，根本分不开。
+        self.pump_beats += 1
         try:
             while True:
                 kind, payload = self.q.get_nowait()
+                self.handled[kind] = self.handled.get(kind, 0) + 1
                 try:
                     self._handle(kind, payload)
                 except Exception:
@@ -6450,7 +6506,13 @@ class SelfServiceWindow(object):
         except queue.Empty:
             pass
         if not self.closed:
-            self.win.after(80, self._pump)
+            try:
+                self.win.after(80, self._pump)
+            except Exception:
+                # ⚠️ 续排失败 = **泵彻底停了**，界面从此再也不响应任何结果。
+                #    以前这里没有 try，异常直接从 Tk 回调里漏出去，
+                #    表现只是「界面永远停在正在登录…」，一行线索都没有。
+                log("账号中心面板 _pump 续排失败:\n%s" % traceback.format_exc())
 
     def _handle(self, kind, payload):
         if kind == "load":
@@ -6471,6 +6533,9 @@ class SelfServiceWindow(object):
             self._on_synced(payload)
         elif kind == "fail":
             self._draw_fail(payload)
+        # --- 会话保活（后台探测的回话）---
+        elif kind == "keepalive":
+            self._on_keepalive(payload)
         # --- 写操作（B 档）---
         elif kind == "act_ok":
             self._on_action_ok(payload)
@@ -6541,6 +6606,81 @@ class SelfServiceWindow(object):
         """今天算哪一天（`YYYY-MM-DD`）。抽出来是为了测试能替换掉。"""
         return datetime.now().strftime("%Y-%m-%d")
 
+    # ------------------------------------------------------------ 会话保活
+
+    def _keepalive_start(self):
+        """开始定期轻探会话。已经有会话（刚同步成功）才调这个。
+
+        🔴 为什么不能只靠「用户下次点同步时再说」：那时候会话已经死了，
+           用户就必须重新读验证码 —— 保活的意义就是**让它别死**。
+        """
+        if self.closed or self.keepalive_job is not None:
+            return
+        self.session_alive = True
+        self._keepalive_tick()
+
+    def _keepalive_tick(self):
+        """安排下一次探测。"""
+        if self.closed:
+            return
+        try:
+            self.keepalive_job = self.win.after(SELF_KEEPALIVE_MS,
+                                                self._keepalive_run)
+        except Exception:
+            # 窗口已经没了（嵌入模式下主窗口被关）⇒ 静默收摊，别刷日志
+            self.keepalive_job = None
+
+    def _keepalive_run(self):
+        """到点了：丢给后台线程去探（`has_session()` 是阻塞的网络请求）。"""
+        self.keepalive_job = None
+        if self.closed:
+            return
+        if self.syncing or self.acting:
+            # 用户正在同步 / 正在写操作 ⇒ 这一轮跳过。
+            # ⚠️ 不是「失败」，所以**不能**停掉保活，也不能记成会话过期。
+            self._keepalive_tick()
+            return
+        threading.Thread(target=self._keepalive_work, daemon=True).start()
+
+    def _keepalive_work(self):
+        """后台：探一下会话还在不在。结果一律回主线程处理。"""
+        try:
+            alive = self.svc.has_session(self.account)
+        except Exception:
+            # 网络不通 / 服务器抽风 —— 那是「不知道」，不是「会话没了」。
+            # 🔴 这里绝不能返回 False：那会让界面去弹验证码，
+            #    而用户可能只是在电梯里没信号。
+            alive = None
+        self._put("keepalive", alive)
+
+    def _on_keepalive(self, alive):
+        """主线程：根据探测结果决定「继续探」还是「收摊」。
+
+        🔴 **不改界面、不重画** —— 用户可能正在看图表，被一次后台探测
+           把界面刷一遍是最讨厌的那种「自己会动」。
+           会话真的过期了也不弹验证码：那是下次点「同步数据」时才该发生的事。
+        """
+        if alive is True:
+            self.session_alive = True
+            self._keepalive_tick()
+            return
+        if alive is False:
+            self.session_alive = False
+            self.keepalive_job = None
+            log("账号中心：会话已过期（保活没拦住），下次同步需要重新验证码")
+            return
+        # alive is None ⇒ 不知道 ⇒ 下一轮再试，别下结论
+        self._keepalive_tick()
+
+    def _keepalive_stop(self):
+        """停掉保活（关面板时调）。"""
+        if self.keepalive_job is not None:
+            try:
+                self.win.after_cancel(self.keepalive_job)
+            except Exception:
+                pass
+            self.keepalive_job = None
+
     # ------------------------------------------------------------ 同步流程
 
     def start_sync(self):
@@ -6578,6 +6718,9 @@ class SelfServiceWindow(object):
             self.note = sync_note
         self.keep_note = False
         self.syncing = False
+        # 🔴 同步成功 ⇒ 手上有一个**有效会话** ⇒ 把它保住，别让它闲到过期。
+        #    放在 `syncing = False` 之后：保活线程里要读 `self.syncing`。
+        self._keepalive_start()
         self._render()
 
     # ------------------------------------------------------------ 本地历史
