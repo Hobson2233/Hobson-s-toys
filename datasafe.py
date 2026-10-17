@@ -51,7 +51,14 @@ _PATH_ATTRS = ("CONFIG_FILE", "ACCOUNTS_FILE", "LOG_FILE", "RESULT_FILE",
                #    而 `sandbox()` 末尾那条自检正是为了防这种事。
                # ⚠️ 注意它**不在** `PRIVATE_FILES` 里（清凭据不删它，见那边的说明），
                #    这两件事是分开的：一个是「沙箱要盖住」，一个是「purge 要不要删」。
-               "SELF_FLOW_FILE")
+               "SELF_FLOW_FILE",
+               # 2026-10-17 加：「上次的登录态」（自助服务的会话 cookie，DPAPI 加密）。
+               # 🔴 它**必须**在这里、也**必须**在 `PRIVATE_FILES` 里 ——
+               #    前者是「测试别写到真实数据目录」，后者是「清凭据要连它一起删」。
+               #    ⚠️ 第一次加它时忘了这一行，`self_session_test` 当场被
+               #    `write_json` 门禁拦住（报「拒绝写入沙箱之外的文件」）——
+               #    这正是那道门禁存在的理由。
+               "SELF_SESSION_FILE")
 
 _state = {"dir": None, "real": None, "snap": None}
 _orig_write_json = C.write_json

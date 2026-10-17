@@ -75,6 +75,29 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 # ⚠️ 别照抄到下载场景去 —— 对下载是收紧。这里是一次小 JSON 请求，6 秒够。
 TIMEOUT = 6.0
 
+
+def _host_of(base):
+    """从 `http://1.2.3.4:80/self` 里取出 `1.2.3.4`（造 cookie 时要）。"""
+    s = (base or DEFAULT_BASE).split("//", 1)[-1]
+    return s.split("/", 1)[0].split(":", 1)[0]
+
+
+def _make_cookie(name, value, host):
+    """造一条能给 `CookieJar` 用的 cookie。
+
+    ⚠️ `discard=True` + `expires=None`：我们在**还原**一条原本就是
+       session cookie 的东西（实测那个 `JSESSIONID-BOSS-0` 没有 Expires）。
+       把它写成「有期限」会让 `CookieJar` 对过期与否做出我们并不掌握的判断。
+       真正的判断交给**服务端** —— 还原之后必须探一次 `has_session()`。
+    """
+    return http.cookiejar.Cookie(
+        version=0, name=name, value=value,
+        port=None, port_specified=False,
+        domain=host, domain_specified=True, domain_initial_dot=False,
+        path="/", path_specified=True,
+        secure=False, expires=None, discard=True,
+        comment=None, comment_url=None, rest=None)
+
 # 只读接口。**这里没有、也不许有** kick / clear / 缴费 / 改密码。
 EP_TOLOGIN = "tologin.do"
 EP_LOGIN = "login.do"
@@ -821,6 +844,44 @@ class SelfService(object):
             if e.kind == "session":
                 return False
             raise
+
+    # ------------------------------------------------------------ 会话搬运
+
+    def export_cookies(self):
+        """把当前会话的 cookie 交出来（**明文值**，调用方负责加密存储）。
+
+        ⚠️ 别写死 `JSESSIONID-BOSS-0` 这个名字 —— 实测它就带了个 `-BOSS-0`
+           后缀，学校换个实现整个名字都会变。这里按「现在 jar 里有什么」给。
+        ⚠️ 本方法**不碰磁盘**：存不存、存哪、怎么加密，是调用方的事。
+        """
+        return [(c.name, c.value) for c in self._jar]
+
+    def import_cookies(self, pairs):
+        """把一份 cookie 塞回这个会话。返回塞进去几条（0 = 没塞进去）。
+
+        🔴 只在**确认还没有会话**时调（`has_session()` 探过是 False）。
+           不然可能拿一份不新鲜的 cookie 盖掉正在用的那个。
+        🔴 塞进去**不等于**能用：调用方必须再探一次 `has_session()` ——
+           cookie 会过期，而 `CookieJar` 只管「带不带」，不管「服务端认不认」。
+        """
+        host = _host_of(self.base)
+        n = 0
+        for item in (pairs or []):
+            # 🔴 **必须先判形状再取下标**。只写 `item[0] / item[1]` 的话，
+            #    一个坏掉的字符串（比如 `"zzz"`）会被当成 `("z", "z")`
+            #    塞进 jar —— 不报错，只表现为「载入了 1 条没用的 cookie」。
+            #    实测踩到过（2026-10-17）。
+            if not isinstance(item, (list, tuple)) or len(item) != 2:
+                continue
+            name, value = item
+            if not name or not value:
+                continue
+            try:
+                self._jar.set_cookie(_make_cookie(str(name), str(value), host))
+                n += 1
+            except Exception:
+                continue
+        return n
 
     # ------------------------------------------------------------ 取数
 

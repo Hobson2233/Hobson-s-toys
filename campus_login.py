@@ -386,7 +386,10 @@ LEGACY_DIR = r"C:\tools"          # 最老的 PowerShell 版部署位置，首�
 
 # 本机保存过的隐私文件清单（--purge 用；显式列举，不用通配符）
 PRIVATE_FILES = ("config.json", "accounts.json", "last-result.json",
-                 "campus-login.log", "selftest.txt", "guitest.txt")
+                 "campus-login.log", "selftest.txt", "guitest.txt",
+                 # 自助服务「上次的登录态」。🔴 **必须在清单里** ——
+                 # 只清密码、留着一个还能用的会话，是最糟的那种「以为清干净了」。
+                 "self-session.json")
 
 # 「账号中心」的本地流量历史。
 #
@@ -758,6 +761,132 @@ def upgrade_secrets_to_encrypted():
         changed += len(plain)
         log("%s：把 %d 处明文密码升级成加密存储" % (kind, len(plain)))
     return changed
+
+
+# ==================== 「上次的登录态」：存不存、存多久 ====================
+#
+# 🔴 为什么要有它（2026-10-17，用户点名要的）：
+#     自助服务登录一次要读一张**图片验证码**，而登录成功只换来一条会话 cookie
+#     （`JSESSIONID-BOSS-0`）。程序一关，cookie 跟着内存没了 ——
+#     于是「关掉再打开」必须重新读一次验证码。
+#     实测（`_lab/session_ttl.py`）：服务端是**滑动过期**，一直有访问就 45 分钟
+#     都不掉。所以「上次那条 cookie 还能不能用」这件事可以**直接问服务端**：
+#     能用就接着用，不能用就安静退回验证码流程。
+#
+# ⚠️ 这确实是「在磁盘上多存一份凭据」，和 `self_service.py` 里
+#    「会话 cookie 不落盘」那条**故意**的设计相反。所以四条边界必须守住：
+#      · 值一律过 DPAPI（`encrypt_secret`），和密码同一套，**不存明文**
+#      · **必须记账号**，加载时比对 —— 串号会让界面显示上一个账号的数据，
+#        而两边数字都「看着正常」，用户根本看不出来（这就是账号卡要写清账号的原因）
+#      · 带 `savedAt` 上限（`SELF_SESSION_AGE`），超过就丢弃，别无限期留一份登录态
+#      · 文件名进 `PRIVATE_FILES` ⇒ 「清除本机保存的账号密码」会连它一起删掉
+#
+# 🔴 **永远不要把「存过」当成「还能用」**：读出来之后必须真的探一次
+#    （`has_session()`），探不通就走验证码。cookie 是会过期的，存档只会过期。
+
+SELF_SESSION_FILE = os.path.join(data_dir(), "self-session.json")
+SELF_SESSION_AGE = 24 * 3600          # 存档最多留一天
+SELF_SESSION_VERSION = 1
+
+
+def save_self_session(account, base, pairs, now=None):
+    """把会话 cookie **加密**存盘。返回 (ok, 说明)。
+
+    `pairs` 是 `[(名字, 明文值)]`，逐条过 `encrypt_secret()` 再写。
+    没有账号 / 没有 cookie ⇒ 不写，返回 (False, 原因)。
+    """
+    account = (account or "").strip()
+    pairs = [(n, v) for n, v in (pairs or []) if n and v]
+    if not account or not pairs:
+        return False, "没有可保存的登录态"
+    stamp = int(time.time() if now is None else now)
+    obj = {
+        "v": SELF_SESSION_VERSION,
+        "account": account,
+        "base": (base or "").rstrip("/"),
+        "savedAt": stamp,
+        "cookies": [[n, encrypt_secret(v)] for n, v in pairs],
+    }
+    try:
+        write_json(SELF_SESSION_FILE, obj)
+    except Exception as e:
+        return False, "写不进去（%s）" % e
+    return True, ""
+
+
+def read_self_session(account, base, now=None):
+    """读出上次存的会话（值已解密）。返回 `(pairs, 说明)`。
+
+    🔴 说明是**给人看的原因**，不是错误码；调用方只在「不是没存过」时记日志。
+    🔴 任何一项对不上就**整份丢掉**，绝不半份复用 ——
+       半个 cookie 集合等于一个坏会话，而它会在后面以「莫名其妙的 -1」出现。
+    """
+    account = (account or "").strip()
+    base = (base or "").rstrip("/")
+    raw = read_json(SELF_SESSION_FILE)
+    if not isinstance(raw, dict):
+        return [], "没存过"
+    if raw.get("v") != SELF_SESSION_VERSION:
+        return [], "存档格式不认（v=%r）" % (raw.get("v"),)
+    if (raw.get("account") or "") != account:
+        # 🔴 这一条是**防串号**的：cookie 是按账号的，拿错账号的会话去查，
+        #    服务端会返回另一个人的数据，而界面照样「看着正常」。
+        return [], "存档是另一个账号的（%s）" % (raw.get("account") or "?",)
+    if (raw.get("base") or "") != base:
+        return [], "门户地址变了"
+    try:
+        saved = int(raw.get("savedAt") or 0)
+    except Exception:
+        saved = 0
+    stamp = time.time() if now is None else now
+    if saved <= 0:
+        return [], "存档里没有保存时间"
+    if stamp - saved > SELF_SESSION_AGE:
+        return [], "存档超过 %d 小时了" % (SELF_SESSION_AGE // 3600)
+    if stamp - saved < -300:
+        # 系统时间被往回调过。宁可不用，也别拿一个「未来」的存档当有效。
+        return [], "存档时间是未来（系统时间被改过？）"
+    pairs = []
+    for item in (raw.get("cookies") or []):
+        if not isinstance(item, (list, tuple)) or len(item) != 2:
+            return [], "存档格式不对"
+        name, enc = item
+        value = decrypt_secret(enc) if isinstance(enc, str) else ""
+        if not name or not value:
+            # 解不开（换了 Windows 用户 / 换了机器）⇒ 整份作废
+            return [], "存档解不开（换了 Windows 用户或机器？）"
+        pairs.append((name, value))
+    if not pairs:
+        return [], "存档里没有 cookie"
+    return pairs, ""
+
+
+def clear_self_session(account=None):
+    """删掉磁盘上的登录态。返回是否真的删掉了一个文件。
+
+    `account` 给了就**只删这个账号的**：存档是「上一次谁登录过就是谁」，
+    当前界面看的是另一个账号时，凭什么把别人的登录态顺手删掉 ——
+    （严格说删了只是让对方下次多读一次验证码，但「不该动的东西被动了」
+      正是这类地方积累出来的。）
+
+    ⚠️ 文件不在也算「没什么可删」（幂等）。
+    """
+    if not os.path.isfile(SELF_SESSION_FILE):
+        return False
+    raw = read_json(SELF_SESSION_FILE)
+    if account:
+        mine = (account or "").strip()
+        # 读不出结构 / 读到的是别人的 ⇒ 不动它。
+        # ⚠️ 读不出来也**不删**：那可能是暂时的（文件正被写），
+        #    下次真要用它的时候 `read_self_session()` 会自己判定作废。
+        if not isinstance(raw, dict) or (raw.get("account") or "") != mine:
+            return False
+    try:
+        os.remove(SELF_SESSION_FILE)
+        return True
+    except Exception as e:
+        log("清掉登录态失败：%s" % e)
+    return False
 
 
 # ==================== 账号文件的互斥 ====================
@@ -6193,6 +6322,8 @@ class SelfServiceWindow(object):
         #       把「不知道」说成事实（红线 50）。
         self.keepalive_job = None
         self.session_alive = None
+        # 上次存下来的登录态试过没有（**一次就够**，见 `_try_restore_session`）
+        self.session_restored = False
         # 🔴 写操作成功后会**自动刷新**一次。刷新走的是 `_on_synced`，
         #    那里默认会把 `self.note` 覆盖成「已同步：…」—— 那样用户刚看到的
         #    「已下线」就被盖掉了，等于不知道刚才那一下成没成。
@@ -6547,12 +6678,50 @@ class SelfServiceWindow(object):
     def _job_session(self):
         """先看会话还在不在。在就直接取数，不在就取验证码。"""
         try:
+            self._try_restore_session()
             if self.svc.has_session(self.account):
                 self._put("load")
             else:
+                # 🔴 服务端明确说「没会话了」⇒ 磁盘上那份也一定是废的，删掉。
+                #    不删的话下次还会白载入一次、白探一次。
+                clear_self_session(self.account)
                 self._job_captcha()
         except self_service.SelfError as e:
             self._put("fail", e.msg)
+
+    def _try_restore_session(self):
+        """把上次存的登录态载回来。**每个面板只做一次。**
+
+        🔴 载回来**不等于**能用 —— 载完必须照常往下走 `has_session()`，
+           探不通就退回验证码。存档是会过期的，我们只掌握「多久以前存的」，
+           不掌握「服务端还认不认」。
+        """
+        if self.session_restored:
+            return
+        self.session_restored = True
+        pairs, why = read_self_session(self.account, self.svc.base)
+        if not pairs:
+            # 「没存过」是正常情况，不值得记日志；其余原因要留痕，
+            # 否则「明明存过却没生效」时完全没有线索。
+            if why and why != "没存过":
+                log("账号中心：没有复用上次的登录态（%s）" % why)
+            return
+        n = self.svc.import_cookies(pairs)
+        log("账号中心：载入了上次的登录态（%d 条 cookie），先探一次再决定" % n)
+
+    def _save_session(self):
+        """把当前会话加密存盘，下次打开就不用再读验证码。
+
+        ⚠️ 只在**服务端刚证明过这个会话有效**之后调（见 `_on_synced`）。
+           别在 `login()` 刚返回时就存 —— 那时还没验过。
+        """
+        try:
+            ok, why = save_self_session(self.account, self.svc.base,
+                                        self.svc.export_cookies())
+            if not ok and why:
+                log("账号中心：登录态没存下来（%s）" % why)
+        except Exception:
+            log("账号中心：保存登录态异常:\n%s" % traceback.format_exc())
 
     def _job_captcha(self):
         try:
@@ -6578,6 +6747,7 @@ class SelfServiceWindow(object):
         except self_service.SelfError as e:
             if e.kind == "session":
                 # 会话在取数途中过期了 —— 退回验证码流程，不算失败
+                clear_self_session(self.account)
                 self._job_captcha()
             else:
                 self._put("fail", e.msg)
@@ -6667,6 +6837,8 @@ class SelfServiceWindow(object):
         if alive is False:
             self.session_alive = False
             self.keepalive_job = None
+            # 服务端不认了 ⇒ 磁盘上那份也没用了
+            clear_self_session(self.account)
             log("账号中心：会话已过期（保活没拦住），下次同步需要重新验证码")
             return
         # alive is None ⇒ 不知道 ⇒ 下一轮再试，别下结论
@@ -6718,6 +6890,9 @@ class SelfServiceWindow(object):
             self.note = sync_note
         self.keep_note = False
         self.syncing = False
+        # 🔴 到这一步说明「服务端刚认可了这个会话」⇒ 这时候存才是可信的。
+        #    存下来之后，「关掉程序再打开」也不用再读验证码。
+        self._save_session()
         # 🔴 同步成功 ⇒ 手上有一个**有效会话** ⇒ 把它保住，别让它闲到过期。
         #    放在 `syncing = False` 之后：保活线程里要读 `self.syncing`。
         self._keepalive_start()

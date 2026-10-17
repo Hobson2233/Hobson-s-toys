@@ -230,6 +230,11 @@ class FakeSvc(object):
     calls = []                # 所有请求的名字（**用来验「打开面板时一次都没发」**）
     posts = []                # 写操作层的 `(path, payload)`（B 档，逐字段断言用）
     script = {}
+    # 会话 cookie 的「仓库」（2026-10-17 加，配合登录态存盘）。
+    # ⚠️ **不记进 `calls`** —— 它不是网络请求，记进去会把
+    #    「打开面板时一次都没发请求」那类断言搞脏。
+    jar = []
+    imported = []             # 最后一次 import 进来的东西（验「载入的是存的那份」）
 
     def __init__(self, base=None, timeout=None):
         FakeSvc.made += 1
@@ -246,6 +251,16 @@ class FakeSvc(object):
         if mode == "raise":
             raise S.SelfError("net", "假装连不上校园网")
         return mode == "yes"
+
+    # --- 会话 cookie 的搬运（2026-10-17，配合「上次的登录态」存盘）---
+    def export_cookies(self):
+        return list(FakeSvc.jar)
+
+    def import_cookies(self, pairs):
+        got = [(n, v) for n, v in (pairs or []) if n and v]
+        FakeSvc.imported.append(list(got))
+        FakeSvc.jar.extend(got)
+        return len(got)
 
     def fetch_captcha(self):
         self._note("fetch_captcha")
@@ -266,6 +281,9 @@ class FakeSvc(object):
         if mode == "boom":
             # **非** SelfError —— 专门用来验「后台任务崩了界面也得看得见」
             raise RuntimeError("假装代码写错了")
+        # 登录成功 ⇒ 服务端会给一条会话 cookie（真机实测就一条）。
+        # 有了它，「上次的登录态」才有东西可存。
+        FakeSvc.jar = [("JSESSIONID-BOSS-0", "FAKE-SESSION")]
 
     def load(self, account, today=None):
         self._note("load")
@@ -569,6 +587,8 @@ def reset_fake():
     FakeSvc.last_login = None
     FakeSvc.calls = []
     FakeSvc.posts = []
+    FakeSvc.jar = []
+    FakeSvc.imported = []
 
 
 def find_button(w, text):
@@ -584,11 +604,18 @@ def find_button(w, text):
 
 
 def reset_history():
-    """把沙箱里的本地历史清干净（每个用例开始前调）。"""
-    try:
-        os.remove(C.SELF_FLOW_FILE)
-    except OSError:
-        pass
+    """把沙箱里**属于上一个用例**的东西清干净（本地历史 + 上次的登录态）。
+
+    ⚠️ 登录态也必须清：不清的话，「上一个用例存下的 cookie」会被下一个用例
+       载入，而 `has_session` 的脚本是各用例自己设的 —— 表现是**随机串场**。
+    """
+    for p in (C.SELF_FLOW_FILE, C.SELF_SESSION_FILE):
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+    FakeSvc.jar = []
+    FakeSvc.imported = []
 
 
 def seed_history(account="2025000000", days=None):
@@ -804,6 +831,14 @@ def test_sync_full_flow(root):
     w.start_sync()
     ok = pump(root, 6.0, lambda: "新增 0 天" in getattr(w, "note", ""))
     check_true("同样的数据再同步一次 ⇒ 新增 0 天", ok, getattr(w, "note", ""))
+
+    # 🔴 登录态要存下来（2026-10-17）—— 这是「关掉再打开不用验证码」的全部依据
+    pairs, why = C.read_self_session("2025000000", w.svc.base)
+    check("登录态存到了磁盘上", pairs, [("JSESSIONID-BOSS-0", "FAKE-SESSION")])
+    check("读它的时候没有任何报警原因", why, "")
+    check_true("存档文件真的在沙箱里（没写进真实数据目录）",
+               os.path.dirname(C.SELF_SESSION_FILE)
+               == os.path.abspath(C.data_dir()), C.SELF_SESSION_FILE)
     check("第二次走了「会话还在」这条路（没再要验证码）",
           "has_session" in FakeSvc.calls, True)
     check("第二次没有登录", FakeSvc.last_login[2], "a1b2")   # 还是第一次那个
@@ -998,6 +1033,51 @@ def test_keepalive(root):
         check("close 之后定时器句柄被清掉", w.keepalive_job, None)
     finally:
         C.SELF_KEEPALIVE_MS = old_ms
+
+
+def test_session_restore(root):
+    """🔴 「上次的登录态」能被复用（2026-10-17 加）。
+
+    这条是「关掉程序再打开也不用重输验证码」的**全部依据**。看住两件事：
+      · 存过的会话会被载回来，而且因为 `has_session` 说有会话，
+        **根本不会去取验证码**（`fetch_captcha` 不该出现在请求记录里）；
+      · 存的是**别的账号**的 ⇒ 一条都不许载入。
+        串号比没有更糟：界面会把别人的数据显示得像自己的，而且看不出异常。
+    """
+    print("\n— 上次的登录态：能复用 / 不串号（2026-10-17 加）")
+    reset_fake()
+    reset_history()
+    base = "http://202.196.169.246"        # 和 `open_panel` 传的一致
+
+    # ① 存一份本账号的，然后同步 ⇒ 应该直接取数
+    ok, why = C.save_self_session("2025000000", base,
+                                  [("JSESSIONID-BOSS-0", "OLD-SESSION")])
+    check_true("先把登录态存进沙箱", ok, why)
+    FakeSvc.script = {"has_session": "yes", "login": "ok"}
+    w = open_panel(root)
+    w.start_sync()
+    ok = pump(root, 6.0, lambda: "账号状态" in texts_of(w.win))
+    check_true("同步成功（走的是「会话还有效」这条路）", ok, "")
+    check("载入的正是存下来的那条 cookie",
+          FakeSvc.imported, [[("JSESSIONID-BOSS-0", "OLD-SESSION")]])
+    check_true("**没有**去取验证码", "fetch_captcha" not in FakeSvc.calls,
+               FakeSvc.calls)
+    check_true("也没有重新登录", "login" not in FakeSvc.calls, FakeSvc.calls)
+    close_panel(w)
+
+    # ② 存档是别的账号的 ⇒ 一条都不载，退回验证码
+    reset_fake()
+    reset_history()
+    C.save_self_session("2026999999", base,
+                        [("JSESSIONID-BOSS-0", "OTHER-ACCOUNT")])
+    FakeSvc.script = {"has_session": "no", "login": "ok"}
+    w2 = open_panel(root)
+    w2.start_sync()
+    ok = pump(root, 6.0, lambda: w2._cap_big is not None)
+    check_true("别人的存档 ⇒ 退回去取验证码", ok, "")
+    check("一条 cookie 都没载入", FakeSvc.imported, [])
+    check_true("🔴 也没把别人那份存档顺手删掉",
+               os.path.isfile(C.SELF_SESSION_FILE), "")
 
 
 def test_job_crash_visible(root):
@@ -1922,6 +2002,7 @@ def main():
             test_sync_tries_gate(root)
             test_sync_net_fail(root)
             test_keepalive(root)
+            test_session_restore(root)
             test_job_crash_visible(root)
             test_clear_history(root)
             test_chart_views(root)
