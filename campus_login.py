@@ -5471,7 +5471,9 @@ def nav_button(parent, tk, text, icon, font, command, width, height=dp(38),
             _draw_round_rect(cv, dp(6), (height - bh) / 2.0,
                              dp(6) + bw, (height + bh) / 2.0,
                              max(1, bw // 2 - 1), NAV_BAR)
-        _draw_icon(cv, icon, col, dp(20), height / 2.0, dp(15))
+        # 图标尺寸走 dp（这条本来就是对的）。2026-10-17 从 15 加到 17 ——
+        # 徽章那一批改完之后，导航栏这几个裸线图标显得比卡片里的还小，反了。
+        _draw_icon(cv, icon, col, dp(20), height / 2.0, dp(17))
         cv.create_text(dp(38), height / 2.0, text=st["text"], font=font,
                        fill=col, anchor="w")
         cv._rb_text = st["text"]
@@ -5817,9 +5819,14 @@ def _draw_icon(cv, name, color, cx, cy, size=14.0, width=_ICON_STROKE,
     return n
 
 
-def icon_badge(parent, tk, name, fg, soft, box=dp(22), radius=dp(7), icon=13.0,
+def icon_badge(parent, tk, name, fg, soft, box=dp(22), radius=dp(7), icon=dp(14),
                page=CARD):
-    """圆角彩色小徽章：浅色圆角底 + 同色系线性图标。返回那个 Canvas。
+    """圆角彩色小徽章：浅色圆角底 + 同色线系图标。返回那个 Canvas。
+
+    🔴 `icon` **必须走 `dp()`**（2026-10-17 修的）。原来写的是裸的 `13.0`，
+       而 `box` 是 `dp(22)` —— 150% 的屏上盒子长到 33px、里面的图形还是 13px，
+       于是图标只占盒子的 39%（设计意图是 59%），看着**又小又空**。
+       这类「一半跟着 DPI 变、一半不变」的错在 100% 屏上完全看不出来。
 
     ⚠️ 图标名写错时**抛异常**，不静默画一个空徽章：
         空徽章看着只是「这里没图标」，跟设计如此完全一样 —— 正是本项目
@@ -9164,12 +9171,18 @@ class LoginApp:
 
         浅底和图标色**必须成对换** —— 只换图标色的话，红图标压在浅绿底上
         看着就是「画错了」，而这类错在截图里不一定显眼，只能靠这里锁死。
+
+        🔴 尺寸一律走 `dp()`（2026-10-17 修）：画布是 `dp(22)` 建的，原来这里
+           却用裸的 `22 / 11 / 7 / 13` 画 —— 150% 的屏上等于在一个 33×33 的
+           画布左上角画了个 22×22 的小方块，**又小又是偏的**。
+           这类「容器跟着 DPI 变、内容不变」的错在 100% 屏上完全看不见。
         """
         col = NET_COLOR.get(st, MUTED)
         soft = NET_SOFT.get(st, NEUTRAL_SOFT)
+        b = dp(22)
         self.st_icon.delete("all")
-        _draw_round_rect(self.st_icon, 0, 0, 22, 22, 7, soft)
-        _draw_icon(self.st_icon, "globe", col, 11, 11, size=13)
+        _draw_round_rect(self.st_icon, 0, 0, b, b, dp(7), soft)
+        _draw_icon(self.st_icon, "globe", col, b / 2.0, b / 2.0, size=dp(14))
 
     def refresh_auto_warning(self):
         try:

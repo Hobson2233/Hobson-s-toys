@@ -1080,6 +1080,43 @@ def test_session_restore(root):
                os.path.isfile(C.SELF_SESSION_FILE), "")
 
 
+def test_icon_scale(root):
+    """🔴 图标尺寸必须跟着 DPI 走（2026-10-17 那道门槛）。
+
+    原来的 bug：徽章的**盒子**是 `dp(22)`、里面的**图形**写死 `13.0`。
+    150% 的屏上盒子 33px、图形 13px ⇒ 图标只占盒子的 39%（设计意图 59%），
+    看着又小又空 —— 用户的原话是「各个图标现在显得小了」。
+    这类「容器跟着 DPI 变、内容不变」的错在 100% 屏上**完全看不出来**，
+    所以只能用门槛钉住，不能靠看截图。
+    """
+    import inspect
+    import tkinter as tk
+    print("\n— 图标尺寸跟着 DPI 走（2026-10-17 加）")
+    prm = inspect.signature(C.icon_badge).parameters
+    check("徽章的盒子 = dp(22)", prm["box"].default, C.dp(22))
+    check("徽章的圆角 = dp(7)", prm["radius"].default, C.dp(7))
+    check("徽章的**图形** = dp(14)（不能是裸数字）",
+          prm["icon"].default, C.dp(14))
+
+    cv = tk.Canvas(root, width=C.dp(80), height=C.dp(80),
+                   highlightthickness=0, bd=0)
+    try:
+        size = C.dp(20)
+        n = C._draw_icon(cv, "globe", "#000000", C.dp(40), C.dp(40), size=size)
+        check_true("图标真的画出来了（不是一块空画布）", n > 0, n)
+        # ⚠️ 用 `coords()` 而不是 `bbox()`：`bbox()` 对带圆头端点的 line
+        #    会把两端的半圆算进去，实测 30px 的图量出来正好 30（贴满整个 size），
+        #    照着它断言只会得出「画满了」这种假结论。
+        co = cv.coords(cv.find_all()[0])      # 第一个图元是外面那个大圆
+        w = co[2] - co[0]
+        # globe 的圆占 24 单位里的 18.8
+        want = size * 18.8 / 24.0
+        check_true("画出来的直径跟传进去的 size 对得上（%.1f vs %.1f）"
+                   % (w, want), abs(w - want) <= 1.0, w)
+    finally:
+        cv.destroy()
+
+
 def test_job_crash_visible(root):
     """🔴 后台任务抛**非预期**异常时，必须变成界面上的提示，不许静默卡住。
 
@@ -2003,6 +2040,7 @@ def main():
             test_sync_net_fail(root)
             test_keepalive(root)
             test_session_restore(root)
+            test_icon_scale(root)
             test_job_crash_visible(root)
             test_clear_history(root)
             test_chart_views(root)
