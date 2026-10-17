@@ -6910,8 +6910,9 @@ class SelfServiceWindow(object):
         return inner
 
     def _row(self, parent, name, value, fg=None, bold=False):
+        """一行「键 —— 值」。间距走 `ROW_GAP`（单行记录档，见「列表间距规范」）。"""
         f = self.tk.Frame(parent, bg=CARD)
-        f.pack(fill="x", pady=dp(2))
+        f.pack(fill="x", pady=dp(self.ROW_GAP))
         self.tk.Label(f, text=name, bg=CARD, fg=SUB,
                       font=(self.fam, self.base)).pack(side="left")
         self.tk.Label(f, text=value, bg=CARD, fg=fg or FG,
@@ -7149,6 +7150,32 @@ class SelfServiceWindow(object):
 
     # ------------------------------------------------------------ 详单卡
 
+    # ------------------------------------------------------------ 列表间距规范
+    # 🔴 2026-10-17 加。用户原话：「很多地方可读性很差，比如这里右边，
+    #    文字的行与行之间没有隔开，导致很难获取到有效信息」。
+    #
+    #    排查下来的真因**不是字号，是分组**：账号中心右侧是一屏高密度信息
+    #    （10 条会话 × 每条两行 + 费用明细 + 设备清单），而当时各个列表的
+    #    间距是 1~2 设计像素、而且**只有部分列表画了分隔线** ——
+    #    结果就是「会话的第二行」和「下一条会话的第一行」贴在一起，
+    #    四行连成一片，眼睛找不到断点。
+    #
+    #    所以立这套三档规矩，判据只有一个：**这两行是不是同一条记录**。
+    #      · `GROUP_IN` —— 同一条记录**内部**的两行（时间行 / 流量行）。
+    #                      小间距 = 「它俩是一伙的」，读的时候不该断开。
+    #      · `ITEM_GAP` —— 两条记录**之间**，并配一条 1px 的 `LINE` 分隔线。
+    #                      大间距 + 分隔线 = 「这里断开了，下一条是新记录」。
+    #      · `ROW_GAP`  —— **单行**记录之间（费用明细、套餐清单、键值行）。
+    #                      没有分隔线，只靠间距分开；比 GROUP_IN 大、比 ITEM_GAP 小。
+    #
+    #    ⚠️ 这三档只用在**右侧滚动区**里，改它们不影响窗口高度（`CONTENT_H`）——
+    #       设置页那边的竖向间距是另一套，别混。
+    #    ⚠️ 加新列表时**别自己写 pady 数字**：挑一档用。散落的字面量正是
+    #       「有的列表松、有的紧」的来源，也就是这次要修的东西。
+    GROUP_IN = 3          # 同一条记录内部的两行之间
+    ITEM_GAP = 10         # 两条记录之间（配合 1px 分隔线）
+    ROW_GAP = 4           # 单行记录之间（不画分隔线）
+
     BILL_SHOW = 10        # 界面上最多列几条会话（服务端可能给几百条）
 
     @staticmethod
@@ -7222,9 +7249,15 @@ class SelfServiceWindow(object):
         # --- 最近几条会话 ---
         show = ss[:self.BILL_SHOW]
         self.tk.Frame(inner, bg=LINE, height=dp(1)).pack(fill="x", pady=(dp(8), dp(0)))
-        for x in show:
+        for i, x in enumerate(show):
+            # 🔴 两条会话之间：**大间距 + 一条分隔线**（见「列表间距规范」）。
+            #    改之前这里什么都没有 —— 上一条的「流量行」和下一条的「时间行」
+            #    直接贴在一起，10 条会话看下来是 20 行连续文字，找不到断点。
+            if i:
+                self.tk.Frame(inner, bg=LINE, height=dp(1)
+                              ).pack(fill="x", pady=(dp(self.ITEM_GAP), dp(0)))
             top = self.tk.Frame(inner, bg=CARD)
-            top.pack(fill="x", pady=(dp(7), dp(0)))
+            top.pack(fill="x", pady=(dp(9), dp(0)))
             self.tk.Label(top,
                           text="%s → %s" % (self._mmdd(x.get("start")),
                                             self._mmdd(x.get("end"))),
@@ -7236,6 +7269,8 @@ class SelfServiceWindow(object):
             # 🔴 上行/下行**分开放**，不合起来 —— 用户明确说过要看上下行。
             #    `terminateCause` 放在末尾：它解释「这次为什么结束」，
             #    实测取值是「空闲超时 / 用户主动下线 / 账号抢占 / 管理员重置」。
+            # ⚠️ `GROUP_IN` 的小间距是**故意小**的：它和上面那行是**同一条会话**，
+            #    留太大反而会让「两行一组」的分组感散掉（见「列表间距规范」）。
             self.tk.Label(inner,
                           text="↑ %s　↓ %s　%s"
                                % (self_service.fmt_flow(x.get("up")),
@@ -7243,7 +7278,8 @@ class SelfServiceWindow(object):
                                   x.get("cause") or ""),
                           bg=CARD, fg=SUB, justify="left",
                           wraplength=self.cw - 20,
-                          font=(self.fam, self.base - 2)).pack(anchor="w")
+                          font=(self.fam, self.base - 2)
+                          ).pack(anchor="w", pady=(dp(self.GROUP_IN), dp(0)))
         if len(ss) > len(show):
             self.tk.Label(inner, text="（共 %d 次，这里只列最近 %d 次）"
                           % (len(ss), len(show)), bg=CARD, fg=SUB,
@@ -7259,12 +7295,14 @@ class SelfServiceWindow(object):
             return
         for i, x in enumerate(dev):
             if i:
-                self.tk.Frame(inner, bg=LINE, height=dp(1)).pack(fill="x", pady=dp(6))
+                # 两条设备之间：大间距 + 分隔线（见「列表间距规范」）
+                self.tk.Frame(inner, bg=LINE, height=dp(1)
+                              ).pack(fill="x", pady=(dp(self.ITEM_GAP), dp(0)))
             # 🔴 排版顺序是**用户要求的**（2026-10-12）：
             #    ① 设备类型（Windows / Android…）② 上线时间 ③ 其余写小字。
             #    原来第一行是 IP + MAC，一眼看不出「这是哪台设备」。
             top = self.tk.Frame(inner, bg=CARD)
-            top.pack(fill="x")
+            top.pack(fill="x", pady=(dp(9), dp(0)) if i else dp(0))
             # `osInfo` 实测是 "Windows" 这种人类可读的串；空的话**不许猜**
             # （`terminalType` 是 "a" 这种代码，含义没验证过）。
             self.tk.Label(top, text=(x.get("os") or "未知设备"), bg=CARD, fg=FG,
@@ -7280,9 +7318,11 @@ class SelfServiceWindow(object):
             #    这种**代码**，含义没验证过。显示成「类型 a」对用户毫无意义，
             #    而猜它的含义（1=电脑 2=手机…）就是编 —— 两条都不能要。
             #    ⚠️ 数据层**仍然保留**这个字段（白名单里），只是界面不用。
+            # ⚠️ `GROUP_IN`：这行和设备名是**同一台设备**，所以要贴紧。
             self.tk.Label(inner, text="　".join(extra), bg=CARD, fg=SUB,
                           justify="left", wraplength=self.cw - 20,
-                          font=(self.fam, self.base - 2)).pack(anchor="w")
+                          font=(self.fam, self.base - 2)
+                          ).pack(anchor="w", pady=(dp(self.GROUP_IN), dp(0)))
             # --- 「下线这台」按钮（B 档，2026-10-16 加）---
             # 🔴 只在有会话时才画（`_can_act`）。点了会二次确认 + 现取一次
             #    在线清单再踢（见 `_kick` 的说明）。
@@ -7445,9 +7485,13 @@ class SelfServiceWindow(object):
     FEE_SHOW = 6          # 扣费 / 缴费各最多列几条
 
     def _rec_row(self, parent, when, what, money):
-        """费用记录的一行：左边「时间 + 类型」，右边金额。"""
+        """费用记录的一行：左边「时间 + 类型」，右边金额。
+
+        ⚠️ 间距走 `ROW_GAP`（单行记录档），不写死数字 —— 原来这里是 `dp(1)`，
+           六条记录挤成一坨，时间和金额对不齐眼睛。
+        """
         f = self.tk.Frame(parent, bg=CARD)
-        f.pack(fill="x", pady=dp(1))
+        f.pack(fill="x", pady=dp(self.ROW_GAP))
         self.tk.Label(f, text=when or "-", bg=CARD, fg=SUB,
                       font=(self.fam, self.base - 2)).pack(side="left")
         self.tk.Label(f, text=what or "", bg=CARD, fg=FG,
@@ -7549,7 +7593,8 @@ class SelfServiceWindow(object):
             return
         for x in rows:
             f = self.tk.Frame(inner, bg=CARD)
-            f.pack(fill="x", pady=dp(1))
+            # 单行记录档（见「列表间距规范」）。原来是 dp(1)，一行挨一行。
+            f.pack(fill="x", pady=dp(self.ROW_GAP))
             self.tk.Label(f, text=x.get("name") or "（未命名套餐）", bg=CARD, fg=FG,
                           font=(self.fam, self.base - 1)).pack(side="left")
             right = []
@@ -7600,9 +7645,9 @@ class SelfServiceWindow(object):
         self._render()
 
     def _link_row(self, parent, label, url):
-        """一行「左边说明 + 右边『打开』」。"""
+        """一行「左边说明 + 右边『打开』」。间距走 `ROW_GAP`。"""
         f = self.tk.Frame(parent, bg=CARD)
-        f.pack(fill="x", pady=dp(2))
+        f.pack(fill="x", pady=dp(self.ROW_GAP))
         self.tk.Label(f, text=label, bg=CARD, fg=FG, justify="left",
                       wraplength=self.cw - 96,
                       font=(self.fam, self.base - 1)).pack(side="left")

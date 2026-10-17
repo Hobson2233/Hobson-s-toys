@@ -630,6 +630,32 @@ def test_available():
     check("没配学校 → 默认郑航", C.self_service_available({}), True)
 
 
+def test_spacing_scale():
+    """列表三档间距的顺序不能乱（见 `SelfServiceWindow` 的「列表间距规范」）。
+
+    🔴 为什么要专门测这个（2026-10-17）：用户反馈「很多地方可读性很差，
+       文字的行与行之间没有隔开」。排查下来真因**不是字号**，是间距
+       散落成一堆 `dp(1)` / `dp(2)` 的字面量，而且**有的列表有分隔线、
+       有的没有** —— 于是「会话的第二行」和「下一条会话的第一行」贴在一起。
+
+    立了三档规矩之后，规矩本身也需要一道门槛：
+      · 三个数字都很小，改错了**看代码看不出来**（dp(1) 和 dp(4) 长得一样）
+      · 只有截图对比才明显 —— 而那正是最容易漏掉的回归
+      · 顺序一乱，分组感就没了：`ITEM_GAP` 比 `GROUP_IN` 还小的话，
+        两条记录之间比一条记录内部还紧，等于把「组」切错了
+    """
+    print("\n— 列表三档间距（同一条记录内部 / 单行记录 / 两条记录之间）")
+    W = C.SelfServiceWindow
+    g, r, i = W.GROUP_IN, W.ROW_GAP, W.ITEM_GAP
+    print("    GROUP_IN=%d  ROW_GAP=%d  ITEM_GAP=%d" % (g, r, i))
+    check_true("三档都是正数", g > 0 and r > 0 and i > 0, "(%d, %d, %d)" % (g, r, i))
+    check_true("顺序：组内 < 单行 < 组间", g < r < i, "%d < %d < %d" % (g, r, i))
+    # 只满足「组间 > 组内」还不够：差 1px 在 150% 屏上是 1.5 物理像素，
+    # 肉眼分不出来，「两行一组」的分组感就不成立。至少要差一倍。
+    check_true("组间至少是组内的两倍（否则分组感不成立）",
+               i >= g * 2, "%d >= %d×2" % (i, g))
+
+
 def test_open_offline_empty(root):
     """🔴 打开面板**一次网络都不发**（没历史时也一样）。"""
     print("\n② 打开面板：不联网、不要验证码（本机没历史）")
@@ -1785,6 +1811,7 @@ def main():
     rc = 0
     try:
         test_available()
+        test_spacing_scale()
         root = _tk().Tk()
         # 🔴 **不能 withdraw**：面板靠 `winfo_width()` 量宽度来排版
         #    （两列 / 单列、wraplength 都从它来），主窗一隐藏，
